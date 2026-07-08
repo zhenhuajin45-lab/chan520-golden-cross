@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .indicators import fmt, pct_change
+from .indicators import fmt
 from .models import AnalysisReport, RuleResult
 
 
@@ -26,6 +26,9 @@ def render_markdown(report: AnalysisReport) -> str:
                  f"RSI {fmt(point.rsi14)}，收盘相对 MA60 偏离 "
                  f"{_ma_bias(target.close, point.ma60)}。")
     lines.append("")
+    lines.append("趋势5日线规则：")
+    lines.extend(_rule_bullets(report.trend_rules))
+    lines.append("")
     lines.append("---")
     lines.append("")
     lines.append("## 二、选股判定")
@@ -34,6 +37,7 @@ def render_markdown(report: AnalysisReport) -> str:
     lines.append("| --- | --- |")
     lines.append(f"| 是否入选 | {report.verdict} |")
     lines.append(f"| 入选等级 | {report.level} |")
+    lines.append(f"| 综合分 | {_score(report)} |")
     lines.append("")
     lines.append("满足的条件：")
     for item in report.satisfied:
@@ -62,6 +66,20 @@ def render_markdown(report: AnalysisReport) -> str:
     lines.append("520金叉买分析：")
     lines.extend(_numbered_520(report))
     lines.append("")
+    lines.append("趋势持仓/加仓判定：")
+    lines.append("")
+    lines.append("| 项目 | 状态 | 详细判定 |")
+    lines.append("| --- | --- | --- |")
+    for item in report.trend_rules + report.position_rules:
+        lines.append(f"| {item.name} | {_status_text(item.status)} | {item.detail} |")
+    lines.append("")
+    lines.append("退出与止盈风险：")
+    lines.append("")
+    lines.append("| 项目 | 状态 | 详细判定 |")
+    lines.append("| --- | --- | --- |")
+    for item in report.exit_rules:
+        lines.append(f"| {item.name} | {_status_text(item.status)} | {item.detail} |")
+    lines.append("")
     lines.append("额外积极信号：")
     extra = [item for item in report.satisfied if not item.startswith("520")]
     if extra:
@@ -70,8 +88,7 @@ def render_markdown(report: AnalysisReport) -> str:
     else:
         lines.append("- 暂无额外强化项。")
     lines.append("")
-    lines.append("结论："
-                 f"{report.core_summary} 需要密切关注未来2-3日是否站稳 MA60，并观察 MACD 是否向零轴修复。")
+    lines.append("结论：" f"{report.core_summary}")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -79,8 +96,12 @@ def render_markdown(report: AnalysisReport) -> str:
     lines.append("")
     lines.append("| 风险项 | 当前结论 |")
     lines.append("| --- | --- |")
-    for item in report.defects or ["无明显硬风险，但仍需按交易计划执行。"]:
+    risk_items = report.defects or ["无明显硬风险，但仍需按交易计划执行。"]
+    for item in risk_items:
         lines.append(f"| 风险 | {item} |")
+    for item in report.exit_rules:
+        if item.status == "WARN":
+            lines.append(f"| 退出/止盈 | {item.detail} |")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -122,7 +143,12 @@ def _ma_bias(close: float, ma: float | None) -> str:
 def _main_buy_label(report: AnalysisReport) -> str:
     for item in report.buy_points:
         if item.name == "520金叉买" and item.status in {"PASS", "WARN"}:
+            if report.verdict == "观察（等待回踩）":
+                return "520确认期/趋势延续（不追高，等回踩）"
             return "520金叉买（弱化版）" if item.status == "WARN" else "520金叉买（标准版）"
+    for item in report.trend_rules:
+        if item.name == "趋势5日线买入法" and item.status in {"PASS", "WARN"}:
+            return "趋势5日线结构"
     return "无标准买点"
 
 
@@ -131,7 +157,7 @@ def _numbered_520(report: AnalysisReport) -> list[str]:
     prev = report.previous_indicator
     close = report.target.close
     out = [
-        f"1. MA5上穿MA20 -> 昨日 {fmt(prev.ma5)} / {fmt(prev.ma20)}，今日 {fmt(point.ma5)} / {fmt(point.ma20)}。",
+        f"1. MA5/MA20关系 -> 昨日 {fmt(prev.ma5)} / {fmt(prev.ma20)}，今日 {fmt(point.ma5)} / {fmt(point.ma20)}。",
         f"2. 股价站稳均线之上 -> 当前 {close:.2f}，MA5 {fmt(point.ma5)}，MA20 {fmt(point.ma20)}。",
         f"3. MACD同步金叉 -> DIF {fmt(point.macd_dif, 3)}，DEA {fmt(point.macd_dea, 3)}，柱 {fmt(point.macd_hist, 3)}。",
         f"4. 放量确认 -> 量比 {fmt(point.volume_ratio)}。",
@@ -139,3 +165,10 @@ def _numbered_520(report: AnalysisReport) -> list[str]:
     if report.target and len(report.large_cycle) > 0:
         out.append(f"5. 大周期过滤 -> {report.large_cycle[0].detail}")
     return out
+
+
+def _score(report: AnalysisReport) -> int:
+    return sum(
+        item.score
+        for item in report.large_cycle + report.buy_points + report.trend_rules + report.position_rules + report.exit_rules
+    )

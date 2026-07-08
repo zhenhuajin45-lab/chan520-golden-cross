@@ -8,6 +8,12 @@
 python -m chan520_skill analyze 600288 --date 2026-07-06
 ```
 
+如需按同花顺截图常见的 `MACD(12,50,9)` 口径核对：
+
+```powershell
+python -m chan520_skill analyze 600288 --date 2026-07-07 --macd-slow 50
+```
+
 部署给其他机器或通过 GitHub 分发时，见 [DEPLOY.md](DEPLOY.md)。
 
 生成报告默认写入：
@@ -38,5 +44,8 @@ https://qt.gtimg.cn/q=sh600288
 - 小周期看量价：放量、突破 MA60、斜率、RSI 健康度。
 - 缠论买点做结构补充：一买、二买、三买用可计算的近似条件落地，避免主观画线。
 - 风控优先：止损位、盈亏比、仓位等级和确认失败条件必须随报告输出。
+- 实战优先：520 金叉后还要区分当天买点、近3日确认、涨停追高、5日线持有、回踩加仓和失败退出。
 
 本工具只做策略分析和复盘辅助，不构成投资建议。
+
+完整实战版规则见 [docs/practical_520_strategy.md](docs/practical_520_strategy.md)。

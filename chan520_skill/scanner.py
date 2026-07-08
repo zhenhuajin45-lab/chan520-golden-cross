@@ -171,7 +171,10 @@ def _scan_one(stock: UniverseStock, target: date) -> ScanRow | None:
         report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
     except Exception:
         return None
-    score = sum(item.score for item in report.large_cycle + report.buy_points)
+    score = sum(
+        item.score
+        for item in report.large_cycle + report.buy_points + report.trend_rules + report.position_rules + report.exit_rules
+    )
     main_signal = _main_signal(report)
     return ScanRow(
         code=stock.code,
@@ -351,7 +354,11 @@ def _section(title: str, rows: list[ScanRow], limit: int) -> list[str]:
 
 
 def _main_signal(report) -> str:
-    active = [item.name for item in report.buy_points if item.status in {"PASS", "WARN"} and item.score > 0]
+    active = [
+        item.name
+        for item in report.buy_points + report.trend_rules + report.position_rules
+        if item.status in {"PASS", "WARN"} and item.score > 0
+    ]
     return " + ".join(active[:4]) if active else "无"
 
 

@@ -8,7 +8,12 @@ from typing import Optional
 from .models import IndicatorPoint, KLine
 
 
-def build_indicators(rows: list[KLine]) -> list[IndicatorPoint]:
+def build_indicators(
+    rows: list[KLine],
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
+) -> list[IndicatorPoint]:
     closes = [row.close for row in rows]
     highs = [row.high for row in rows]
     lows = [row.low for row in rows]
@@ -19,7 +24,7 @@ def build_indicators(rows: list[KLine]) -> list[IndicatorPoint]:
     ma60 = sma(closes, 60)
     ma120 = sma(closes, 120)
     ma250 = sma(closes, 250)
-    dif, dea, hist = macd(closes)
+    dif, dea, hist = macd(closes, macd_fast, macd_slow, macd_signal)
     rsi14 = rsi(closes, 14)
     atr14 = atr(rows, 14)
     vol_ratio = volume_ratio(volumes, 5)
@@ -106,12 +111,17 @@ def ema(values: list[float], span: int) -> list[Optional[float]]:
     return out
 
 
-def macd(values: list[float]) -> tuple[list[Optional[float]], list[Optional[float]], list[Optional[float]]]:
-    ema12 = ema(values, 12)
-    ema26 = ema(values, 26)
-    dif = [(a - b) if a is not None and b is not None else None for a, b in zip(ema12, ema26)]
+def macd(
+    values: list[float],
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[list[Optional[float]], list[Optional[float]], list[Optional[float]]]:
+    ema_fast = ema(values, fast)
+    ema_slow = ema(values, slow)
+    dif = [(a - b) if a is not None and b is not None else None for a, b in zip(ema_fast, ema_slow)]
     dif_values = [0.0 if value is None else value for value in dif]
-    dea_raw = ema(dif_values, 9)
+    dea_raw = ema(dif_values, signal)
     dea: list[Optional[float]] = []
     hist: list[Optional[float]] = []
     for d, e in zip(dif, dea_raw):

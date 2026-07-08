@@ -61,6 +61,9 @@ class AnalysisReport:
     previous_indicator: IndicatorPoint
     large_cycle: list[RuleResult] = field(default_factory=list)
     buy_points: list[RuleResult] = field(default_factory=list)
+    trend_rules: list[RuleResult] = field(default_factory=list)
+    position_rules: list[RuleResult] = field(default_factory=list)
+    exit_rules: list[RuleResult] = field(default_factory=list)
     satisfied: list[str] = field(default_factory=list)
     defects: list[str] = field(default_factory=list)
     operation_rows: list[tuple[str, str]] = field(default_factory=list)

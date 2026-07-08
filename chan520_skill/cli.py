@@ -20,6 +20,9 @@ def main(argv: list[str] | None = None) -> int:
     analyze_parser.add_argument("--csv", help="CSV path when --source csv")
     analyze_parser.add_argument("--output", help="output markdown path")
     analyze_parser.add_argument("--adjust", type=int, default=1, help="Eastmoney fqt value: 0 none, 1 qfq, 2 hfq")
+    analyze_parser.add_argument("--macd-fast", type=int, default=12, help="MACD fast EMA period")
+    analyze_parser.add_argument("--macd-slow", type=int, default=26, help="MACD slow EMA period; Tonghuashun screenshots often use 50")
+    analyze_parser.add_argument("--macd-signal", type=int, default=9, help="MACD signal EMA period")
 
     scan_parser = sub.add_parser("scan-market", help="scan HS non-ST A-share universe")
     scan_parser.add_argument("--date", required=True, help="target trade date, YYYY-MM-DD")
@@ -49,7 +52,14 @@ def run_analyze(args: argparse.Namespace) -> int:
         else:
             meta, rows = auto_history(code, target_date, adjust=args.adjust)
         rows = trim_to_date(rows, target_date)
-        report = analyze(meta, rows, target_date)
+        report = analyze(
+            meta,
+            rows,
+            target_date,
+            macd_fast=args.macd_fast,
+            macd_slow=args.macd_slow,
+            macd_signal=args.macd_signal,
+        )
         markdown = render_markdown(report)
     except Exception as exc:
         print(f"ERROR: {exc}")
