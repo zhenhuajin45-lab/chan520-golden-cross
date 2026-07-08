@@ -31,7 +31,7 @@ def evaluate_regime(symbol: str, rows: list[KLine], target: date) -> RegimeState
     point = points[-1]
     close = trimmed[-1].close
     rise60 = pct_change(trimmed[-61].close, close)
-    ma20_slope = point.slope5_deg or 0.0
+    ma20_slope = _ma_slope(points, "ma20", window=5)
     above20 = point.ma20 is not None and close > point.ma20
     above60 = point.ma60 is not None and close > point.ma60
     if above20 and above60 and rise60 >= 3 and ma20_slope >= 0:
@@ -50,6 +50,17 @@ def evaluate_regime(symbol: str, rows: list[KLine], target: date) -> RegimeState
         f"close={close:.2f}, ma20={ma20_text}, ma60={ma60_text}, rise60={rise60:.2f}%"
     )
     return RegimeState(symbol=symbol, name=INDEX_NAMES.get(symbol, symbol), date=target, regime=regime, regime_ok=ok, detail=detail)
+
+
+def _ma_slope(points, name: str, window: int = 5) -> float:
+    if len(points) < window:
+        return 0.0
+    values = [getattr(point, name) for point in points[-window:]]
+    if any(value is None for value in values):
+        return 0.0
+    first = values[0]
+    last = values[-1]
+    return (last / first - 1) * 100 if first else 0.0
 
 
 def fetch_regime(symbol: str, target: date, adjust: int = 0) -> RegimeState:

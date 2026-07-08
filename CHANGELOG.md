@@ -1,5 +1,71 @@
 # CHANGELOG
 
+## 2026-07-08 - Review v2 discipline iteration
+
+### 核心目标
+
+第二轮评审指出第一版虽然有事件驱动和基础风控，但仍偏“简易版策略”。本轮把 520 策略升级为共享账户、行业共振、风险预算和退出纪律共同约束的实战版组合回测框架。
+
+### 评审矩阵
+
+| 评审项 | 落地状态 | 代码/文档 |
+| --- | --- | --- |
+| 共享资金账户组合回测 | 已落地 | `portfolio_backtest_symbols` |
+| D+1 开盘前成交复核 | 已落地 | 涨跌停、现金、单股、行业、总仓位 cap 均在成交前复核 |
+| 单笔风险 1% | 已落地 | `RiskConfig.risk_per_trade` |
+| 单股上限 20% | 已落地 | `RiskConfig.max_position_pct` |
+| 单行业上限 40% | 已落地 | `RiskConfig.max_sector_pct` |
+| regime 总仓位 80/50/30 | 已落地 | `RiskConfig.regime_exposure` |
+| 现金保留 20% | 已落地 | `RiskConfig.cash_reserve_pct` |
+| 金字塔 5/15/30 分档 | 已落地 | `RiskConfig.pyramid_steps`，当前新仓默认首档 |
+| 四不做 | 已落地 | `entry_filters.apply_four_no_entry` |
+| R:R >= 2 | 已落地 | `EntryFilterConfig.min_rr` |
+| 行业层/三层共振 | 已落地基础版 | `sector_state_from_members`，行业映射为静态表 |
+| 移动止损 | 已落地 | `trailing_stop` |
+| 时间止损 | 已落地 | `time_stop_trigger` |
+| 3 天不创新高退出 | 已落地 | `_exit_by_discipline` |
+| 跌破 MA20 退出 | 已落地 | `_exit_by_discipline` |
+| 最大回撤/单日/单周熔断 | 已落地基础版 | `update_account_risk` |
+| 15+ 标的、5+ 行业、2 年证据 | 已落地 | `reports/backtest/*_2024-07-01_2026-07-01.*` |
+| 100 只全市场抽样 | 未完成 | 需先补行业归属缓存和批量行情稳定性 |
+
+### 新增模块
+
+- `chan520_skill/risk.py`：风险预算、仓位 cap、regime 仓位、现金保留、金字塔分档、移动止损、时间止损、账户熔断。
+- `chan520_skill/entry_filters.py`：四不做、止损距离、急涨急跌、盈亏比和盈亏平衡胜率。
+- `chan520_skill/sector.py`：行业映射、行业宽度、行业 60 日方向和行业门控。
+
+### 回测升级
+
+- `backtest_symbols` 默认委托共享账户组合引擎。
+- 历史行情先取腾讯后复权，失败回退东方财富后复权。
+- 指标预计算，避免逐日完整调用 `analyze`。
+- 同一天多只股票触发时，先预占计划现金/行业/总仓位；D+1 实际成交前再按开盘价复核所有 cap。
+- metrics 输出新增纪律合规段：`max_symbol_pct`、`max_sector_pct`、`max_exposure`、`avg_entry_rr`、`breakeven_win_rate`、拒绝次数和 regime 平均暴露。
+
+### 文档
+
+- 新增 [docs/risk.md](docs/risk.md)。
+- 新增 [docs/sector.md](docs/sector.md)。
+- 更新 [docs/backtest.md](docs/backtest.md)。
+- 更新 [DEPLOY.md](DEPLOY.md) 和 [README.md](README.md)。
+
+### 测试
+
+- 新增 `tests/test_risk.py`。
+- 新增 `tests/test_entry_filters.py`。
+- 新增 `tests/test_sector.py`。
+- 新增 `tests/test_portfolio_backtest.py`。
+- 新增 `tests/test_exit_discipline.py`。
+
+### 已知限制
+
+- 行业映射仍是静态表，未接入真实全市场行业归属缓存。
+- 行业共振使用篮子内成员宽度代理，尚未使用完整行业指数或行业成分。
+- 金字塔分档已进入仓位函数，但当前组合回测只做首仓，未实现盈利后 15%/30% 动态加仓。
+- 100 只全市场抽样未提交；公开接口批量拉取、行业映射和缓存层还需加固后再做。
+- 本项目仍是本地分析和复盘工具，不是自动下单系统。
+
 ## 2026-07-08 - Review v1 iteration
 
 ### P0-1 回测与期望值
