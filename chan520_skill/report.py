@@ -11,6 +11,8 @@ def render_markdown(report: AnalysisReport) -> str:
     lines.append(f"# {report.meta.name}（{report.meta.code}）520战法买卖点报告")
     lines.append("")
     lines.append(f"数据截止：{target.date.isoformat()} 收盘 | 收盘价：{target.close:.2f}")
+    if report.regime_state is not None:
+        lines.append(f"市场状态：{report.regime_state.regime} | {report.regime_state.detail}")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -22,7 +24,7 @@ def render_markdown(report: AnalysisReport) -> str:
                  f"MA60 {fmt(point.ma60)}；MACD DIF {fmt(point.macd_dif, 3)} / DEA {fmt(point.macd_dea, 3)}，"
                  f"柱 {fmt(point.macd_hist, 3)}。")
     lines.append("- **小周期（近期/量价）**："
-                 f"量比 {fmt(point.volume_ratio)}，MA5斜率 {fmt(point.slope5_deg)} 度，"
+                 f"5日放量倍数 {fmt(point.volume_expansion or point.volume_ratio)}，MA5斜率 {fmt(point.slope5_deg)} 度，"
                  f"RSI {fmt(point.rsi14)}，收盘相对 MA60 偏离 "
                  f"{_ma_bias(target.close, point.ma60)}。")
     lines.append("")

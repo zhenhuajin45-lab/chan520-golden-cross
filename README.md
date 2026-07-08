@@ -14,6 +14,13 @@ python -m chan520_skill analyze 600288 --date 2026-07-06
 python -m chan520_skill analyze 600288 --date 2026-07-07 --macd-slow 50
 ```
 
+事件驱动回测：
+
+```powershell
+python -m chan520_skill backtest 600288 --start 2026-01-01 --end 2026-07-01 --split-date 2026-04-01
+python -m chan520_skill backtest --basket "600288,300568,688106,002132,603638,301282,600203,300390" --start 2026-01-01 --end 2026-07-01 --split-date 2026-04-01
+```
+
 部署给其他机器或通过 GitHub 分发时，见 [DEPLOY.md](DEPLOY.md)。
 
 生成报告默认写入：
@@ -55,3 +62,4 @@ https://qt.gtimg.cn/q=sh600288
 本工具只做策略分析和复盘辅助，不构成投资建议。
 
 完整实战版规则见 [docs/practical_520_strategy.md](docs/practical_520_strategy.md)。
+回测、市场状态和 A 股微观结构见 [docs/backtest.md](docs/backtest.md)、[docs/regime.md](docs/regime.md)、[docs/microstructure.md](docs/microstructure.md)。

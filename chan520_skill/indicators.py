@@ -13,6 +13,7 @@ def build_indicators(
     macd_fast: int = 12,
     macd_slow: int = 26,
     macd_signal: int = 9,
+    vol_base: str = "prior_only",
 ) -> list[IndicatorPoint]:
     closes = [row.close for row in rows]
     highs = [row.high for row in rows]
@@ -27,7 +28,7 @@ def build_indicators(
     dif, dea, hist = macd(closes, macd_fast, macd_slow, macd_signal)
     rsi14 = rsi(closes, 14)
     atr14 = atr(rows, 14)
-    vol_ratio = volume_ratio(volumes, 5)
+    vol_ratio = volume_ratio(volumes, 5, base=vol_base)
     slope5 = slope_deg_optional(ma5, 5)
 
     result: list[IndicatorPoint] = []
@@ -48,6 +49,7 @@ def build_indicators(
                 volume_ratio=vol_ratio[i],
                 slope5_deg=slope5[i],
                 atr14=atr14[i],
+                volume_expansion=vol_ratio[i],
             )
         )
     return result
@@ -168,14 +170,34 @@ def atr(rows: list[KLine], window: int) -> list[Optional[float]]:
     return sma(true_ranges, window)
 
 
-def volume_ratio(volumes: list[float], window: int) -> list[Optional[float]]:
+def volume_ratio(volumes: list[float], window: int, base: str = "prior_only") -> list[Optional[float]]:
+    if base not in {"prior_only", "incl_today"}:
+        raise ValueError("base must be 'prior_only' or 'incl_today'")
+    out: list[Optional[float]] = []
+    for i, value in enumerate(volumes):
+        if base == "incl_today":
+            if i + 1 < window:
+                out.append(None)
+                continue
+            baseline = volumes[i + 1 - window : i + 1]
+        else:
+            if i < window:
+                out.append(None)
+                continue
+            baseline = volumes[i - window : i]
+        base_value = mean(baseline)
+        out.append(value / base_value if base_value else None)
+    return out
+
+
+def volume_ratio_including_today(volumes: list[float], window: int) -> list[Optional[float]]:
     out: list[Optional[float]] = []
     for i, value in enumerate(volumes):
         if i + 1 < window:
             out.append(None)
             continue
-        base = mean(volumes[i + 1 - window : i + 1])
-        out.append(value / base if base else None)
+        base_value = mean(volumes[i + 1 - window : i + 1])
+        out.append(value / base_value if base_value else None)
     return out
 
 

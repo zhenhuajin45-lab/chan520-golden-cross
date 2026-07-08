@@ -15,7 +15,9 @@ env/
 .codex/
 
 # Generated scan outputs
-reports/
+reports/*
+!reports/backtest/
+!reports/backtest/**
 
 # Local scratch files
 tmp/

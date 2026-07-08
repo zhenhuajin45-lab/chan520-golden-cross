@@ -36,6 +36,12 @@ pip install -r requirements.txt
 python -m chan520_skill analyze 600288 --date 2026-07-07 --source auto
 ```
 
+默认会启用市场 `regime` 降级。若只想复刻单票技术面，可关闭：
+
+```bash
+python -m chan520_skill analyze 600288 --date 2026-07-07 --no-regime
+```
+
 输出默认写入：
 
 ```text
@@ -58,12 +64,26 @@ reports/market_candidate_scan_2026-07-07.md
 reports/market_candidate_clean_2026-07-07.md
 ```
 
+## 事件驱动回测
+
+```bash
+python -m chan520_skill backtest 600288 --start 2026-01-01 --end 2026-07-01 --split-date 2026-04-01
+python -m chan520_skill backtest --basket "600288,300568,688106,002132,603638,301282,600203,300390" --start 2026-01-01 --end 2026-07-01 --split-date 2026-04-01
+```
+
+输出：
+
+```text
+reports/backtest/trades_*.csv
+reports/backtest/metrics_*.md
+```
+
 ## 注意事项
 
 - 本项目只做策略复盘和本地分析，不构成投资建议。
 - 行情接口是公开接口，可能出现限流、断开、字段变化。
 - 批量扫描采用“两阶段”：全市场报价初筛，再对候选拉历史 K 线精扫。
-- `reports/` 是生成目录，默认不提交到 GitHub。
+- `reports/` 是生成目录；普通扫描输出默认不提交到 GitHub，`reports/backtest/` 中的评审证据会提交。
 - 若需要复现某天结果，可以把对应 `reports/` 文件单独作为附件发给别人。
 
 ## 常见问题

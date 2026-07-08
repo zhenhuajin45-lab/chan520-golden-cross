@@ -43,6 +43,7 @@ class IndicatorPoint:
     volume_ratio: Optional[float]
     slope5_deg: Optional[float]
     atr14: Optional[float]
+    volume_expansion: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,17 @@ class RuleResult:
     status: str
     detail: str
     score: int = 0
+    tags: frozenset[str] = field(default_factory=frozenset)
+
+
+@dataclass(frozen=True)
+class RegimeState:
+    symbol: str
+    name: str
+    date: date
+    regime: str
+    regime_ok: bool
+    detail: str
 
 
 @dataclass
@@ -59,6 +71,7 @@ class AnalysisReport:
     target: KLine
     indicator: IndicatorPoint
     previous_indicator: IndicatorPoint
+    regime_state: RegimeState | None = None
     large_cycle: list[RuleResult] = field(default_factory=list)
     buy_points: list[RuleResult] = field(default_factory=list)
     trend_rules: list[RuleResult] = field(default_factory=list)

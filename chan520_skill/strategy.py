@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import date
 
 from .indicators import build_indicators, crossed_down, crossed_up, fmt, pct_change, weekly_bars
-from .models import AnalysisReport, IndicatorPoint, KLine, RuleResult, StockMeta
+from .microstructure import is_limit_up, is_new_stock
+from .models import AnalysisReport, IndicatorPoint, KLine, RegimeState, RuleResult, StockMeta
+from .quality import ensure_data_quality
+from .regime import degrade_verdict
 
 
 def analyze(
@@ -13,24 +16,41 @@ def analyze(
     macd_fast: int = 12,
     macd_slow: int = 26,
     macd_signal: int = 9,
+    regime_state: RegimeState | None = None,
+    min_history: int = 250,
+    stop_mode: str = "pct",
+    atr_k: float = 2.0,
+    vol_base: str = "prior_only",
 ) -> AnalysisReport:
     if len(rows) < 61:
         raise ValueError("at least 61 daily bars are required for practical 520 analysis")
-    indicators = build_indicators(rows, macd_fast=macd_fast, macd_slow=macd_slow, macd_signal=macd_signal)
+    ensure_data_quality(rows, min_bars=61)
+    indicators = build_indicators(
+        rows,
+        macd_fast=macd_fast,
+        macd_slow=macd_slow,
+        macd_signal=macd_signal,
+        vol_base=vol_base,
+    )
     target = rows[-1]
     point = indicators[-1]
     prev = indicators[-2]
-    report = AnalysisReport(meta=meta, target=target, indicator=point, previous_indicator=prev)
+    report = AnalysisReport(meta=meta, target=target, indicator=point, previous_indicator=prev, regime_state=regime_state)
 
     report.large_cycle = _large_cycle(rows, indicators, macd_fast, macd_slow, macd_signal)
-    report.buy_points = _buy_points(rows, indicators)
+    report.buy_points = _buy_points(meta.code, rows, indicators)
     report.trend_rules = _trend_5day_rules(rows, indicators)
     report.position_rules = _position_rules(rows, indicators)
     report.exit_rules = _exit_rules(rows, indicators)
     report.satisfied = _satisfied_conditions(rows, indicators, report)
-    report.defects = _defects(rows, indicators, report)
+    report.defects = _defects(rows, indicators, report, min_history=min_history)
     report.verdict, report.level = _verdict(report)
-    report.operation_rows = _operations(rows, report)
+    if regime_state is not None and not regime_state.regime_ok:
+        old_verdict = report.verdict
+        report.verdict = degrade_verdict(report.verdict)
+        report.level = "regime降级" if report.verdict != old_verdict else report.level
+        report.defects.append(f"市场regime过滤未通过：{regime_state.detail}")
+    report.operation_rows = _operations(rows, report, stop_mode=stop_mode, atr_k=atr_k)
     report.core_summary = _core_summary(report)
     return report
 
@@ -108,13 +128,13 @@ def _mode_filter(rows: list[KLine], indicators: list[IndicatorPoint]) -> RuleRes
     bottom_rebound = target.pct_chg >= 3 and _volume_ok(point, 1.5) and point.ma20 is not None and target.close >= point.ma20 * 0.96
     if trend_up or platform_break:
         detail = "符合“只做三种形态”中的趋势向上/平台放量突破。"
-        return RuleResult("交易模式过滤", "PASS", detail, 2)
+        return RuleResult("交易模式过滤", "PASS", detail, 2, frozenset({"mode_ok"}))
     if bottom_rebound:
-        return RuleResult("交易模式过滤", "WARN", "底部放量反弹形态接近成立，但必须等待趋势不破确认。", 1)
-    return RuleResult("交易模式过滤", "FAIL", "不属于趋势向上、平台放量突破或底部放量反弹的清晰形态。", -2)
+        return RuleResult("交易模式过滤", "WARN", "底部放量反弹形态接近成立，但必须等待趋势不破确认。", 1, frozenset({"mode_repair"}))
+    return RuleResult("交易模式过滤", "FAIL", "不属于趋势向上、平台放量突破或底部放量反弹的清晰形态。", -2, frozenset({"mode_fail"}))
 
 
-def _buy_points(rows: list[KLine], indicators: list[IndicatorPoint]) -> list[RuleResult]:
+def _buy_points(code: str, rows: list[KLine], indicators: list[IndicatorPoint]) -> list[RuleResult]:
     target = rows[-1]
     point = indicators[-1]
     prev = indicators[-2]
@@ -127,19 +147,26 @@ def _buy_points(rows: list[KLine], indicators: list[IndicatorPoint]) -> list[Rul
     large_ok = pct_change(rows[-61].close, target.close) >= 5
     volume_ok = _volume_ok(point, 1.2)
     extended = _is_extended(target, point)
+    limit_up = is_limit_up(target, rows[-2].close, code) if len(rows) >= 2 else False
 
     if cross_age is not None and above_ma:
         fresh = cross_age == 0
-        standard = fresh and macd_strong and large_ok and volume_ok and not extended
+        standard = fresh and macd_strong and large_ok and volume_ok and not extended and not limit_up
         status = "PASS" if standard else "WARN"
         stage = "当天触发" if fresh else f"触发后第{cross_age + 1}日确认"
         detail = (
             f"{stage}。MA5 {fmt(point.ma5)} > MA20 {fmt(point.ma20)}，收盘 {target.close:.2f} 在双均线上方；"
             f"MACD DIF {fmt(point.macd_dif, 3)} / DEA {fmt(point.macd_dea, 3)}，量比 {fmt(point.volume_ratio)}。"
         )
+        tags = {"buy_520"}
         if not standard:
             detail += " 未同时满足大周期、零轴MACD、量能或低偏离要求，按弱化/确认期处理。"
-        results.append(RuleResult("520金叉买", status, detail, 4 if standard else 2))
+        if extended:
+            tags.add("extended")
+        if limit_up:
+            detail += " 金叉日接近涨停封板，按不可成交/等待回踩处理。"
+            tags.add("limit_untradable")
+        results.append(RuleResult("520金叉买", status, detail, 4 if standard else 2, frozenset(tags)))
     else:
         results.append(
             RuleResult(
@@ -147,6 +174,7 @@ def _buy_points(rows: list[KLine], indicators: list[IndicatorPoint]) -> list[Rul
                 "FAIL",
                 f"未触发近3日520金叉。今日 MA5 {fmt(point.ma5)}，MA20 {fmt(point.ma20)}；昨日 MA5/MA20 {fmt(prev.ma5)}/{fmt(prev.ma20)}。",
                 -2,
+                frozenset({"buy_520_fail"}),
             )
         )
 
@@ -158,14 +186,15 @@ def _buy_points(rows: list[KLine], indicators: list[IndicatorPoint]) -> list[Rul
                 f"DIF {fmt(point.macd_dif, 3)} > DEA {fmt(point.macd_dea, 3)}，柱 {fmt(point.macd_hist, 3)}。"
                 + ("零轴上方，强信号。" if macd_strong else "零轴未完全站上，信号偏弱但正在修复。"),
                 2 if macd_strong else 1,
+                frozenset({"macd_gold"}),
             )
         )
     else:
-        results.append(RuleResult("MACD同步金叉", "FAIL", f"DIF {fmt(point.macd_dif, 3)} <= DEA {fmt(point.macd_dea, 3)}。", -1))
+        results.append(RuleResult("MACD同步金叉", "FAIL", f"DIF {fmt(point.macd_dif, 3)} <= DEA {fmt(point.macd_dea, 3)}。", -1, frozenset({"macd_fail"})))
 
     if point.ma20 and target.low <= point.ma20 * 1.02 and target.close >= point.ma20 and cross_age is None:
         score = 2 if _volume_ok(point, 1.1) and _ma_turning_up(indicators, "ma5") else 1
-        results.append(RuleResult("回踩MA20支撑买", "PASS" if score == 2 else "WARN", f"回踩/接近 MA20 {fmt(point.ma20)} 后收回。", score))
+        results.append(RuleResult("回踩MA20支撑买", "PASS" if score == 2 else "WARN", f"回踩/接近 MA20 {fmt(point.ma20)} 后收回。", score, frozenset({"pullback_ma20"})))
     else:
         results.append(RuleResult("回踩MA20支撑买", "FAIL", "不在上涨趋势回踩 MA20 不破的低吸结构。", 0))
 
@@ -181,7 +210,7 @@ def _buy_points(rows: list[KLine], indicators: list[IndicatorPoint]) -> list[Rul
             )
         )
     else:
-        results.append(RuleResult("突破回踩买", "FAIL", f"未站上 MA60 {fmt(point.ma60)}。", -1))
+        results.append(RuleResult("突破回踩买", "FAIL", f"未站上 MA60 {fmt(point.ma60)}。", -1, frozenset({"ma60_fail"})))
 
     if _chan_first_buy(rows, indicators):
         results.append(RuleResult("缠论一买", "WARN", "阶段新低后 MACD 下行动能未同步创新低，属于左侧试错结构。", 1))
@@ -280,11 +309,14 @@ def _position_rules(rows: list[KLine], indicators: list[IndicatorPoint]) -> list
         and not _is_extended(target, point)
     )
     if breakout_add:
-        add_rule = RuleResult("顺势加仓位置", "PASS", "首次突破近20日平台/压力且未明显追高，可按金字塔方式加仓。", 2)
+        add_rule = RuleResult("顺势加仓位置", "PASS", "首次突破近20日平台/压力且未明显追高，可按金字塔方式加仓。", 2, frozenset({"add_ok"}))
     elif pullback_add:
-        add_rule = RuleResult("顺势加仓位置", "WARN", "上升趋势回踩10日线附近止跌，属于观察型加仓点。", 1)
+        add_rule = RuleResult("顺势加仓位置", "WARN", "上升趋势回踩10日线附近止跌，属于观察型加仓点。", 1, frozenset({"add_watch"}))
     else:
-        add_rule = RuleResult("顺势加仓位置", "FAIL", "当前不是低风险加仓点；追高或逆势补仓都不符合材料纪律。", -1 if _is_extended(target, point) else 0)
+        tags = {"add_fail"}
+        if _is_extended(target, point):
+            tags.add("extended")
+        add_rule = RuleResult("顺势加仓位置", "FAIL", "当前不是低风险加仓点；追高或逆势补仓都不符合材料纪律。", -1 if _is_extended(target, point) else 0, frozenset(tags))
 
     no_average_down = "PASS" if point.ma20 and target.close >= point.ma20 else "WARN"
     return [
@@ -350,7 +382,7 @@ def _satisfied_conditions(rows: list[KLine], indicators: list[IndicatorPoint], r
     return out
 
 
-def _defects(rows: list[KLine], indicators: list[IndicatorPoint], report: AnalysisReport) -> list[str]:
+def _defects(rows: list[KLine], indicators: list[IndicatorPoint], report: AnalysisReport, min_history: int) -> list[str]:
     target = rows[-1]
     point = indicators[-1]
     defects: list[str] = []
@@ -365,6 +397,8 @@ def _defects(rows: list[KLine], indicators: list[IndicatorPoint], report: Analys
         defects.append("短线偏离5日线或20日线过大，空仓不宜追高，等待回踩确认")
     if point.rsi14 and point.rsi14 > 72:
         defects.append("RSI进入偏热区，追买风险上升")
+    if is_new_stock(rows, min_history=min_history):
+        defects.append(f"历史数据不足 {min_history} 根K线，长期过滤降级，按次新/样本不足处理")
     if any(item.status == "WARN" and item.score < 0 for item in report.exit_rules):
         defects.append("已有退出/止盈风险项被触发，买点失效或不适合新开仓")
     return defects
@@ -375,7 +409,7 @@ def _verdict(report: AnalysisReport) -> tuple[str, str]:
     buy520 = _find_rule(report.buy_points, "520金叉买")
     trend5 = _find_rule(report.trend_rules, "趋势5日线买入法")
     exit_risk = any(item.status == "WARN" and item.score <= -2 for item in report.exit_rules)
-    extended = any("追高" in item or "偏离" in item for item in report.defects)
+    extended = _has_tag(report, "extended")
     if exit_risk:
         return "回避/减仓观察", "风控"
     if buy520 and buy520.status == "PASS" and score >= 9 and len(report.defects) <= 1:
@@ -391,10 +425,10 @@ def _verdict(report: AnalysisReport) -> tuple[str, str]:
     return "不入选", "回避"
 
 
-def _operations(rows: list[KLine], report: AnalysisReport) -> list[tuple[str, str]]:
+def _operations(rows: list[KLine], report: AnalysisReport, stop_mode: str, atr_k: float) -> list[tuple[str, str]]:
     point = report.indicator
     close = report.target.close
-    stop = _stop_hint(report)
+    stop = _stop_hint(report, mode=stop_mode, atr_k=atr_k)
     target1 = _recent_high_hint(rows, close)
     rr = (target1 - close) / (close - stop) if close > stop else 0.0
     extended = _is_extended(report.target, point)
@@ -433,9 +467,11 @@ def _score(report: AnalysisReport) -> int:
     )
 
 
-def _stop_hint(report: AnalysisReport) -> float:
+def _stop_hint(report: AnalysisReport, mode: str = "pct", atr_k: float = 2.0) -> float:
     close = report.target.close
     point = report.indicator
+    if mode == "atr" and point.atr14:
+        return max(close - atr_k * point.atr14, 0.01)
     candidates = [close * 0.95]
     if point.ma20:
         candidates.append(point.ma20 * 0.97)
@@ -500,6 +536,13 @@ def _find_rule(items: list[RuleResult], name: str) -> RuleResult | None:
         if item.name == name:
             return item
     return None
+
+
+def _has_tag(report: AnalysisReport, tag: str) -> bool:
+    return any(
+        tag in item.tags
+        for item in report.large_cycle + report.buy_points + report.trend_rules + report.position_rules + report.exit_rules
+    )
 
 
 def _chan_first_buy(rows: list[KLine], indicators: list[IndicatorPoint]) -> bool:

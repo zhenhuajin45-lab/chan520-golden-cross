@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import platform
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,7 +17,7 @@ from urllib.request import Request, urlopen
 
 import requests
 
-from .data import DataError, normalize_code, trim_to_date
+from .data import DataError, auto_history, normalize_code, trim_to_date
 from .models import KLine, StockMeta
 from .strategy import analyze
 from .indicators import fmt
@@ -160,7 +161,15 @@ def scan_market(
         "selected": sum(1 for row in rows if row.verdict == "入选"),
         "watch": sum(1 for row in rows if row.verdict.startswith("观察")),
         "not_selected": sum(1 for row in rows if row.verdict == "不入选"),
+        "success": len(rows),
+        "failed": failures,
+        "suspended": 0,
+        "insufficient": 0,
     }
+    success_rate = len(rows) / len(universe) if universe else 0.0
+    stats["coverage_below_threshold"] = success_rate < 0.85
+    if stats["coverage_below_threshold"]:
+        print(f"WARNING: scan coverage {success_rate:.2%} below 85% threshold", flush=True)
     return csv_path, md_path, stats
 
 
@@ -170,7 +179,12 @@ def _scan_one(stock: UniverseStock, target: date) -> ScanRow | None:
         rows = trim_to_date(klines, target)
         report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
     except Exception:
-        return None
+        try:
+            meta, rows = auto_history(stock.code, target)
+            rows = trim_to_date(rows, target)
+            report = analyze(StockMeta(code=stock.code, name=meta.name or stock.name, market=stock.market), rows, target)
+        except Exception:
+            return None
     score = sum(
         item.score
         for item in report.large_cycle + report.buy_points + report.trend_rules + report.position_rules + report.exit_rules
@@ -264,10 +278,11 @@ def _read_json(url: str, timeout: int, referer: str, attempts: int = 3) -> dict:
             last_error = exc
             if attempt < attempts:
                 time.sleep(0.4 * attempt)
-    try:
-        return _read_json_with_powershell(url, timeout)
-    except Exception as exc:
-        last_error = exc
+    if platform.system() == "Windows":
+        try:
+            return _read_json_with_powershell(url, timeout)
+        except Exception as exc:
+            last_error = exc
     raise DataError(f"read json failed after {attempts} attempts: {last_error}")
 
 
