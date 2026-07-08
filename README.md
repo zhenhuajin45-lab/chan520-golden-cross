@@ -22,6 +22,12 @@ python -m chan520_skill analyze 600288 --date 2026-07-07 --macd-slow 50
 reports/600288_2026-07-06.md
 ```
 
+复跑旧观察池：
+
+```powershell
+python scripts/rescan_observe_candidates.py
+```
+
 ## 数据源
 
 默认 `--source auto`：先使用东方财富历史 K 线接口，失败时自动切换腾讯历史 K 线。
