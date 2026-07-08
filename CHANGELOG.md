@@ -1,5 +1,78 @@
 # CHANGELOG
 
+## 2026-07-08 - Review v3 credible backtest iteration
+
+### 总结
+
+第三轮目标是让回测成为公平检验，而不是让 EV 好看。本轮修复仓位塌缩、真实大盘层、真实信号、板块层退化、移动止损过紧和统计口径不足的问题。修复后 30 只、2 年样本只产生 3 笔标准入选交易，样本不足 100 笔，因此不对策略 EV 下结论。
+
+### M 仓位规模
+
+- `allowed_new_position_shares` 删除“不足 1 手兜底买 1 手”路径。
+- 首仓现在取风险预算、首仓资金上限、单股 cap、行业 cap、总仓位 cap、现金保留的最小整手。
+- 新增 `RiskConfig.first_tranche_pct=0.15`。
+- 新增 `tests/test_sizing_realized_risk.py`。
+
+### R 止损与目标位
+
+- `trailing_stop` 增加 `trail_activation=4%`，盈利未达到阈值前不抬到成本价。
+- 目标位改为结构化目标：前摆动高、量度升幅、`entry + 3*ATR` 中较高者。
+- 更新退出纪律测试。
+
+### N 金字塔加仓
+
+- 组合回测支持 `add` 加仓单。
+- 已盈利、趋势未破、突破新高或回踩均线止跌时才允许加仓。
+- 加仓会更新持仓均价、股数、止损和 `pyramid_stage`。
+- 新增 `tests/test_pyramiding.py`。
+
+### O 真实指数 Regime
+
+- 组合回测默认使用 `000300` 沪深300指数 regime。
+- 停用篮子宽度作为大盘层门控来源。
+- 指数历史优先东方财富，失败回退腾讯指数日线。
+- 新增 `--regime-index`。
+- 新增 `tests/test_backtest_regime.py`。
+
+### P 板块层收窄
+
+- 未接入真实行业成分前，组合回测默认 `use_sector=False`，不再宣称完整三层共振。
+- 行业映射仍用于单行业 40% 风险 cap。
+- `--use-sector` 可显式启用当前代理行业宽度门控。
+
+### Q 真实信号
+
+- 组合回测入场判定改为真实 `analyze()` 的 `verdict == "入选"`。
+- `_portfolio_signal` 不再作为入场来源。
+- 为性能仅对标准 520 必要条件日期调用完整 `analyze()`；该预过滤不会改变“入选”集合。
+
+### S 不变量测试
+
+- 新增组合级无前视测试：篡改中间日之后 K 线，已发生入场字段不变。
+- cap 测试新增可压到 cap 的场景。
+- 涨停拒买、风险预算、加仓和指数 regime 均有离线测试。
+
+### T 新证据
+
+- 新增 `reports/backtest/v3/trades_basket_2024-07-01_2026-07-01.csv`。
+- 新增 `reports/backtest/v3/metrics_basket_2024-07-01_2026-07-01.md`。
+- 新 metrics 包含 `trimmed_expectancy_5pct`、`median_trade_pnl`、`expectancy_ci95_low/high`、`sample_sufficient`、`avg_entry_risk_pct`、`max_entry_risk_pct`、`pyramid_adds`。
+- 第三轮证据：30 只、2024-07-01 至 2026-07-01、交易 3 笔、`expectancy=-132.95`、`sample_sufficient=0`。样本不足，不下 EV 结论。
+- 第二轮 15 只证据保留为历史文件，但因仓位塌缩为 1 手，已废弃为策略判断依据。
+
+### 工程文档
+
+- 新增 [docs/architecture.md](docs/architecture.md)。
+- 新增 [docs/testing.md](docs/testing.md)。
+- 新增 [assumptions.md](assumptions.md)。
+
+### 已知限制
+
+- 尚未完成完整 `decide()` 纯函数与 `PaperRunner` 双运行器。
+- 尚未提交离线 30/100 股票真实快照夹具；v3 证据仍依赖公开接口实时拉取。
+- 真实行业成分和行业指数未接入，板块门控默认关闭。
+- 30 只样本只有 3 笔标准交易，必须扩大池子或单独研究观察级信号，才能评估统计边际。
+
 ## 2026-07-08 - Review v2 discipline iteration
 
 ### 核心目标

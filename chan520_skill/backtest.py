@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import csv
 import math
+import random
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from statistics import mean, pstdev
+from statistics import median, mean, pstdev
 
 from .entry_filters import EntryFilterConfig, apply_four_no_entry, breakeven_win_rate
 from .indicators import build_indicators, crossed_up, pct_change
@@ -13,6 +14,7 @@ from .data import DataError, eastmoney_history, normalize_code, tencent_history
 from .microstructure import is_limit_down, is_limit_up, price_limit
 from .models import IndicatorPoint, KLine, RegimeState, StockMeta
 from .quality import ensure_data_quality
+from .regime import index_history
 from .risk import AccountRiskState, RiskConfig, allowed_new_position_shares, time_stop_trigger, trailing_stop, update_account_risk
 from .sector import DEFAULT_SECTOR_MAP, SectorState, industry_of, sector_state_from_members
 from .strategy import analyze
@@ -36,6 +38,8 @@ class BacktestConfig:
     slippage_bps: float = SLIPPAGE_BPS
     split_date: date | None = None
     min_history: int = 250
+    regime_index: str = "000300"
+    use_sector: bool = False
 
 
 @dataclass(frozen=True)
@@ -216,6 +220,7 @@ def portfolio_backtest_symbols(
     risk_config: RiskConfig | None = None,
     entry_config: EntryFilterConfig | None = None,
     sector_map: dict[str, str] | None = None,
+    index_rows: list[KLine] | None = None,
 ) -> tuple[Path, Path, dict[str, float]]:
     config = config or BacktestConfig()
     risk_config = risk_config or RiskConfig()
@@ -227,6 +232,7 @@ def portfolio_backtest_symbols(
     points_by_date: dict[str, dict[date, IndicatorPoint]] = {}
     rows_by_date: dict[str, dict[date, KLine]] = {}
     row_index_by_date: dict[str, dict[date, int]] = {}
+    verdicts_by_date: dict[str, dict[date, str]] = {}
 
     for idx, symbol in enumerate(symbols, 1):
         code = normalize_code(symbol)
@@ -247,7 +253,12 @@ def portfolio_backtest_symbols(
         print(f"loaded {idx}/{len(symbols)} {code} rows={len(rows)}", flush=True)
 
     all_dates = sorted({row.date for rows in histories.values() for row in rows if start <= row.date <= end})
-    regime_by_date = {day: _basket_regime_from_points(rows_by_date, points_by_date, day) for day in all_dates}
+    for code, rows in histories.items():
+        verdicts_by_date[code] = _analyze_verdicts(metas[code], rows, all_dates, config)
+    if index_rows is None:
+        lookback = max((end - start).days + 620, 1000)
+        index_rows = index_history(config.regime_index, end, lookback_days=lookback)
+    regime_by_date = _regime_by_date_from_index(config.regime_index, index_rows, all_dates)
     sector_states_by_date = {
         day: _sector_states_from_points(histories, sector_map, rows_by_date, points_by_date, row_index_by_date, day)
         for day in all_dates
@@ -263,7 +274,9 @@ def portfolio_backtest_symbols(
         "rejected_four_no": 0,
         "rejected_caps": 0,
         "limit_blocked": 0,
+        "adds": 0,
         "rr_values": [],
+        "entry_risk_pct": [],
         "max_symbol_pct": 0.0,
         "max_sector_pct": 0.0,
         "max_exposure": 0.0,
@@ -315,8 +328,13 @@ def portfolio_backtest_symbols(
                     )
                 )
                 del positions[order.code]
-            elif order.side == "buy":
-                if order.code in positions or risk_state.halted_today or risk_state.stopped_for_drawdown:
+            elif order.side in {"buy", "add"}:
+                pos = positions.get(order.code)
+                if order.side == "buy" and pos is not None:
+                    continue
+                if order.side == "add" and pos is None:
+                    continue
+                if risk_state.halted_today or risk_state.stopped_for_drawdown:
                     continue
                 if _open_limit_up(row, prev.close, order.code):
                     discipline["limit_blocked"] += 1
@@ -332,12 +350,12 @@ def portfolio_backtest_symbols(
                     cash=cash,
                     entry=fill,
                     stop=order.stop,
-                    current_symbol_value=0.0,
+                    current_symbol_value=_position_value(pos, rows_by_date, day) if pos else 0.0,
                     current_sector_value=sector_values.get(industry, 0.0),
                     current_gross_value=current_gross,
                     regime=execution_regime.regime,
                     config=risk_config,
-                    pyramid_stage=0,
+                    pyramid_stage=(pos.pyramid_stage + 1) if pos else 0,
                     sector_multiplier=0.5 if risk_state.next_week_half_size else 1.0,
                 )
                 shares = min(order.shares, allowed_at_open, int((cash // (fill * 100)) * 100))
@@ -350,20 +368,31 @@ def portfolio_backtest_symbols(
                     discipline["rejected_caps"] += 1
                     continue
                 cash -= total
-                meta = metas[order.code]
-                positions[order.code] = Position(
-                    code=order.code,
-                    name=meta.name,
-                    industry=industry,
-                    shares=shares,
-                    entry_price=fill,
-                    entry_date=day,
-                    entry_reason=order.reason,
-                    stop=order.stop,
-                    highest_high=row.high,
-                )
-                discipline["entries"] += 1
+                if pos is not None:
+                    new_total = pos.shares + shares
+                    pos.entry_price = (pos.entry_price * pos.shares + fill * shares) / new_total
+                    pos.shares = new_total
+                    pos.stop = max(pos.stop, order.stop)
+                    pos.highest_high = max(pos.highest_high, row.high)
+                    pos.pyramid_stage += 1
+                    discipline["adds"] += 1
+                else:
+                    meta = metas[order.code]
+                    positions[order.code] = Position(
+                        code=order.code,
+                        name=meta.name,
+                        industry=industry,
+                        shares=shares,
+                        entry_price=fill,
+                        entry_date=day,
+                        entry_reason=order.reason,
+                        stop=order.stop,
+                        highest_high=row.high,
+                    )
+                    discipline["entries"] += 1
                 discipline["rr_values"].append(order.rr)
+                if current_equity > 0:
+                    discipline["entry_risk_pct"].append(max(fill - order.stop, 0) * shares / current_equity)
         pending = remaining_pending
 
         sector_states = sector_states_by_date.get(day, {})
@@ -382,25 +411,52 @@ def portfolio_backtest_symbols(
             if row is None or point is None:
                 continue
             pos.highest_high = max(pos.highest_high, row.high)
-            pos.stop = max(pos.stop, trailing_stop(pos.entry_price, row.close, point.ma10, point.atr14, risk_config))
+            pos.stop = max(pos.stop, trailing_stop(pos.entry_price, row.close, point.ma10, point.atr14, risk_config, current_stop=pos.stop))
             if _exit_by_discipline(pos, row, histories[pos.code], day, point, risk_config):
                 pending.append(PendingOrder(pos.code, "sell", "discipline_exit"))
+                continue
+            if _add_signal(pos, row, histories[pos.code], day, point) and not any(
+                order.code == pos.code and order.side in {"add", "sell"} for order in pending
+            ):
+                add_stop = max(pos.stop, _initial_stop(row, point, risk_config))
+                add_target = _target_price(histories[pos.code], day, row.close, risk_config)
+                add_decision = apply_four_no_entry("入选", row, point, pos.code, row.close, add_stop, add_target, entry_config)
+                if add_decision.ok:
+                    shares = allowed_new_position_shares(
+                        equity=equity,
+                        cash=planned_cash,
+                        entry=row.close,
+                        stop=add_stop,
+                        current_symbol_value=_position_value(pos, rows_by_date, day),
+                        current_sector_value=planned_sector_values.get(pos.industry, 0.0),
+                        current_gross_value=planned_gross,
+                        regime=regime.regime,
+                        config=risk_config,
+                        pyramid_stage=pos.pyramid_stage + 1,
+                        sector_multiplier=0.5 if risk_state.next_week_half_size else 1.0,
+                    )
+                    if shares > 0:
+                        pending.append(PendingOrder(pos.code, "add", "pyramid_add", shares=shares, stop=add_stop, rr=add_decision.rr))
+                        planned_value = row.close * shares
+                        planned_cash -= planned_value
+                        planned_gross += planned_value
+                        planned_sector_values[pos.industry] = planned_sector_values.get(pos.industry, 0.0) + planned_value
 
         for code, rows in histories.items():
             if code in positions or risk_state.halted_today or risk_state.stopped_for_drawdown:
                 continue
             row = rows_by_date[code].get(day)
             point = points_by_date[code].get(day)
-            prev_point = _previous_point(indicators[code], day)
-            if row is None or point is None or prev_point is None:
+            if row is None or point is None:
                 continue
-            verdict = _portfolio_signal(prev_point, point, row)
+            verdict = verdicts_by_date.get(code, {}).get(day, "不入选")
             industry = industry_of(code, sector_map)
             sector_state = sector_states.get(industry, SectorState(industry, day, "unknown", False, 0.0, "missing"))
-            if not regime.regime_ok or not sector_state.sector_ok or verdict != "入选":
+            sector_ok = sector_state.sector_ok if config.use_sector else True
+            if not regime.regime_ok or not sector_ok or verdict != "入选":
                 continue
             stop = _initial_stop(row, point, risk_config)
-            target = _target_price(rows, day, row.close)
+            target = _target_price(rows, day, row.close, risk_config)
             decision = apply_four_no_entry(verdict, row, point, code, row.close, stop, target, entry_config)
             if not decision.ok:
                 discipline["rejected_four_no"] += 1
@@ -535,6 +591,8 @@ def metrics_from_trades(
         "total_return": total_return,
         "cagr": cagr,
         "expectancy": ev,
+        "trimmed_expectancy_5pct": _trimmed_mean([trade.net_pnl for trade in trades], trim_pct=0.05),
+        "median_trade_pnl": median([trade.net_pnl for trade in trades]) if trades else 0.0,
         "win_rate": win_rate,
         "payoff_ratio": payoff,
         "profit_factor": profit_factor,
@@ -544,6 +602,10 @@ def metrics_from_trades(
         "avg_holding_days": mean([trade.holding_days for trade in trades]) if trades else 0.0,
         "exposure": exposure_days / len(equity_curve) if equity_curve else 0.0,
     }
+    lo, hi = _bootstrap_mean_ci([trade.net_pnl for trade in trades])
+    metrics["expectancy_ci95_low"] = lo
+    metrics["expectancy_ci95_high"] = hi
+    metrics["sample_sufficient"] = 1.0 if len(trades) >= 100 else 0.0
     if split_date:
         is_trades = [trade for trade in trades if trade.entry_date < split_date]
         oos_trades = [trade for trade in trades if trade.entry_date >= split_date]
@@ -622,7 +684,10 @@ def _write_metrics(
                 f"- 总仓位上限：trend_up/range/down = 80%/50%/30%，实测最大 {discipline.get('max_exposure', 0):.2%}。",
                 f"- 四不做：拒绝 {discipline.get('rejected_four_no', 0)} 次；入场档位 `{entry_config.entry_tier}`；最小 R:R {entry_config.min_rr:.2f}。",
                 f"- 盈亏比：实际入场最小 R:R {min_rr:.2f}，平均 R:R {avg_rr:.2f}，对应盈亏平衡胜率 {breakeven_win_rate(avg_rr):.2%}。",
-                f"- 熔断/仓位：仓位被 cap 拒绝 {discipline.get('rejected_caps', 0)} 次，涨跌停阻断 {discipline.get('limit_blocked', 0)} 次。",
+                f"- 实测风险：平均 {metrics.get('avg_entry_risk_pct', 0):.2%}，最大 {metrics.get('max_entry_risk_pct', 0):.2%}，目标 {risk_config.risk_per_trade:.2%}。",
+                f"- 金字塔：加仓 {discipline.get('adds', 0)} 次。",
+                f"- 熔断/仓位：仓位被 cap/整手约束拒绝 {discipline.get('rejected_caps', 0)} 次，涨跌停阻断 {discipline.get('limit_blocked', 0)} 次。",
+                f"- 样本判定：交易笔数 {metrics.get('trade_count', 0):.0f}，{'满足' if metrics.get('sample_sufficient', 0) else '不足'} 100 笔 EV 结论门槛。",
                 "",
                 "| Regime | Average Exposure |",
                 "| --- | ---: |",
@@ -643,8 +708,35 @@ def _add_discipline_metrics(metrics: dict[str, float], discipline: dict) -> None
     metrics["max_exposure"] = discipline.get("max_exposure", 0.0)
     metrics["discipline_entries"] = float(discipline.get("entries", 0))
     rr_values = discipline.get("rr_values", [])
+    risk_values = discipline.get("entry_risk_pct", [])
     metrics["avg_entry_rr"] = mean(rr_values) if rr_values else 0.0
+    metrics["avg_entry_risk_pct"] = mean(risk_values) if risk_values else 0.0
+    metrics["max_entry_risk_pct"] = max(risk_values) if risk_values else 0.0
+    metrics["pyramid_adds"] = float(discipline.get("adds", 0))
     metrics["breakeven_win_rate"] = breakeven_win_rate(metrics["payoff_ratio"]) if metrics["payoff_ratio"] != math.inf else 0.0
+
+
+def _trimmed_mean(values: list[float], trim_pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    cut = int(len(ordered) * trim_pct)
+    trimmed = ordered[cut : len(ordered) - cut] if cut and len(ordered) > 2 * cut else ordered
+    return mean(trimmed) if trimmed else 0.0
+
+
+def _bootstrap_mean_ci(values: list[float], iterations: int = 500, seed: int = 520) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    rng = random.Random(seed)
+    means: list[float] = []
+    for _ in range(iterations):
+        sample = [values[rng.randrange(len(values))] for _item in values]
+        means.append(mean(sample))
+    means.sort()
+    low_idx = int(iterations * 0.025)
+    high_idx = min(iterations - 1, int(iterations * 0.975))
+    return means[low_idx], means[high_idx]
 
 
 def _positions_value(positions: dict[str, Position], rows_by_date: dict[str, dict[date, KLine]], day: date) -> float:
@@ -712,12 +804,16 @@ def _initial_stop(row: KLine, point: IndicatorPoint, config: RiskConfig) -> floa
     return row.close * 0.92
 
 
-def _target_price(rows: list[KLine], day: date, close: float) -> float:
+def _target_price(rows: list[KLine], day: date, close: float, config: RiskConfig) -> float:
     history = [row for row in rows if row.date <= day]
-    recent = history[-60:-1]
-    if not recent:
+    if not history:
         return close * 1.1
-    return max(max(row.high for row in recent), close * 1.02)
+    point = build_indicators(history)[-1]
+    recent = history[-80:-1]
+    swing_high = max((row.high for row in recent), default=close * 1.06)
+    atr_target = close + (point.atr14 or close * 0.03) * config.target_atr_k
+    measured_target = close + max(close - min(row.low for row in history[-20:]), close * 0.04)
+    return max(swing_high, atr_target, measured_target)
 
 
 def _basket_regime(histories: dict[str, list[KLine]], day: date) -> RegimeState:
@@ -743,6 +839,95 @@ def _sector_states_for_day(
         industry = industry_of(code, sector_map)
         grouped.setdefault(industry, {})[code] = rows
     return {industry: sector_state_from_members(industry, member_rows, day) for industry, member_rows in grouped.items()}
+
+
+def _analyze_verdicts(meta: StockMeta, rows: list[KLine], all_dates: list[date], config: BacktestConfig) -> dict[date, str]:
+    wanted = set(all_dates)
+    verdicts: dict[date, str] = {}
+    indicators = build_indicators(rows)
+    for idx, row in enumerate(rows):
+        if row.date not in wanted or idx + 1 < 61:
+            continue
+        if not _could_be_standard_520(rows, indicators, idx):
+            verdicts[row.date] = "不入选"
+            continue
+        report = analyze(meta, rows[: idx + 1], row.date, regime_state=None, min_history=config.min_history)
+        verdicts[row.date] = report.verdict
+    return verdicts
+
+
+def _could_be_standard_520(rows: list[KLine], points: list[IndicatorPoint], idx: int) -> bool:
+    row = rows[idx]
+    point = points[idx]
+    if not _recent_520_cross(points, idx, lookback=3):
+        return False
+    if not (point.ma5 and point.ma20 and row.close > point.ma5 and row.close > point.ma20):
+        return False
+    if not (point.macd_dif is not None and point.macd_dea is not None and point.macd_dif > point.macd_dea > 0):
+        return False
+    if pct_change(rows[idx - 60].close, row.close) < 5:
+        return False
+    if (point.volume_expansion or point.volume_ratio or 0) < 1.2:
+        return False
+    if point.rsi14 is not None and point.rsi14 > 72:
+        return False
+    return True
+
+
+def _recent_520_cross(points: list[IndicatorPoint], idx: int, lookback: int) -> bool:
+    start = max(1, idx - lookback)
+    for pos in range(start, idx + 1):
+        prev = points[pos - 1]
+        cur = points[pos]
+        if crossed_up(prev.ma5, prev.ma20, cur.ma5, cur.ma20):
+            return True
+    return False
+
+
+def _regime_by_date_from_index(symbol: str, rows: list[KLine], all_dates: list[date]) -> dict[date, RegimeState]:
+    if not rows:
+        raise DataError("index regime rows are empty")
+    sorted_rows = sorted(rows, key=lambda row: row.date)
+    points = build_indicators(sorted_rows)
+    out: dict[date, RegimeState] = {}
+    row_idx = 0
+    for day in all_dates:
+        while row_idx + 1 < len(sorted_rows) and sorted_rows[row_idx + 1].date <= day:
+            row_idx += 1
+        current = sorted_rows[row_idx]
+        if current.date > day:
+            out[day] = RegimeState(symbol, symbol, day, "down", False, "指数数据不足")
+            continue
+        if row_idx < 60:
+            out[day] = RegimeState(symbol, symbol, day, "down", False, "指数regime数据不足")
+            continue
+        point = points[row_idx]
+        rise60 = pct_change(sorted_rows[row_idx - 60].close, current.close)
+        ma20_slope = _point_slope(points, row_idx, "ma20", 5)
+        above20 = point.ma20 is not None and current.close > point.ma20
+        above60 = point.ma60 is not None and current.close > point.ma60
+        if above20 and above60 and rise60 >= 3 and ma20_slope >= 0:
+            regime, ok = "trend_up", True
+        elif not above60 and rise60 <= -5:
+            regime, ok = "down", False
+        else:
+            regime, ok = "range", False
+        ma20_text = f"{point.ma20:.2f}" if point.ma20 is not None else "N/A"
+        ma60_text = f"{point.ma60:.2f}" if point.ma60 is not None else "N/A"
+        detail = f"{symbol} {day.isoformat()} regime={regime}; close={current.close:.2f}, ma20={ma20_text}, ma60={ma60_text}, rise60={rise60:.2f}%"
+        out[day] = RegimeState(symbol, symbol, day, regime, ok, detail)
+    return out
+
+
+def _point_slope(points: list[IndicatorPoint], idx: int, name: str, window: int) -> float:
+    if idx + 1 < window:
+        return 0.0
+    values = [getattr(point, name) for point in points[idx + 1 - window : idx + 1]]
+    if any(value is None for value in values):
+        return 0.0
+    first = values[0]
+    last = values[-1]
+    return (last / first - 1) * 100 if first else 0.0
 
 
 def _basket_regime_from_points(
@@ -821,6 +1006,24 @@ def _exit_by_discipline(
     if point.ma20 and row.close < point.ma20:
         return True
     return False
+
+
+def _add_signal(pos: Position, row: KLine, rows: list[KLine], day: date, point: IndicatorPoint) -> bool:
+    if pos.pyramid_stage >= 2 or row.close <= pos.entry_price or row.close <= pos.stop:
+        return False
+    history = [item for item in rows if item.date <= day]
+    if len(history) < 21:
+        return False
+    prev = history[-2]
+    recent_high = max(item.high for item in history[-21:-1])
+    volume_ok = (point.volume_expansion or point.volume_ratio or 0) >= 1.0
+    breakout = row.high > recent_high and row.close > prev.close and volume_ok
+    pullback_ma = False
+    for ma in (point.ma5, point.ma10, point.ma20):
+        if ma and row.low <= ma * 1.02 and row.close >= ma and row.close >= prev.close and volume_ok:
+            pullback_ma = True
+            break
+    return breakout or pullback_ma
 
 
 def _max_drawdown(equity_curve: list[tuple[date, float]]) -> float:

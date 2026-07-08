@@ -7,6 +7,7 @@ from math import floor
 @dataclass(frozen=True)
 class RiskConfig:
     risk_per_trade: float = 0.01
+    first_tranche_pct: float = 0.15
     max_position_pct: float = 0.20
     max_sector_pct: float = 0.40
     cash_reserve_pct: float = 0.20
@@ -15,10 +16,13 @@ class RiskConfig:
     )
     pyramid_steps: tuple[float, float, float] = (0.05, 0.15, 0.30)
     atr_k: float = 2.0
+    target_atr_k: float = 3.0
+    trail_activation: float = 0.04
     time_stop_days: int = 7
     max_dd_stop: float = 0.15
     daily_loss_stop: float = 0.015
     weekly_loss_stop: float = 0.04
+    min_sector_members: int = 8
 
 
 @dataclass
@@ -69,18 +73,32 @@ def allowed_new_position_shares(
     sector_remaining = max(equity * config.max_sector_pct * sector_multiplier - current_sector_value, 0)
     exposure_remaining = max(equity * max_total_exposure(regime, config) - current_gross_value, 0)
     cash_remaining = max(cash - equity * config.cash_reserve_pct, 0)
-    cap_by_value = min(single_remaining, sector_remaining, exposure_remaining, cash_remaining)
+    tranche_pct = config.first_tranche_pct if pyramid_stage <= 0 else _pyramid_increment_pct(config, pyramid_stage)
+    tranche_remaining = max(equity * tranche_pct, 0)
+    cap_by_value = min(single_remaining, sector_remaining, exposure_remaining, cash_remaining, tranche_remaining)
     cap_shares = int(floor((cap_by_value / entry) / lot) * lot)
-    base = min(risk_shares, cap_shares)
-    if base <= 0:
-        return 0
-    stage = max(0, min(pyramid_stage, len(config.pyramid_steps) - 1))
-    staged = int(floor((base * config.pyramid_steps[stage]) / lot) * lot)
-    return staged if staged > 0 else (lot if base >= lot and entry * lot <= cap_by_value else 0)
+    return min(risk_shares, cap_shares)
 
 
-def trailing_stop(entry: float, close: float, ma10: float | None, atr14: float | None, config: RiskConfig) -> float:
-    candidates = [entry]
+def _pyramid_increment_pct(config: RiskConfig, pyramid_stage: int) -> float:
+    steps = config.pyramid_steps
+    if not steps:
+        return config.first_tranche_pct
+    idx = max(0, min(pyramid_stage, len(steps) - 1))
+    return max(steps[idx], 0)
+
+
+def trailing_stop(
+    entry: float,
+    close: float,
+    ma10: float | None,
+    atr14: float | None,
+    config: RiskConfig,
+    current_stop: float | None = None,
+) -> float:
+    if close < entry * (1 + config.trail_activation):
+        return current_stop if current_stop is not None else max(entry - config.atr_k * atr14, 0.01) if atr14 else entry * 0.92
+    candidates = [current_stop if current_stop is not None else entry]
     if ma10 is not None:
         candidates.append(ma10)
     if atr14 is not None and atr14 > 0:

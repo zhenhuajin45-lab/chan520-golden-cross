@@ -48,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     backtest_parser.add_argument("--slippage-bps", type=float, default=5.0)
     backtest_parser.add_argument("--initial-cash", type=float, default=100000.0)
     backtest_parser.add_argument("--output-dir", default="reports/backtest")
+    backtest_parser.add_argument("--regime-index", default="000300", help="index symbol for portfolio regime, default HS300")
+    backtest_parser.add_argument("--use-sector", action="store_true", help="enable current sector breadth proxy gate")
 
     args = parser.parse_args(argv)
     if args.cmd == "analyze":
@@ -140,6 +142,8 @@ def run_backtest(args: argparse.Namespace) -> int:
         fill=args.fill,
         slippage_bps=args.slippage_bps,
         split_date=date.fromisoformat(args.split_date) if args.split_date else None,
+        regime_index=args.regime_index,
+        use_sector=args.use_sector,
     )
     try:
         trades_path, metrics_path, metrics = backtest_symbols(symbols, start, end, Path(args.output_dir), config=config)

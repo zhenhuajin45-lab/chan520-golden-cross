@@ -6,7 +6,7 @@
 
 ## 判定口径
 
-默认指数为 `000001` 上证指数。也可指定：
+单票 `analyze` 默认指数为 `000001` 上证指数。组合回测第三轮后默认使用 `000300` 沪深300，避免用股票篮子自身宽度循环定义“大盘层”。也可指定：
 
 - `399006` 创业板指
 - `000300` 沪深300
@@ -44,6 +44,14 @@ python -m chan520_skill analyze 600288 --date 2026-07-07 --no-regime
 ```powershell
 python -m chan520_skill analyze 600288 --date 2026-07-07 --regime-index 000300
 ```
+
+组合回测：
+
+```powershell
+python -m chan520_skill backtest --basket "600288,300568" --start 2024-07-01 --end 2026-07-01 --regime-index 000300
+```
+
+指数历史优先取东方财富，失败时回退腾讯指数日线。
 
 ## 降级规则
 

@@ -6,6 +6,7 @@
 - P1-1：D+1 执行、涨跌停不可成交、交易成本。
 - P2-4：回测默认使用后复权数据，实时分析仍默认前复权。
 - Review v2：共享账户组合回测、风险预算、行业 cap、市场 regime 仓位、四不做、移动/时间止损。
+- Review v3：修复 1 手塌缩、真实指数 regime、真实 `analyze()` 入选信号、板块层收窄、延迟移动止损、抗尾部统计。
 
 ## 实战版组合引擎
 
@@ -17,7 +18,7 @@
 - 同一天多只股票触发时，用计划现金和计划行业/总仓位预占额度；D+1 开盘成交前再按实际开盘价复核一次 cap。
 - 组合 equity curve 按交易日记录现金加持仓市值。
 
-纪律默认值见 [risk.md](risk.md)，行业共振见 [sector.md](sector.md)。
+纪律默认值见 [risk.md](risk.md)，行业层说明见 [sector.md](sector.md)。
 
 ## 撮合规则
 
@@ -40,9 +41,10 @@ python -m chan520_skill backtest 600288 --start 2026-01-01 --end 2026-07-01 --fi
 - 收盘价站上 `MA5` 和 `MA20`。
 - `MACD DIF > DEA`。
 - `RSI14 <= 72`，避免过热追高。
-- 市场篮子 regime 必须为 `trend_up`。
-- 行业层必须通过宽度/60日趋势共振。
+- 指数 regime 必须为 `trend_up`，组合回测默认 `000300`。
+- 行业层默认不作为入场否决，仅保留行业 cap；`--use-sector` 才启用代理行业宽度门控。
 - 四不做必须通过：弱信号不做、急涨急跌不做、止损过远不做、`R:R < 2` 不做。
+- 回测入选判定使用真实 `analyze()` verdict，不再使用 `_portfolio_signal` 替身；为了性能，仅在标准 520 必要条件具备时调用完整 `analyze()`。
 
 生成买入信号后，实际买入仍要经过风险预算：
 
@@ -50,7 +52,7 @@ python -m chan520_skill backtest 600288 --start 2026-01-01 --end 2026-07-01 --fi
 shares = floor(equity * 1% / (entry - stop) / 100) * 100
 ```
 
-再叠加单股 20%、行业 40%、总仓位 80/50/30、现金保留 20% 和金字塔 5/15/30 分档约束。
+再叠加首仓 15%、单股 20%、行业 40%、总仓位 80/50/30、现金保留 20% 和整手约束。目标规模不足 1 手时跳过，不兜底买 1 手。
 
 ## 交易成本
 
@@ -74,7 +76,7 @@ shares = floor(equity * 1% / (entry - stop) / 100) * 100
 
 持仓每日更新移动止损。触发以下任一项时，生成 D+1 卖出：
 
-- 跌破移动止损，移动止损取 `entry`、`MA10`、`close - 2 * ATR14` 中较高者。
+- 跌破移动止损；移动止损只有盈利达到 4% 后才上移到 `MA10` 或 `close - 2 * ATR14`。
 - 入场 7 天后仍未达到 2% 浮盈。
 - 持仓后连续 3 个 bar 不创新高。
 - 跌破 `MA20`。
@@ -92,22 +94,24 @@ shares = floor(equity * 1% / (entry - stop) / 100) * 100
 | max_drawdown | equity curve 峰谷回撤 |
 | sharpe | 日收益 Sharpe，无风险利率按 0 |
 | exposure | 持仓天数 / 有效回测天数 |
+| trimmed_expectancy_5pct | 去掉前后 5% 尾部后的每笔期望 |
+| median_trade_pnl | 每笔盈亏中位数 |
+| expectancy_ci95_low/high | bootstrap 95% 置信区间 |
+| sample_sufficient | 交易笔数是否达到 100 笔结论门槛 |
 
 ## 已生成证据
 
-当前仓库保留第一轮 2026-01-01 至 2026-07-01 的 8 只股票篮子回测证据，并会提交第二轮 2024-07-01 至 2026-07-01 的 15 只、5+ 行业共享账户组合回测证据：
+当前仓库保留历史证据，但第二轮 15 只证据已标记为废弃参考，原因是仓位规模塌缩为 1 手。第三轮提交新的 30 只、2 年证据：
 
 ```text
-reports/backtest/trades_basket_2026-01-01_2026-07-01.csv
-reports/backtest/metrics_basket_2026-01-01_2026-07-01.md
-reports/backtest/trades_basket_2024-07-01_2026-07-01.csv
-reports/backtest/metrics_basket_2024-07-01_2026-07-01.md
+reports/backtest/v3/trades_basket_2024-07-01_2026-07-01.csv
+reports/backtest/v3/metrics_basket_2024-07-01_2026-07-01.md
 ```
 
-metrics 文件包含 `max_symbol_pct`、`max_sector_pct`、`max_exposure`、`avg_entry_rr`、`breakeven_win_rate` 和 “纪律合规” 段，用于核对评审提出的风险约束是否真的进入回测路径。
+第三轮证据结果为 3 笔交易，样本不足 100 笔，不能据此判断 EV。metrics 中 `sample_sufficient=0`，并输出去尾 EV、中位数和 bootstrap CI。
 
 ## 已知限制
 
 - 行业映射当前优先使用内置静态表；没有映射的代码归为 `未知行业`。全市场部署前应接入东方财富/同花顺/申万行业表缓存。
-- 市场 regime 在组合回测中用篮子自身宽度代理，单票分析仍使用指数 regime。
-- 第二轮先提交 15 只、5+ 行业、2 年组合证据；100 只全市场抽样仍标为后续项，因为公开接口批量下载稳定性和行业映射缓存还需要加固。
+- 第三轮仍未提交离线 100 只夹具；当前证据依赖公开接口实时拉取。
+- 30 只样本只有 3 笔标准入选交易，必须扩大股票池或放宽研究问题后才能评估统计边际。

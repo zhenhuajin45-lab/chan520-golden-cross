@@ -21,7 +21,7 @@ python -m chan520_skill backtest 600288 --start 2026-01-01 --end 2026-07-01 --sp
 python -m chan520_skill backtest --basket "600288,300568,688106,002132,603638,301282,600203,300390" --start 2026-01-01 --end 2026-07-01 --split-date 2026-04-01
 ```
 
-`backtest` 现在默认使用共享资金账户的纪律组合引擎：风险预算 1%、单股 20%、行业 40%、regime 仓位 80/50/30、现金保留 20%、四不做、R:R>=2、移动/时间止损。
+`backtest` 默认使用共享资金账户的纪律组合引擎：真实沪深300 regime、真实 `analyze()` 入选信号、风险预算 1%、首仓 15%、单股 20%、行业 40%、现金保留 20%、四不做、R:R>=2、延迟移动止损和金字塔加仓。当前板块门控默认关闭，仅保留行业 cap。
 
 部署给其他机器或通过 GitHub 分发时，见 [DEPLOY.md](DEPLOY.md)。
 
@@ -64,4 +64,4 @@ https://qt.gtimg.cn/q=sh600288
 本工具只做策略分析和复盘辅助，不构成投资建议。
 
 完整实战版规则见 [docs/practical_520_strategy.md](docs/practical_520_strategy.md)。
-回测、市场状态、行业共振、风险纪律和 A 股微观结构见 [docs/backtest.md](docs/backtest.md)、[docs/regime.md](docs/regime.md)、[docs/sector.md](docs/sector.md)、[docs/risk.md](docs/risk.md)、[docs/microstructure.md](docs/microstructure.md)。
+回测、市场状态、行业层、风险纪律、架构和测试说明见 [docs/backtest.md](docs/backtest.md)、[docs/regime.md](docs/regime.md)、[docs/sector.md](docs/sector.md)、[docs/risk.md](docs/risk.md)、[docs/architecture.md](docs/architecture.md)、[docs/testing.md](docs/testing.md)。

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .data import DataError, trim_to_date
+from .data import DataError, _read_json_with_retry, trim_to_date
 from .indicators import build_indicators, pct_change
 from .models import KLine, RegimeState
 from .quality import ensure_data_quality
@@ -21,6 +21,12 @@ INDEX_SECIDS = {
     "000001": "1.000001",
     "399006": "0.399006",
     "000300": "1.000300",
+}
+
+INDEX_TENCENT = {
+    "000001": "sh000001",
+    "399006": "sz399006",
+    "000300": "sh000300",
 }
 
 
@@ -83,9 +89,10 @@ def index_history(symbol: str, end: date, adjust: int = 0, lookback_days: int = 
         "end": end.strftime("%Y%m%d"),
     }
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?" + urlencode(params)
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
-    with urlopen(req, timeout=timeout) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    try:
+        payload = _read_json_with_retry(url, timeout=timeout)
+    except DataError:
+        return tencent_index_history(symbol, end, lookback_days=lookback_days, timeout=timeout)
     data = payload.get("data")
     if not data or not data.get("klines"):
         raise DataError(f"Eastmoney returned no index kline data for {symbol}")
@@ -107,6 +114,36 @@ def index_history(symbol: str, end: date, adjust: int = 0, lookback_days: int = 
                 turnover=float(parts[10]),
             )
         )
+    return rows
+
+
+def tencent_index_history(symbol: str, end: date, lookback_days: int = 560, timeout: int = 20) -> list[KLine]:
+    tencent_symbol = INDEX_TENCENT.get(symbol)
+    if not tencent_symbol:
+        raise DataError(f"unsupported index symbol for Tencent fallback: {symbol}")
+    begin = end - timedelta(days=lookback_days)
+    params = f"{tencent_symbol},day,{begin.isoformat()},{end.isoformat()},640,qfq"
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + urlencode({"param": params})
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"})
+    with urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    data = payload.get("data", {}).get(tencent_symbol, {})
+    klines = data.get("day")
+    if not klines:
+        raise DataError(f"Tencent returned no index kline data for {symbol}")
+    rows: list[KLine] = []
+    for idx, item in enumerate(klines):
+        current_date = date.fromisoformat(item[0])
+        open_price = float(item[1])
+        close = float(item[2])
+        high = float(item[3])
+        low = float(item[4])
+        volume = float(item[5])
+        prev_close = float(klines[idx - 1][2]) if idx else open_price
+        change = close - prev_close
+        pct = change / prev_close * 100 if prev_close else 0.0
+        amplitude = (high - low) / prev_close * 100 if prev_close else 0.0
+        rows.append(KLine(current_date, open_price, close, high, low, volume, 0.0, amplitude, pct, change, 0.0))
     return rows
 
 

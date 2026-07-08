@@ -27,7 +27,8 @@ def test_three_days_no_new_high_triggers_exit() -> None:
 
 
 def test_trailing_stop_moves_up() -> None:
-    assert trailing_stop(10, 15, 12, 1, RiskConfig()) == 13
+    assert trailing_stop(10, 10.2, 12, 1, RiskConfig(), current_stop=9) == 9
+    assert trailing_stop(10, 15, 12, 1, RiskConfig(), current_stop=9) == 13
 
 
 def test_time_stop_exit_path() -> None:
