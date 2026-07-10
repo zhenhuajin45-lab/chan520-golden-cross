@@ -51,6 +51,12 @@ def main(argv: list[str] | None = None) -> int:
     backtest_parser.add_argument("--regime-index", default="000300", help="index symbol for portfolio regime, default HS300")
     backtest_parser.add_argument("--use-sector", action="store_true", help="enable current sector breadth proxy gate")
     backtest_parser.add_argument("--signal-adjust", choices=["none", "qfq", "hfq"], default="none", help="signal price adjustment; none is causal default")
+    backtest_parser.add_argument(
+        "--strategy",
+        choices=["strategy_v1_baseline", "strategy_v2_modular"],
+        default="strategy_v1_baseline",
+        help="strategy implementation used for the research run",
+    )
     backtest_parser.add_argument("--universe-snapshot", help="point-in-time eligible-universe CSV; requires as_of=start date")
 
     args = parser.parse_args(argv)
@@ -163,6 +169,7 @@ def run_backtest(args: argparse.Namespace) -> int:
         regime_index=args.regime_index,
         use_sector=args.use_sector,
         signal_adjust=args.signal_adjust,
+        strategy_mode=args.strategy,
     )
     try:
         trades_path, metrics_path, metrics = backtest_symbols(

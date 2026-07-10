@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from statistics import median, mean, pstdev
+from typing import Callable
 
 from .entry_filters import EntryFilterConfig, apply_four_no_entry, breakeven_win_rate
 from .indicators import build_indicators, crossed_up, pct_change
@@ -26,6 +27,7 @@ from .risk import (
 )
 from .sector import DEFAULT_SECTOR_MAP, SectorState, industry_of, sector_state_from_members
 from .strategy import analyze
+from .strategy_modular import evaluate_modular, modular_regime_by_date
 
 
 COMMISSION_RATE = 0.00025
@@ -50,6 +52,10 @@ class BacktestConfig:
     use_sector: bool = False
     require_industry: bool = True
     signal_adjust: str = "none"
+    strategy_mode: str = "strategy_v1_baseline"
+
+
+HistoryLoader = Callable[..., tuple[StockMeta, list[KLine]]]
 
 
 @dataclass(frozen=True)
@@ -266,6 +272,7 @@ def portfolio_backtest_symbols(
     entry_config: EntryFilterConfig | None = None,
     sector_map: dict[str, str] | None = None,
     index_rows: list[KLine] | None = None,
+    history_loader: HistoryLoader | None = None,
 ) -> tuple[Path, Path, dict[str, float]]:
     config = config or BacktestConfig()
     risk_config = risk_config or RiskConfig()
@@ -289,21 +296,30 @@ def portfolio_backtest_symbols(
     for idx, symbol in enumerate(symbols, 1):
         code = normalize_code(symbol)
         lookback = max((end - start).days + 620, 1000)
-        try:
-            meta, execution_rows = tencent_history(code, end, lookback_days=lookback, adjust="none")
+        if history_loader is not None:
+            meta, execution_rows = history_loader(code, end, lookback_days=lookback, adjust="none")
             if config.signal_adjust == "none":
                 signal_rows = list(execution_rows)
             else:
-                _signal_meta, signal_rows = tencent_history(code, end, lookback_days=lookback, adjust=config.signal_adjust)
-        except Exception:
-            meta, execution_rows = eastmoney_history(code, end, lookback_days=lookback, adjust=0)
-            adjust_map = {"none": 0, "qfq": 1, "hfq": 2}
-            if config.signal_adjust == "none":
-                signal_rows = list(execution_rows)
-            else:
-                _signal_meta, signal_rows = eastmoney_history(
-                    code, end, lookback_days=lookback, adjust=adjust_map.get(config.signal_adjust, 0)
+                _signal_meta, signal_rows = history_loader(
+                    code, end, lookback_days=lookback, adjust=config.signal_adjust
                 )
+        else:
+            try:
+                meta, execution_rows = tencent_history(code, end, lookback_days=lookback, adjust="none")
+                if config.signal_adjust == "none":
+                    signal_rows = list(execution_rows)
+                else:
+                    _signal_meta, signal_rows = tencent_history(code, end, lookback_days=lookback, adjust=config.signal_adjust)
+            except Exception:
+                meta, execution_rows = eastmoney_history(code, end, lookback_days=lookback, adjust=0)
+                adjust_map = {"none": 0, "qfq": 1, "hfq": 2}
+                if config.signal_adjust == "none":
+                    signal_rows = list(execution_rows)
+                else:
+                    _signal_meta, signal_rows = eastmoney_history(
+                        code, end, lookback_days=lookback, adjust=adjust_map.get(config.signal_adjust, 0)
+                    )
         execution_rows = [row for row in execution_rows if row.date <= end]
         signal_rows = [row for row in signal_rows if row.date <= end]
         common_dates = {row.date for row in execution_rows} & {row.date for row in signal_rows}
@@ -322,17 +338,33 @@ def portfolio_backtest_symbols(
         row_index_by_date[code] = {row.date: row_idx for row_idx, row in enumerate(signal_rows)}
         print(f"loaded {idx}/{len(symbols)} {code} signal_rows={len(signal_rows)} execution_rows={len(execution_rows)}", flush=True)
 
+    if config.strategy_mode not in {"strategy_v1_baseline", "strategy_v2_modular"}:
+        raise ValueError("strategy_mode must be strategy_v1_baseline or strategy_v2_modular")
     all_dates = sorted({row.date for rows in execution_histories.values() for row in rows if start <= row.date <= end})
-    for code, rows in signal_histories.items():
-        verdicts_by_date[code] = _analyze_verdicts(metas[code], rows, all_dates, config)
     if index_rows is None:
         lookback = max((end - start).days + 620, 1000)
         index_rows = index_history(config.regime_index, end, lookback_days=lookback)
-    regime_by_date = _regime_by_date_from_index(config.regime_index, index_rows, all_dates)
+    regime_by_date = (
+        modular_regime_by_date(config.regime_index, index_rows, all_dates)
+        if config.strategy_mode == "strategy_v2_modular"
+        else _regime_by_date_from_index(config.regime_index, index_rows, all_dates)
+    )
+    print(f"precompute regime dates={len(regime_by_date)} strategy={config.strategy_mode}", flush=True)
+    for verdict_idx, (code, rows) in enumerate(signal_histories.items(), 1):
+        if config.strategy_mode == "strategy_v2_modular":
+            verdicts_by_date[code] = _analyze_verdicts(
+                metas[code], rows, all_dates, config, regime_by_date, indicators[code]
+            )
+        else:
+            verdicts_by_date[code] = _analyze_verdicts(metas[code], rows, all_dates, config)
+        if verdict_idx == len(signal_histories) or verdict_idx % 50 == 0:
+            print(f"precompute verdicts {verdict_idx}/{len(signal_histories)}", flush=True)
+    print(f"precompute sectors dates={len(all_dates)} symbols={len(signal_histories)}", flush=True)
     sector_states_by_date = {
         day: _sector_states_from_points(signal_histories, sector_map, signal_rows_by_date, points_by_date, row_index_by_date, day)
         for day in all_dates
     }
+    print("precompute sectors complete", flush=True)
     cash = config.initial_cash
     positions: dict[str, Position] = {}
     pending: list[PendingOrder] = []
@@ -360,7 +392,13 @@ def portfolio_backtest_symbols(
     }
 
     previous_close_equity = config.initial_cash
-    for day in all_dates:
+    for day_idx, day in enumerate(all_dates, 1):
+        if day_idx <= 3 or day_idx % 20 == 0:
+            print(
+                f"portfolio start day {day_idx}/{len(all_dates)} {day.isoformat()} "
+                f"positions={len(positions)} pending={len(pending)}",
+                flush=True,
+            )
         begin_trading_session(risk_state, day.isocalendar()[:2], previous_close_equity)
         # Open processing may only use the preceding close.  Today's close is
         # not available until all D+1 orders have been handled.
@@ -513,7 +551,11 @@ def portfolio_backtest_symbols(
                 order.code == pos.code and order.side in {"add", "sell"} for order in pending
             ):
                 add_stop = max(pos.stop, _to_execution_price(_initial_stop(signal_row, point, risk_config), signal_row, row))
-                add_target = _to_execution_price(_target_price(signal_histories[pos.code], day, signal_row.close, risk_config), signal_row, row)
+                add_target = _to_execution_price(
+                    _target_price_with_point(signal_histories[pos.code], day, signal_row.close, risk_config, point),
+                    signal_row,
+                    row,
+                )
                 add_decision = apply_four_no_entry("入选", row, point, pos.code, row.close, add_stop, add_target, entry_config)
                 if add_decision.ok:
                     shares = allowed_new_position_shares(
@@ -563,7 +605,9 @@ def portfolio_backtest_symbols(
             if signal_row is None:
                 continue
             stop = _to_execution_price(_initial_stop(signal_row, point, risk_config), signal_row, row)
-            target = _to_execution_price(_target_price(rows, day, signal_row.close, risk_config), signal_row, row)
+            target = _to_execution_price(
+                _target_price_with_point(rows, day, signal_row.close, risk_config, point), signal_row, row
+            )
             decision = apply_four_no_entry(verdict, row, point, code, row.close, stop, target, entry_config)
             if not decision.ok:
                 discipline["rejected_four_no"] += 1
@@ -588,7 +632,19 @@ def portfolio_backtest_symbols(
             if shares <= 0:
                 discipline["rejected_caps"] += 1
                 continue
-            pending.append(PendingOrder(code, "buy", "standard_520_discipline", shares=shares, stop=stop, target=target, rr=decision.rr, signal_date=day, signal_regime=regime.regime))
+            pending.append(
+                PendingOrder(
+                    code,
+                    "buy",
+                    f"{config.strategy_mode}_entry",
+                    shares=shares,
+                    stop=stop,
+                    target=target,
+                    rr=decision.rr,
+                    signal_date=day,
+                    signal_regime=regime.regime,
+                )
+            )
             planned_value = row.close * shares
             planned_cash -= planned_value
             planned_gross += planned_value
@@ -604,6 +660,12 @@ def portfolio_backtest_symbols(
         equity_curve.append((day, equity))
         risk_state = update_account_risk(risk_state, equity, previous_close_equity, day.isocalendar()[:2], risk_config)
         previous_close_equity = equity
+        if day_idx == len(all_dates) or day_idx % 20 == 0:
+            print(
+                f"portfolio days {day_idx}/{len(all_dates)} positions={len(positions)} "
+                f"pending={len(pending)} trades={len(trades)}",
+                flush=True,
+            )
 
     # Liquidate at final close for evidence.
     if all_dates:
@@ -650,9 +712,18 @@ def portfolio_backtest_symbols(
     _write_trades(trades_path, trades)
     _write_fills(fills_path, fills)
     metrics = metrics_from_trades(trades, equity_curve, config.initial_cash, 0, split_date=config.split_date)
+    annual_stats = annual_stats_from_trades(trades, equity_curve, config.initial_cash)
     _add_discipline_metrics(metrics, discipline)
     metrics["fill_count"] = float(len(fills))
-    _write_metrics(metrics_path, metrics, config, discipline=discipline, risk_config=risk_config, entry_config=entry_config)
+    _write_metrics(
+        metrics_path,
+        metrics,
+        config,
+        discipline=discipline,
+        risk_config=risk_config,
+        entry_config=entry_config,
+        annual_stats=annual_stats,
+    )
     return trades_path, metrics_path, metrics
 
 
@@ -713,6 +784,7 @@ def metrics_from_trades(
     years = _years(equity_curve)
     total_return = total_net / initial_cash if initial_cash else 0.0
     cagr = (1 + total_return) ** (1 / years) - 1 if years > 0 and total_return > -1 else total_return
+    calmar = cagr / abs(max_dd) if max_dd < 0 else (math.inf if cagr > 0 else 0.0)
     metrics = {
         "total_return": total_return,
         "cagr": cagr,
@@ -724,6 +796,7 @@ def metrics_from_trades(
         "profit_factor": profit_factor,
         "max_drawdown": max_dd,
         "sharpe": sharpe,
+        "calmar": calmar,
         "trade_count": float(len(trades)),
         "avg_holding_days": mean([trade.holding_days for trade in trades]) if trades else 0.0,
         "exposure": exposure_days / len(equity_curve) if equity_curve else 0.0,
@@ -740,6 +813,41 @@ def metrics_from_trades(
         metrics["is_expectancy"] = metrics_from_trades(is_trades, [], initial_cash)["expectancy"]
         metrics["oos_expectancy"] = metrics_from_trades(oos_trades, [], initial_cash)["expectancy"]
     return metrics
+
+
+def annual_stats_from_trades(
+    trades: list[Trade], equity_curve: list[tuple[date, float]], initial_cash: float
+) -> list[dict[str, float | int]]:
+    """Return calendar-year results from the daily equity curve."""
+    if not equity_curve:
+        return []
+    by_year: dict[int, list[tuple[date, float]]] = {}
+    for day, equity in equity_curve:
+        by_year.setdefault(day.year, []).append((day, equity))
+    stats: list[dict[str, float | int]] = []
+    previous_equity = initial_cash
+    for year in sorted(by_year):
+        points = by_year[year]
+        peak = previous_equity
+        max_dd = 0.0
+        for _day, equity in points:
+            peak = max(peak, equity)
+            if peak > 0:
+                max_dd = min(max_dd, equity / peak - 1)
+        end_equity = points[-1][1]
+        year_trades = [trade for trade in trades if trade.exit_date.year == year]
+        wins = sum(1 for trade in year_trades if trade.net_pnl > 0)
+        stats.append(
+            {
+                "year": year,
+                "trades": len(year_trades),
+                "return": end_equity / previous_equity - 1 if previous_equity else 0.0,
+                "max_drawdown": max_dd,
+                "win_rate": wins / len(year_trades) if year_trades else 0.0,
+            }
+        )
+        previous_equity = end_equity
+    return stats
 
 
 def _entry_signal(report) -> bool:
@@ -791,6 +899,7 @@ def _write_metrics(
     discipline: dict | None = None,
     risk_config: RiskConfig | None = None,
     entry_config: EntryFilterConfig | None = None,
+    annual_stats: list[dict[str, float | int]] | None = None,
 ) -> None:
     lines = [
         "# Backtest Metrics",
@@ -800,6 +909,7 @@ def _write_metrics(
         f"- commission: `{config.commission_rate}`; min commission: `{config.min_commission}`",
         f"- stamp tax sell only: `{config.stamp_tax_rate}`; transfer SH only: `{config.transfer_rate}`",
         f"- slippage bps: `{config.slippage_bps}`",
+        f"- strategy: `{config.strategy_mode}`",
         "",
         "| Metric | Value |",
         "| --- | ---: |",
@@ -834,6 +944,21 @@ def _write_metrics(
         )
         for regime, values in sorted(discipline.get("regime_exposure", {}).items()):
             lines.append(f"| {regime} | {(mean(values) if values else 0):.6f} |")
+    if annual_stats is not None:
+        lines.extend(
+            [
+                "",
+                "## Annual Statistics",
+                "",
+                "| Year | Trades | Return | Max Drawdown | Win Rate |",
+                "| ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for item in annual_stats:
+            lines.append(
+                f"| {item['year']} | {item['trades']} | {item['return']:.6f} | "
+                f"{item['max_drawdown']:.6f} | {item['win_rate']:.6f} |"
+            )
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -989,11 +1114,13 @@ def _initial_stop(row: KLine, point: IndicatorPoint, config: RiskConfig) -> floa
     return row.close * 0.92
 
 
-def _target_price(rows: list[KLine], day: date, close: float, config: RiskConfig) -> float:
+def _target_price(
+    rows: list[KLine], day: date, close: float, config: RiskConfig, point: IndicatorPoint | None = None
+) -> float:
     history = [row for row in rows if row.date <= day]
     if not history:
         return close * 1.1
-    point = build_indicators(history)[-1]
+    point = point or build_indicators(history)[-1]
     recent = history[-80:-1]
     overhead_highs = sorted({row.high for row in recent if row.high > close})
     swing_high = overhead_highs[0] if overhead_highs else None
@@ -1003,6 +1130,17 @@ def _target_price(rows: list[KLine], day: date, close: float, config: RiskConfig
     # farthest historical high made the R:R gate optimistic and untestable.
     candidates = [value for value in (swing_high, atr_target, measured_target) if value and value > close]
     return min(candidates) if candidates else close * 1.04
+
+
+def _target_price_with_point(
+    rows: list[KLine], day: date, close: float, config: RiskConfig, point: IndicatorPoint
+) -> float:
+    try:
+        return _target_price(rows, day, close, config, point=point)
+    except TypeError as exc:
+        if "unexpected keyword argument 'point'" not in str(exc):
+            raise
+        return _target_price(rows, day, close, config)
 
 
 def _basket_regime(histories: dict[str, list[KLine]], day: date) -> RegimeState:
@@ -1030,12 +1168,32 @@ def _sector_states_for_day(
     return {industry: sector_state_from_members(industry, member_rows, day) for industry, member_rows in grouped.items()}
 
 
-def _analyze_verdicts(meta: StockMeta, rows: list[KLine], all_dates: list[date], config: BacktestConfig) -> dict[date, str]:
+def _analyze_verdicts(
+    meta: StockMeta,
+    rows: list[KLine],
+    all_dates: list[date],
+    config: BacktestConfig,
+    regime_by_date: dict[date, RegimeState] | None = None,
+    points: list[IndicatorPoint] | None = None,
+) -> dict[date, str]:
     wanted = set(all_dates)
     verdicts: dict[date, str] = {}
-    indicators = build_indicators(rows)
+    indicators = points or build_indicators(rows)
     for idx, row in enumerate(rows):
         if row.date not in wanted or idx + 1 < 61:
+            continue
+        if config.strategy_mode == "strategy_v2_modular":
+            state = regime_by_date.get(row.date) if regime_by_date else None
+            prior_ma60 = indicators[idx - 5].ma60 if idx >= 5 else None
+            decision = evaluate_modular(
+                rows[: idx + 1],
+                row.date,
+                state,
+                point=indicators[idx],
+                previous=indicators[idx - 1] if idx else None,
+                prior_ma60=prior_ma60,
+            )
+            verdicts[row.date] = decision.verdict
             continue
         if not _could_be_standard_520(rows, indicators, idx):
             verdicts[row.date] = "不入选"

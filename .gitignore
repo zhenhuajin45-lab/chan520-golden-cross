@@ -18,6 +18,7 @@ env/
 reports/*
 !reports/backtest/
 !reports/backtest/**
+reports/backtest/**/*.pkl
 
 # Local scratch files
 tmp/

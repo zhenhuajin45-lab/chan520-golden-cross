@@ -12,7 +12,14 @@ class RiskConfig:
     max_sector_pct: float = 0.40
     cash_reserve_pct: float = 0.20
     regime_exposure: dict[str, float] = field(
-        default_factory=lambda: {"trend_up": 0.80, "range": 0.50, "down": 0.30}
+        default_factory=lambda: {
+            "trend_up": 0.80,
+            "range": 0.50,
+            "down": 0.30,
+            "BULL": 0.80,
+            "NORMAL": 0.50,
+            "BEAR": 0.30,
+        }
     )
     # Values are incremental cash caps after the initial tranche, not multipliers.
     # The default therefore means 15% initial capital plus one 5% add, capped at 20%.
