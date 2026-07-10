@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-07-10 - V4 backtest credibility iteration
+
+- 组合回测拆为 D 日收盘信号、D+1 开盘成交和 D+1 收盘估值，开盘风控不再读取当日收盘信息。
+- 默认用不复权价格计算信号和成交；独立信号序列仅作为显式研究选项，成交、资金、费用和整手始终使用不复权价格。
+- 补齐建仓、加仓和平仓的双边费用账本，新增 `fills_*.csv`，期末平仓纳入滑点与最终权益。
+- 标准520支持金叉后1至3日确认，MACD要求真实交叉窗口共振，目标位改为保守第一目标并进入退出路径。
+- 金字塔定义为首仓15%加一次5%，记录加仓后的整仓风险；周亏损减半在下一周开盘生效。
+- 新增历史股票池快照接口、行业映射缺失拒绝、信号漏斗和 V4 因果/费用/非空成交验收测试。
+
 ## 2026-07-08 - Review v3 credible backtest iteration
 
 ### 总结
@@ -90,7 +99,7 @@
 | 单行业上限 40% | 已落地 | `RiskConfig.max_sector_pct` |
 | regime 总仓位 80/50/30 | 已落地 | `RiskConfig.regime_exposure` |
 | 现金保留 20% | 已落地 | `RiskConfig.cash_reserve_pct` |
-| 金字塔 5/15/30 分档 | 已落地 | `RiskConfig.pyramid_steps`，当前新仓默认首档 |
+| 金字塔首仓15%加一次5% | V4替代 | `RiskConfig.first_tranche_pct` / `pyramid_increment_pcts` |
 | 四不做 | 已落地 | `entry_filters.apply_four_no_entry` |
 | R:R >= 2 | 已落地 | `EntryFilterConfig.min_rr` |
 | 行业层/三层共振 | 已落地基础版 | `sector_state_from_members`，行业映射为静态表 |

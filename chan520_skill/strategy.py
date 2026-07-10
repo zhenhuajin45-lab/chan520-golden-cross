@@ -24,6 +24,8 @@ def analyze(
 ) -> AnalysisReport:
     if len(rows) < 61:
         raise ValueError("at least 61 daily bars are required for practical 520 analysis")
+    if rows[-1].date != target_date:
+        raise ValueError(f"rows must be trimmed to target_date {target_date.isoformat()}; got {rows[-1].date.isoformat()}")
     ensure_data_quality(rows, min_bars=61)
     indicators = build_indicators(
         rows,
@@ -143,7 +145,9 @@ def _buy_points(code: str, rows: list[KLine], indicators: list[IndicatorPoint]) 
     cross_age = _recent_cross_age(indicators, "ma5", "ma20", lookback=3)
     above_ma = bool(point.ma5 and point.ma20 and target.close > point.ma5 and target.close > point.ma20)
     macd_gold = _macd_gold(point)
-    macd_strong = macd_gold and point.macd_dif is not None and point.macd_dea is not None and point.macd_dif > 0 and point.macd_dea > 0
+    macd_cross_age = _recent_cross_age(indicators, "macd_dif", "macd_dea", lookback=3)
+    macd_sync = cross_age is not None and macd_cross_age is not None and abs(cross_age - macd_cross_age) <= 2
+    macd_strong = macd_gold and macd_sync and point.macd_dif is not None and point.macd_dea is not None and point.macd_dif > 0 and point.macd_dea > 0
     large_ok = pct_change(rows[-61].close, target.close) >= 5
     volume_ok = _volume_ok(point, 1.2)
     extended = _is_extended(target, point)
@@ -151,7 +155,8 @@ def _buy_points(code: str, rows: list[KLine], indicators: list[IndicatorPoint]) 
 
     if cross_age is not None and above_ma:
         fresh = cross_age == 0
-        standard = fresh and macd_strong and large_ok and volume_ok and not extended and not limit_up
+        confirmation_ok = _confirmation_holds(rows, indicators, cross_age)
+        standard = confirmation_ok and macd_strong and large_ok and volume_ok and not extended and not limit_up
         status = "PASS" if standard else "WARN"
         stage = "当天触发" if fresh else f"触发后第{cross_age + 1}日确认"
         detail = (
@@ -160,7 +165,7 @@ def _buy_points(code: str, rows: list[KLine], indicators: list[IndicatorPoint]) 
         )
         tags = {"buy_520"}
         if not standard:
-            detail += " 未同时满足大周期、零轴MACD、量能或低偏离要求，按弱化/确认期处理。"
+            detail += " 未同时满足确认、大周期、零轴MACD同步交叉、量能或低偏离要求，按弱化/确认期处理。"
         if extended:
             tags.add("extended")
         if limit_up:
@@ -184,7 +189,7 @@ def _buy_points(code: str, rows: list[KLine], indicators: list[IndicatorPoint]) 
                 "MACD同步金叉",
                 "PASS" if macd_strong else "WARN",
                 f"DIF {fmt(point.macd_dif, 3)} > DEA {fmt(point.macd_dea, 3)}，柱 {fmt(point.macd_hist, 3)}。"
-                + ("零轴上方，强信号。" if macd_strong else "零轴未完全站上，信号偏弱但正在修复。"),
+                + ("在520附近同步交叉且零轴上方，强信号。" if macd_strong else "未在520附近形成同步交叉或零轴未完全站上，按修复处理。"),
                 2 if macd_strong else 1,
                 frozenset({"macd_gold"}),
             )
@@ -408,11 +413,13 @@ def _verdict(report: AnalysisReport) -> tuple[str, str]:
     score = _score(report)
     buy520 = _find_rule(report.buy_points, "520金叉买")
     trend5 = _find_rule(report.trend_rules, "趋势5日线买入法")
+    mode = _find_rule(report.large_cycle, "交易模式过滤")
     exit_risk = any(item.status == "WARN" and item.score <= -2 for item in report.exit_rules)
     extended = _has_tag(report, "extended")
     if exit_risk:
         return "回避/减仓观察", "风控"
-    if buy520 and buy520.status == "PASS" and score >= 9 and len(report.defects) <= 1:
+    history_ok = not any("历史数据不足" in defect for defect in report.defects)
+    if buy520 and buy520.status == "PASS" and mode and mode.status == "PASS" and not extended and history_ok:
         return "入选", "标准520"
     if (buy520 and buy520.status in {"PASS", "WARN"} or trend5 and trend5.status in {"PASS", "WARN"}) and extended:
         return "观察（等待回踩）", "确认后回踩"
@@ -529,6 +536,21 @@ def _recent_cross_age(indicators: list[IndicatorPoint], left: str, right: str, l
         if crossed_up(getattr(prev, left), getattr(prev, right), getattr(cur, left), getattr(cur, right)):
             return age
     return None
+
+
+def _confirmation_holds(rows: list[KLine], indicators: list[IndicatorPoint], cross_age: int) -> bool:
+    """Allow the trigger day and the next three closes when MA20 held."""
+    if cross_age < 0 or cross_age > 3:
+        return False
+    start = len(rows) - 1 - cross_age
+    for idx in range(start, len(rows)):
+        point = indicators[idx]
+        row = rows[idx]
+        if point.ma20 is None or point.ma5 is None:
+            return False
+        if row.close <= point.ma20 or row.close <= point.ma5:
+            return False
+    return True
 
 
 def _find_rule(items: list[RuleResult], name: str) -> RuleResult | None:

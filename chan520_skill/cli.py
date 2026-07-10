@@ -8,8 +8,8 @@ from .backtest import BacktestConfig, backtest_symbols
 from .data import DataError, auto_history, eastmoney_history, load_csv, normalize_code, tencent_history, trim_to_date
 from .regime import fetch_regime
 from .report import render_markdown
-from .scanner import scan_market
 from .strategy import analyze
+from .universe import industry_map, load_universe_snapshot
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,6 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     backtest_parser.add_argument("--output-dir", default="reports/backtest")
     backtest_parser.add_argument("--regime-index", default="000300", help="index symbol for portfolio regime, default HS300")
     backtest_parser.add_argument("--use-sector", action="store_true", help="enable current sector breadth proxy gate")
+    backtest_parser.add_argument("--signal-adjust", choices=["none", "qfq", "hfq"], default="none", help="signal price adjustment; none is causal default")
+    backtest_parser.add_argument("--universe-snapshot", help="point-in-time eligible-universe CSV; requires as_of=start date")
 
     args = parser.parse_args(argv)
     if args.cmd == "analyze":
@@ -110,6 +112,10 @@ def run_analyze(args: argparse.Namespace) -> int:
 
 
 def run_scan_market(args: argparse.Namespace) -> int:
+    # Scanning has optional third-party dependencies.  Keep analysis and
+    # backtesting usable in minimal local environments.
+    from .scanner import scan_market
+
     target_date = date.fromisoformat(args.date)
     try:
         csv_path, md_path, stats = scan_market(target_date, Path(args.output_dir), max_workers=args.workers)
@@ -130,7 +136,19 @@ def run_scan_market(args: argparse.Namespace) -> int:
 def run_backtest(args: argparse.Namespace) -> int:
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
-    if args.basket:
+    sector_map = None
+    if args.universe_snapshot:
+        if args.basket or args.code:
+            print("ERROR: --universe-snapshot cannot be combined with code or --basket")
+            return 2
+        try:
+            members = load_universe_snapshot(args.universe_snapshot, start)
+        except Exception as exc:
+            print(f"ERROR: invalid universe snapshot: {exc}")
+            return 2
+        symbols = [member.code for member in members]
+        sector_map = industry_map(members)
+    elif args.basket:
         symbols = [normalize_code(item) for item in args.basket.split(",") if item.strip()]
     elif args.code:
         symbols = [normalize_code(args.code)]
@@ -144,9 +162,12 @@ def run_backtest(args: argparse.Namespace) -> int:
         split_date=date.fromisoformat(args.split_date) if args.split_date else None,
         regime_index=args.regime_index,
         use_sector=args.use_sector,
+        signal_adjust=args.signal_adjust,
     )
     try:
-        trades_path, metrics_path, metrics = backtest_symbols(symbols, start, end, Path(args.output_dir), config=config)
+        trades_path, metrics_path, metrics = backtest_symbols(
+            symbols, start, end, Path(args.output_dir), config=config, sector_map=sector_map
+        )
     except Exception as exc:
         print(f"ERROR: {exc}")
         return 1

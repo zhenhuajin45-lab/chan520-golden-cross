@@ -4,6 +4,7 @@ from chan520_skill.risk import (
     AccountRiskState,
     RiskConfig,
     allowed_new_position_shares,
+    begin_trading_session,
     max_total_exposure,
     position_size,
     time_stop_trigger,
@@ -62,4 +63,15 @@ def test_circuit_breakers() -> None:
     state = AccountRiskState(peak_equity=100000)
     update_account_risk(state, 84000, 100000, (2024, 1), cfg)
     assert state.stopped_for_drawdown
-    assert state.halted_today
+    assert state.halted_next_session
+
+
+def test_weekly_loss_reduces_the_following_week() -> None:
+    cfg = RiskConfig(weekly_loss_stop=0.04)
+    state = AccountRiskState(peak_equity=100000)
+    begin_trading_session(state, (2024, 1), 100000)
+    update_account_risk(state, 95000, 100000, (2024, 1), cfg)
+    assert state.active_week_size_multiplier == 1.0
+    assert state.next_week_size_multiplier == 0.5
+    begin_trading_session(state, (2024, 2), 95000)
+    assert state.active_week_size_multiplier == 0.5
