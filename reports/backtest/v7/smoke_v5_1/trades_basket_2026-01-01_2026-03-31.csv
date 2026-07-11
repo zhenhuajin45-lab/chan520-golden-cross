@@ -1,0 +1,4 @@
+﻿code,name,entry_date,exit_date,entry_price,exit_price,shares,gross_pnl,costs,net_pnl,holding_days,entry_reason,exit_reason,entry_costs,exit_costs,entry_count
+000338,潍柴动力,2026-02-11,2026-03-03,25.65282,27.616185,500,981.6825000000016,16.90404625,964.7784537500016,20,strategy_v5_alpha_ranked_entry,three_bars_no_high,5.0,11.90404625,1
+000021,深科技,2026-02-25,2026-03-04,33.74486399999999,30.66466,500,-1540.1019999999955,22.666165,-1562.7681649999956,7,strategy_v5_alpha_ranked_entry,close_stop,10.0,12.666165,2
+000338,潍柴动力,2026-03-04,2026-03-06,26.193089999999998,27.436275000000002,500,621.592500000002,16.85906875,604.733431250002,2,strategy_v5_alpha_ranked_entry,target_close_confirmed,5.0,11.85906875,1

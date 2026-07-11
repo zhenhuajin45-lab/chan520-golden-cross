@@ -107,11 +107,9 @@ def run_store(args) -> None:
     try:
         names = load_names(conn)
         sector_map = load_sector_map(conn)
-        rows_by_code = load_daily_bars(conn, start, end, args.lookback_days)
+        symbol_filter = load_symbol_filter(conn, args.max_symbols)
+        rows_by_code = load_daily_bars(conn, start, end, args.lookback_days, symbol_filter)
         rows_by_code = {code: rows for code, rows in rows_by_code.items() if len(rows) >= 260}
-        if args.max_symbols:
-            keep = sorted(rows_by_code)[: args.max_symbols]
-            rows_by_code = {code: rows_by_code[code] for code in keep}
         symbols = sorted(rows_by_code)
         eligible_by_date = load_dynamic_universe(conn, start, end, set(symbols))
         index_rows = load_index_bars(conn, end)
@@ -135,7 +133,7 @@ def run_store(args) -> None:
         eligible_by_date,
         PortfolioEngineConfig(max_positions=5),
     )
-    write_research_report(output_dir / "research_report_v5_alpha.md", output_dir, metrics, start, end, len(symbols))
+    write_research_report(output_dir / "research_report_v5_1.md", output_dir, metrics, start, end, len(symbols))
     print(f"SQLite alpha complete trades={int(metrics['trade_count'])} cagr={metrics['cagr']:.4f} max_dd={metrics['max_drawdown']:.4f}")
     print(f"Trades: {trades_path.resolve()}")
     print(f"Metrics: {metrics_path.resolve()}")
@@ -310,17 +308,39 @@ def load_sector_map(conn: sqlite3.Connection) -> dict[str, str]:
     return {code: sector for code, sector in conn.execute("select code, sector from sector_map")}
 
 
-def load_daily_bars(conn: sqlite3.Connection, start: date, end: date, lookback_days: int) -> dict[str, list[KLine]]:
+def load_symbol_filter(conn: sqlite3.Connection, max_symbols: int) -> set[str] | None:
+    if max_symbols <= 0:
+        return None
+    return {
+        code
+        for (code,) in conn.execute("select code from stock_meta order by code limit ?", (max_symbols,))
+    }
+
+
+def load_daily_bars(
+    conn: sqlite3.Connection,
+    start: date,
+    end: date,
+    lookback_days: int,
+    symbols: set[str] | None = None,
+) -> dict[str, list[KLine]]:
     out: dict[str, list[KLine]] = defaultdict(list)
     from_date = start - timedelta(days=max(0, lookback_days))
+    params: list[str] = [from_date.isoformat(), end.isoformat()]
+    symbol_clause = ""
+    if symbols:
+        placeholders = ",".join("?" for _ in symbols)
+        symbol_clause = f" and code in ({placeholders})"
+        params.extend(sorted(symbols))
     query = """
         select code, trade_date, open, close, high, low, volume, amount, amplitude, pct_chg, change, turnover
         from daily_bars
         where trade_date between ? and ?
+    """ + symbol_clause + """
         order by code, trade_date
     """
     count = 0
-    for row in conn.execute(query, (from_date.isoformat(), end.isoformat())):
+    for row in conn.execute(query, params):
         code = row[0]
         out[code].append(kline_from_row(row[1:]))
         count += 1
@@ -403,11 +423,11 @@ def load_pickle(path: Path):
 def write_research_report(path: Path, output_dir: Path, metrics: dict[str, float], start: date, end: date, symbols: int) -> None:
     yearly = output_dir / f"yearly_report_basket_{start}_{end}.csv"
     lines = [
-        "# chan520 v5 Alpha Research Report",
+        "# chan520 v5.1 Alpha Research Report",
         "",
         f"- Period: `{start}` to `{end}`",
         f"- Symbols loaded from SQLite store: `{symbols}`",
-        "- Strategy: `strategy_v5_alpha`",
+        "- Strategy: `strategy_v5_alpha_ranked`",
         "- Execution: close signal, next-session open fill, unadjusted GM prices.",
         "- Data source: durable local SQLite store generated from GM historical caches.",
         "",
@@ -433,6 +453,10 @@ def write_research_report(path: Path, output_dir: Path, metrics: dict[str, float
             f"- `{(output_dir / f'trade_records_basket_{start}_{end}.csv').name}`",
             f"- `{(output_dir / f'drawdown_report_basket_{start}_{end}.csv').name}`",
             f"- `{(output_dir / f'sector_heat_basket_{start}_{end}.csv').name}`",
+            "- `candidate_funnel_daily.csv`",
+            "- `candidate_selection_audit.csv`",
+            "- `signal_snapshots.csv`",
+            "- `trade_attribution.csv`",
             f"- `{yearly.name}`",
         ]
     )

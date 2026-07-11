@@ -1,0 +1,10 @@
+﻿{
+    "source_report":  "reports/backtest/v6/store_all_2026",
+    "frozen_strategy":  "strategy_v5_alpha_first_fit_frozen",
+    "frozen_from_commit":  "c22116154d04a76bf6c1927265247ebbdcc988f2",
+    "period_start":  "2026-01-01",
+    "period_end":  "2026-07-09",
+    "data_store":  "data/gm_alpha/chan520_alpha.sqlite",
+    "universe":  "all_a_share_dynamic_universe",
+    "note":  "Frozen from pre-V5.1 first-fit evidence for controlled comparison; SQLite store is local and not committed."
+}

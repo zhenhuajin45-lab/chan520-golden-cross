@@ -39,6 +39,13 @@ MIN_COMMISSION = 5.0
 STAMP_TAX_RATE = 0.0005
 TRANSFER_RATE = 0.00001
 SLIPPAGE_BPS = 5.0
+ENTRY_VERDICT = "��ѡ"
+OBSERVE_VERDICT = "�۲�"
+V5_STRATEGY_MODES = {
+    "strategy_v5_alpha",
+    "strategy_v5_alpha_ranked",
+    "strategy_v5_alpha_first_fit_frozen",
+}
 
 
 @dataclass(frozen=True)
@@ -125,6 +132,56 @@ class Fill:
     signal_date: date | None
     stop: float = 0.0
     target: float = 0.0
+
+
+@dataclass(frozen=True)
+class CandidateSignal:
+    code: str
+    name: str
+    date: date
+    industry: str
+    market_regime: str
+    eligible: bool
+    market_ok: bool
+    alpha_total: float
+    trend_score: float
+    relative_strength_score: float
+    volume_quality_score: float
+    risk_score: float
+    sector_bonus: float
+    sector_heat_score: float
+    entry_score: float
+    ranking_score: float
+    hard_pass: bool
+    reasons: tuple[str, ...]
+
+    @property
+    def verdict(self) -> str:
+        return ENTRY_VERDICT if self.hard_pass else OBSERVE_VERDICT
+
+
+def is_v5_strategy_mode(strategy_mode: str) -> bool:
+    return strategy_mode in V5_STRATEGY_MODES
+
+
+def is_ranked_v5_strategy_mode(strategy_mode: str) -> bool:
+    return strategy_mode in {"strategy_v5_alpha", "strategy_v5_alpha_ranked"}
+
+
+def rank_candidate_signals(candidates: list[CandidateSignal]) -> list[CandidateSignal]:
+    return sorted(
+        candidates,
+        key=lambda item: (
+            -item.ranking_score,
+            -item.entry_score,
+            -item.relative_strength_score,
+            item.code,
+        ),
+    )
+
+
+def is_entry_verdict(verdict: str) -> bool:
+    return verdict in {ENTRY_VERDICT, "入选", "��ѡ"}
 
 
 def backtest_code(
@@ -298,6 +355,7 @@ def portfolio_backtest_symbols(
     signal_rows_by_date: dict[str, dict[date, KLine]] = {}
     row_index_by_date: dict[str, dict[date, int]] = {}
     verdicts_by_date: dict[str, dict[date, str]] = {}
+    candidate_signals_by_date: dict[str, dict[date, CandidateSignal]] = {}
 
     for idx, symbol in enumerate(symbols, 1):
         code = normalize_code(symbol)
@@ -345,15 +403,18 @@ def portfolio_backtest_symbols(
         if idx == 1 or idx == len(symbols) or idx % 100 == 0:
             print(f"loaded {idx}/{len(symbols)} {code} signal_rows={len(signal_rows)} execution_rows={len(execution_rows)}", flush=True)
 
-    if config.strategy_mode not in {"strategy_v1_baseline", "strategy_v2_modular", "strategy_v5_alpha"}:
-        raise ValueError("strategy_mode must be strategy_v1_baseline, strategy_v2_modular, or strategy_v5_alpha")
+    if config.strategy_mode not in {"strategy_v1_baseline", "strategy_v2_modular"} | V5_STRATEGY_MODES:
+        raise ValueError(
+            "strategy_mode must be strategy_v1_baseline, strategy_v2_modular, "
+            "strategy_v5_alpha, strategy_v5_alpha_ranked, or strategy_v5_alpha_first_fit_frozen"
+        )
     all_dates = sorted({row.date for rows in execution_histories.values() for row in rows if start <= row.date <= end})
     if index_rows is None:
         lookback = max((end - start).days + 620, 1000)
         index_rows = index_history(config.regime_index, end, lookback_days=lookback)
     if eligible_by_date is None:
         eligible_by_date = {day: set(signal_histories) for day in all_dates}
-    if config.strategy_mode == "strategy_v5_alpha":
+    if is_v5_strategy_mode(config.strategy_mode):
         breadth = breadth_above_ma60(signal_histories, points_by_date, rows_by_date, eligible_by_date, all_dates)
         market_points = build_market_regime(index_rows, breadth, all_dates)
         regime_by_date = to_regime_states(config.regime_index, market_points)
@@ -363,7 +424,7 @@ def portfolio_backtest_symbols(
         regime_by_date = _regime_by_date_from_index(config.regime_index, index_rows, all_dates)
     index_rows_by_date, index_prior_by_date = _index_reference_maps(index_rows, (20, 60))
     sector_heat_by_date: dict[date, dict[str, SectorAlpha]] = {}
-    if config.strategy_mode == "strategy_v5_alpha":
+    if is_v5_strategy_mode(config.strategy_mode):
         print(f"precompute sector heat dates={len(all_dates)} symbols={len(signal_histories)}", flush=True)
         sector_heat_by_date = build_sector_heat(
             signal_histories,
@@ -377,7 +438,23 @@ def portfolio_backtest_symbols(
         print("precompute sector heat complete", flush=True)
     print(f"precompute regime dates={len(regime_by_date)} strategy={config.strategy_mode}", flush=True)
     for verdict_idx, (code, rows) in enumerate(signal_histories.items(), 1):
-        if config.strategy_mode in {"strategy_v2_modular", "strategy_v5_alpha"}:
+        if is_v5_strategy_mode(config.strategy_mode):
+            candidate_signals_by_date[code] = _analyze_v5_candidate_signals(
+                metas[code],
+                rows,
+                all_dates,
+                regime_by_date,
+                indicators[code],
+                index_rows_by_date,
+                index_prior_by_date,
+                sector_map,
+                sector_heat_by_date,
+                eligible_by_date,
+            )
+            verdicts_by_date[code] = {
+                day: signal.verdict for day, signal in candidate_signals_by_date[code].items()
+            }
+        elif config.strategy_mode == "strategy_v2_modular":
             verdicts_by_date[code] = _analyze_verdicts(
                 metas[code],
                 rows,
@@ -425,6 +502,9 @@ def portfolio_backtest_symbols(
         "max_exposure": 0.0,
         "regime_exposure": {},
     }
+    selection_audit_rows: list[dict[str, str | int | float]] = []
+    signal_snapshot_rows: list[dict[str, str | int | float]] = []
+    funnel_by_date: dict[date, dict[str, int]] = {}
 
     previous_close_equity = config.initial_cash
     for day_idx, day in enumerate(all_dates, 1):
@@ -613,10 +693,31 @@ def portfolio_backtest_symbols(
                         planned_gross += planned_value
                         planned_sector_values[pos.industry] = planned_sector_values.get(pos.industry, 0.0) + planned_value
 
-        for code, rows in signal_histories.items():
+        if is_v5_strategy_mode(config.strategy_mode):
+            funnel_by_date[day] = _candidate_funnel_for_day(
+                day,
+                signal_histories,
+                candidate_signals_by_date,
+                eligible_by_date.get(day, set(signal_histories)),
+            )
+        entry_items = _daily_entry_items(
+            day,
+            signal_histories,
+            candidate_signals_by_date,
+            positions,
+            config.strategy_mode,
+        )
+        for rank, code, rows, candidate_signal in entry_items:
             if code in positions or risk_state.halted_next_session or risk_state.stopped_for_drawdown:
+                if candidate_signal is not None:
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "risk_or_position", None))
                 continue
             if max_positions is not None and len(positions) + sum(1 for order in pending if order.side == "buy") >= max_positions:
+                if is_ranked_v5_strategy_mode(config.strategy_mode):
+                    if candidate_signal is not None:
+                        selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "capacity", None))
+                        funnel_by_date.setdefault(day, {})["capacity_rejected"] = funnel_by_date.setdefault(day, {}).get("capacity_rejected", 0) + 1
+                    continue
                 break
             if code not in eligible_by_date.get(day, set(signal_histories)):
                 continue
@@ -625,23 +726,33 @@ def portfolio_backtest_symbols(
             if row is None or point is None:
                 continue
             verdict = verdicts_by_date.get(code, {}).get(day, "不入选")
+            if candidate_signal is not None:
+                verdict = candidate_signal.verdict
             industry = industry_of(code, sector_map)
             if industry == "未知行业" and config.require_industry:
                 discipline["industry_unmapped"] += 1
+                if candidate_signal is not None:
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "industry_unmapped", None))
                 continue
             sector_state = sector_states.get(industry, SectorState(industry, day, "unknown", False, 0.0, "missing"))
             sector_ok = sector_state.sector_ok if config.use_sector else True
-            if verdict != "入选":
+            if not is_entry_verdict(verdict):
                 continue
             discipline["standard_signals"] += 1
             if not regime.regime_ok:
                 discipline["regime_rejected"] += 1
+                if candidate_signal is not None:
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "regime", None))
                 continue
             if not sector_ok:
                 discipline["sector_rejected"] += 1
+                if candidate_signal is not None:
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "sector", None))
                 continue
             signal_row = _row_on_date(rows, day)
             if signal_row is None:
+                if candidate_signal is not None:
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "missing_signal_row", None))
                 continue
             stop = _to_execution_price(_initial_stop(signal_row, point, risk_config), signal_row, row)
             target = _to_execution_price(
@@ -650,6 +761,10 @@ def portfolio_backtest_symbols(
             decision = apply_four_no_entry(verdict, row, point, code, row.close, stop, target, entry_config)
             if not decision.ok:
                 discipline["rejected_four_no"] += 1
+                if candidate_signal is not None:
+                    selection_audit_rows.append(
+                        _candidate_audit_row(candidate_signal, rank, False, "four_no:" + "|".join(decision.reasons), None)
+                    )
                 for reason in decision.reasons:
                     key = reason.split("：", 1)[0]
                     counts = discipline["four_no_reasons"]
@@ -670,6 +785,8 @@ def portfolio_backtest_symbols(
             )
             if shares <= 0:
                 discipline["rejected_caps"] += 1
+                if candidate_signal is not None:
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "position_cap", None))
                 continue
             pending.append(
                 PendingOrder(
@@ -685,6 +802,11 @@ def portfolio_backtest_symbols(
                 )
             )
             planned_value = row.close * shares
+            if candidate_signal is not None:
+                order_for_audit = pending[-1]
+                selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, True, "", order_for_audit))
+                signal_snapshot_rows.append(_candidate_audit_row(candidate_signal, rank, True, "", order_for_audit))
+                funnel_by_date.setdefault(day, {})["selected"] = funnel_by_date.setdefault(day, {}).get("selected", 0) + 1
             planned_cash -= planned_value
             planned_gross += planned_value
             planned_sector_values[industry] = planned_sector_values.get(industry, 0.0) + planned_value
@@ -753,6 +875,16 @@ def portfolio_backtest_symbols(
     drawdown_path = output_dir / f"drawdown_report_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
     trade_records_path = output_dir / f"trade_records_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
     sector_heat_path = output_dir / f"sector_heat_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
+    candidate_funnel_daily_path = output_dir / "candidate_funnel_daily.csv"
+    candidate_funnel_summary_path = output_dir / "candidate_funnel_summary.md"
+    candidate_selection_audit_path = output_dir / "candidate_selection_audit.csv"
+    signal_snapshots_path = output_dir / "signal_snapshots.csv"
+    trade_attribution_path = output_dir / "trade_attribution.csv"
+    alpha_decile_path = output_dir / "alpha_decile_analysis.csv"
+    alpha_ic_path = output_dir / "alpha_ic_report.md"
+    sector_data_audit_path = output_dir / "sector_data_audit.md"
+    controlled_comparison_csv_path = output_dir / "controlled_comparison_2026.csv"
+    controlled_comparison_md_path = output_dir / "controlled_comparison_2026.md"
     _write_trades(trades_path, trades)
     _write_trades(trade_records_path, trades)
     _write_fills(fills_path, fills)
@@ -763,6 +895,16 @@ def portfolio_backtest_symbols(
     _write_drawdown_report(drawdown_path, equity_curve)
     if sector_heat_by_date:
         _write_sector_heat_report(sector_heat_path, sector_heat_by_date)
+    if is_v5_strategy_mode(config.strategy_mode):
+        _write_candidate_funnel_daily(candidate_funnel_daily_path, funnel_by_date)
+        _write_candidate_funnel_summary(candidate_funnel_summary_path, funnel_by_date)
+        _write_dict_rows(candidate_selection_audit_path, selection_audit_rows)
+        _write_dict_rows(signal_snapshots_path, signal_snapshot_rows)
+        _write_trade_attribution(trade_attribution_path, trades, signal_snapshot_rows)
+        _write_alpha_decile_analysis(alpha_decile_path, selection_audit_rows)
+        _write_alpha_ic_report(alpha_ic_path, selection_audit_rows, trades)
+        _write_sector_data_audit(sector_data_audit_path, sector_map, sector_heat_by_date)
+        _write_controlled_comparison_note(controlled_comparison_csv_path, controlled_comparison_md_path, config)
     _add_discipline_metrics(metrics, discipline)
     metrics["fill_count"] = float(len(fills))
     _write_metrics(
@@ -854,7 +996,15 @@ def metrics_from_trades(
     lo, hi = _bootstrap_mean_ci([trade.net_pnl for trade in trades])
     metrics["expectancy_ci95_low"] = lo
     metrics["expectancy_ci95_high"] = hi
-    metrics["sample_sufficient"] = 1.0 if len(trades) >= 100 else 0.0
+    independent_clusters = _independent_trade_clusters(trades)
+    metrics["trade_count_sufficient"] = 1.0 if len(trades) >= 100 else 0.0
+    metrics["independent_cluster_count"] = float(independent_clusters)
+    metrics["expectancy_ci95_positive"] = 1.0 if lo > 0 else 0.0
+    metrics["statistically_supported"] = (
+        1.0 if len(trades) >= 100 and independent_clusters >= 26 and lo > 0 and years >= 3 else 0.0
+    )
+    metrics["sample_sufficient"] = metrics["statistically_supported"]
+    metrics["validation_label"] = 1.0 if split_date and years >= 3 else 0.0
     if split_date:
         is_trades = [trade for trade in trades if trade.entry_date < split_date]
         oos_trades = [trade for trade in trades if trade.entry_date >= split_date]
@@ -863,6 +1013,10 @@ def metrics_from_trades(
         metrics["is_expectancy"] = metrics_from_trades(is_trades, [], initial_cash)["expectancy"]
         metrics["oos_expectancy"] = metrics_from_trades(oos_trades, [], initial_cash)["expectancy"]
     return metrics
+
+
+def _independent_trade_clusters(trades: list[Trade]) -> int:
+    return len({trade.entry_date.isocalendar()[:2] for trade in trades})
 
 
 def annual_stats_from_trades(
@@ -977,6 +1131,146 @@ def _write_drawdown_report(path: Path, equity_curve: list[tuple[date, float]]) -
             )
 
 
+def _daily_entry_items(
+    day: date,
+    signal_histories: dict[str, list[KLine]],
+    candidate_signals_by_date: dict[str, dict[date, CandidateSignal]],
+    positions: dict[str, Position],
+    strategy_mode: str,
+) -> list[tuple[int, str, list[KLine], CandidateSignal | None]]:
+    if is_ranked_v5_strategy_mode(strategy_mode):
+        candidates = [
+            signal
+            for code, signals in candidate_signals_by_date.items()
+            if code not in positions
+            for signal in [signals.get(day)]
+            if signal is not None and signal.hard_pass
+        ]
+        return [
+            (rank, signal.code, signal_histories[signal.code], signal)
+            for rank, signal in enumerate(rank_candidate_signals(candidates), 1)
+        ]
+    return [
+        (rank, code, rows, candidate_signals_by_date.get(code, {}).get(day))
+        for rank, (code, rows) in enumerate(signal_histories.items(), 1)
+    ]
+
+
+def _candidate_funnel_for_day(
+    day: date,
+    signal_histories: dict[str, list[KLine]],
+    candidate_signals_by_date: dict[str, dict[date, CandidateSignal]],
+    eligible: set[str],
+) -> dict[str, int]:
+    signals = [signals_by_day[day] for signals_by_day in candidate_signals_by_date.values() if day in signals_by_day]
+    hard_pass = [signal for signal in signals if signal.hard_pass]
+    return {
+        "eligible": len(eligible),
+        "evaluated": len(signals),
+        "hard_pass": len(hard_pass),
+        "selected": 0,
+        "capacity_rejected": 0,
+        "all_symbols": len(signal_histories),
+    }
+
+
+def _candidate_audit_row(
+    signal: CandidateSignal,
+    rank: int,
+    selected: bool,
+    rejection_reason: str,
+    order: PendingOrder | None,
+) -> dict[str, str | int | float]:
+    return {
+        "date": signal.date.isoformat(),
+        "code": signal.code,
+        "name": signal.name,
+        "industry": signal.industry,
+        "market_regime": signal.market_regime,
+        "eligible": int(signal.eligible),
+        "market_ok": int(signal.market_ok),
+        "alpha_total": f"{signal.alpha_total:.6f}",
+        "sector_bonus": f"{signal.sector_bonus:.6f}",
+        "ranking_score": f"{signal.ranking_score:.6f}",
+        "trend_score": f"{signal.trend_score:.6f}",
+        "relative_strength_score": f"{signal.relative_strength_score:.6f}",
+        "volume_quality_score": f"{signal.volume_quality_score:.6f}",
+        "risk_score": f"{signal.risk_score:.6f}",
+        "sector_heat_score": f"{signal.sector_heat_score:.6f}",
+        "entry_score": f"{signal.entry_score:.6f}",
+        "hard_pass": int(signal.hard_pass),
+        "rank": rank,
+        "selected": int(selected),
+        "rejection_reason": rejection_reason,
+        "shares": order.shares if order else 0,
+        "stop": f"{order.stop:.6f}" if order else "",
+        "target": f"{order.target:.6f}" if order else "",
+        "rr": f"{order.rr:.6f}" if order else "",
+        "reasons": "|".join(signal.reasons),
+    }
+
+
+def _plan_new_entry_order(
+    *,
+    code: str,
+    rows: list[KLine],
+    day: date,
+    row: KLine,
+    point: IndicatorPoint,
+    industry: str,
+    verdict: str,
+    equity: float,
+    planned_cash: float,
+    planned_gross: float,
+    planned_sector_values: dict[str, float],
+    regime: RegimeState,
+    risk_state: AccountRiskState,
+    config: BacktestConfig,
+    risk_config: RiskConfig,
+    entry_config: EntryFilterConfig,
+) -> tuple[PendingOrder | None, str, float]:
+    signal_row = _row_on_date(rows, day)
+    if signal_row is None:
+        return None, "missing_signal_row", 0.0
+    stop = _to_execution_price(_initial_stop(signal_row, point, risk_config), signal_row, row)
+    target = _to_execution_price(
+        _target_price_with_point(rows, day, signal_row.close, risk_config, point), signal_row, row
+    )
+    decision = apply_four_no_entry(verdict, row, point, code, row.close, stop, target, entry_config)
+    if not decision.ok:
+        return None, "four_no:" + "|".join(decision.reasons), decision.rr
+    shares = allowed_new_position_shares(
+        equity=equity,
+        cash=planned_cash,
+        entry=row.close,
+        stop=stop,
+        current_symbol_value=0.0,
+        current_sector_value=planned_sector_values.get(industry, 0.0),
+        current_gross_value=planned_gross,
+        regime=regime.regime,
+        config=risk_config,
+        pyramid_stage=0,
+        size_multiplier=risk_state.active_week_size_multiplier,
+    )
+    if shares <= 0:
+        return None, "position_cap", decision.rr
+    return (
+        PendingOrder(
+            code,
+            "buy",
+            f"{config.strategy_mode}_entry",
+            shares=shares,
+            stop=stop,
+            target=target,
+            rr=decision.rr,
+            signal_date=day,
+            signal_regime=regime.regime,
+        ),
+        "selected",
+        row.close * shares,
+    )
+
+
 def _write_sector_heat_report(path: Path, sector_heat_by_date: dict[date, dict[str, SectorAlpha]]) -> None:
     fields = [
         "date",
@@ -1010,6 +1304,162 @@ def _write_sector_heat_report(path: Path, sector_heat_by_date: dict[date, dict[s
                         "momentum_score": f"{item.momentum_score:.6f}",
                     }
                 )
+
+
+def _write_dict_rows(path: Path, rows: list[dict[str, str | int | float]]) -> None:
+    if not rows:
+        path.write_text("", encoding="utf-8-sig")
+        return
+    fields = list(rows[0].keys())
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _write_candidate_funnel_daily(path: Path, funnel_by_date: dict[date, dict[str, int]]) -> None:
+    fields = ["date", "all_symbols", "eligible", "evaluated", "hard_pass", "selected", "capacity_rejected"]
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for day in sorted(funnel_by_date):
+            row = funnel_by_date[day]
+            writer.writerow({"date": day.isoformat(), **{field: row.get(field, 0) for field in fields if field != "date"}})
+
+
+def _write_candidate_funnel_summary(path: Path, funnel_by_date: dict[date, dict[str, int]]) -> None:
+    totals: dict[str, int] = {}
+    for row in funnel_by_date.values():
+        for key, value in row.items():
+            totals[key] = totals.get(key, 0) + int(value)
+    lines = [
+        "# Candidate Funnel Summary",
+        "",
+        "| Stage | Count |",
+        "| --- | ---: |",
+    ]
+    for key in ("all_symbols", "eligible", "evaluated", "hard_pass", "selected", "capacity_rejected"):
+        lines.append(f"| {key} | {totals.get(key, 0)} |")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_trade_attribution(path: Path, trades: list[Trade], signal_rows: list[dict[str, str | int | float]]) -> None:
+    by_code: dict[str, list[dict[str, str | int | float]]] = {}
+    for row in signal_rows:
+        by_code.setdefault(str(row["code"]), []).append(row)
+    output: list[dict[str, str | int | float]] = []
+    for trade in trades:
+        signals = by_code.get(trade.code, [])
+        eligible_signals = [
+            row for row in signals if str(row.get("date", "")) <= trade.entry_date.isoformat()
+        ]
+        chosen = max(eligible_signals, key=lambda row: str(row.get("date", ""))) if eligible_signals else {}
+        output.append(
+            {
+                "code": trade.code,
+                "entry_date": trade.entry_date.isoformat(),
+                "exit_date": trade.exit_date.isoformat(),
+                "net_pnl": f"{trade.net_pnl:.6f}",
+                "exit_reason": trade.exit_reason,
+                "signal_date": chosen.get("date", ""),
+                "rank": chosen.get("rank", ""),
+                "ranking_score": chosen.get("ranking_score", ""),
+                "entry_score": chosen.get("entry_score", ""),
+                "relative_strength_score": chosen.get("relative_strength_score", ""),
+                "reasons": chosen.get("reasons", ""),
+            }
+        )
+    _write_dict_rows(path, output)
+
+
+def _write_alpha_decile_analysis(path: Path, audit_rows: list[dict[str, str | int | float]]) -> None:
+    hard_pass = [row for row in audit_rows if int(row.get("hard_pass", 0)) == 1]
+    ranked = sorted(hard_pass, key=lambda row: float(row.get("ranking_score", 0)), reverse=True)
+    rows: list[dict[str, str | int | float]] = []
+    if ranked:
+        bucket_size = max(1, math.ceil(len(ranked) / 10))
+        for decile in range(10):
+            bucket = ranked[decile * bucket_size : (decile + 1) * bucket_size]
+            if not bucket:
+                continue
+            rows.append(
+                {
+                    "decile": decile + 1,
+                    "candidate_count": len(bucket),
+                    "selected_count": sum(int(item.get("selected", 0)) for item in bucket),
+                    "avg_ranking_score": f"{mean(float(item.get('ranking_score', 0)) for item in bucket):.6f}",
+                    "avg_entry_score": f"{mean(float(item.get('entry_score', 0)) for item in bucket):.6f}",
+                }
+            )
+    _write_dict_rows(path, rows)
+
+
+def _write_alpha_ic_report(path: Path, audit_rows: list[dict[str, str | int | float]], trades: list[Trade]) -> None:
+    selected = [row for row in audit_rows if int(row.get("selected", 0)) == 1]
+    lines = [
+        "# Alpha IC Report",
+        "",
+        "- Scope: selected signal snapshots matched to realized trades when available.",
+        "- Interpretation: retrospective research evidence, not untouched out-of-sample proof.",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+        f"| selected_signals | {len(selected)} |",
+        f"| realized_trades | {len(trades)} |",
+        f"| statistically_supported | 0 |",
+        "",
+        "A full cross-sectional IC requires next-period returns for every candidate, including non-selected names. "
+        "This file records the limitation explicitly so the report cannot overstate alpha evidence.",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_sector_data_audit(
+    path: Path,
+    sector_map: dict[str, str],
+    sector_heat_by_date: dict[date, dict[str, SectorAlpha]],
+) -> None:
+    mapped = sum(1 for value in sector_map.values() if value)
+    unmapped = len(sector_map) - mapped
+    sector_days = sum(len(items) for items in sector_heat_by_date.values())
+    lines = [
+        "# Sector Data Audit",
+        "",
+        "| Item | Value |",
+        "| --- | ---: |",
+        f"| symbols_with_sector_label | {mapped} |",
+        f"| symbols_without_sector_label | {unmapped} |",
+        f"| daily_sector_heat_rows | {sector_days} |",
+        "",
+        "Sector heat is used only as a capped prior. Missing sector data never creates an artificial hot-sector boost.",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_controlled_comparison_note(csv_path: Path, md_path: Path, config: BacktestConfig) -> None:
+    rows = [
+        {
+            "variant": config.strategy_mode,
+            "selection_policy": "ranked" if is_ranked_v5_strategy_mode(config.strategy_mode) else "first_fit_frozen",
+            "parameter_tuning": "none",
+            "status": "current_run",
+        }
+    ]
+    _write_dict_rows(csv_path, rows)
+    md_path.write_text(
+        "\n".join(
+            [
+                "# Controlled Comparison",
+                "",
+                "This run records the current variant only. Frozen first-fit and ranked variants must be executed on the same data snapshot before comparing returns.",
+                "",
+                f"- Current strategy: `{config.strategy_mode}`",
+                "- Parameter tuning: `none`",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
 
 def _write_metrics(
@@ -1056,7 +1506,7 @@ def _write_metrics(
                 f"- 实测风险：平均 {metrics.get('avg_entry_risk_pct', 0):.2%}，最大 {metrics.get('max_entry_risk_pct', 0):.2%}，目标 {risk_config.risk_per_trade:.2%}。",
                 f"- 金字塔：加仓 {discipline.get('adds', 0)} 次。",
                 f"- 熔断/仓位：仓位被 cap/整手约束拒绝 {discipline.get('rejected_caps', 0)} 次，涨跌停阻断 {discipline.get('limit_blocked', 0)} 次。",
-                f"- 样本判定：交易笔数 {metrics.get('trade_count', 0):.0f}，{'满足' if metrics.get('sample_sufficient', 0) else '不足'} 100 笔 EV 结论门槛。",
+                f"- 样本判定：交易笔数 {metrics.get('trade_count', 0):.0f}，独立周簇 {metrics.get('independent_cluster_count', 0):.0f}，CI95 下沿 {metrics.get('expectancy_ci95_low', 0):.2f}，统计支持={'是' if metrics.get('statistically_supported', 0) else '否'}。",
                 "",
                 "| Regime | Average Exposure |",
                 "| --- | ---: |",
@@ -1306,10 +1756,10 @@ def _analyze_verdicts(
     for idx, row in enumerate(rows):
         if row.date not in wanted or idx + 1 < 61:
             continue
-        if config.strategy_mode == "strategy_v5_alpha":
+        if is_v5_strategy_mode(config.strategy_mode):
             state = regime_by_date.get(row.date) if regime_by_date else None
             if state is not None and state.regime == "BEAR":
-                verdicts[row.date] = "观察"
+                verdicts[row.date] = OBSERVE_VERDICT
                 continue
             alpha = score_alpha(
                 rows,
@@ -1320,7 +1770,7 @@ def _analyze_verdicts(
             )
             entry = trend_pullback_entry(rows, idx, indicators[idx])
             heat_bonus = sector_heat_bonus(meta.code, row.date, sector_map or {}, sector_heat_by_date or {})
-            verdicts[row.date] = "入选" if alpha.total + heat_bonus >= 70 and entry.score >= 60 else "观察"
+            verdicts[row.date] = ENTRY_VERDICT if alpha.total + heat_bonus >= 70 and entry.score >= 60 else OBSERVE_VERDICT
             continue
         if config.strategy_mode == "strategy_v2_modular":
             state = regime_by_date.get(row.date) if regime_by_date else None
@@ -1341,6 +1791,67 @@ def _analyze_verdicts(
         report = analyze(meta, rows[: idx + 1], row.date, regime_state=None, min_history=config.min_history)
         verdicts[row.date] = report.verdict
     return verdicts
+
+
+def _analyze_v5_candidate_signals(
+    meta: StockMeta,
+    rows: list[KLine],
+    all_dates: list[date],
+    regime_by_date: dict[date, RegimeState],
+    points: list[IndicatorPoint],
+    index_rows_by_date: dict[date, KLine],
+    index_prior_by_date: dict[tuple[date, int], KLine],
+    sector_map: dict[str, str],
+    sector_heat_by_date: dict[date, dict[str, SectorAlpha]],
+    eligible_by_date: dict[date, set[str]],
+) -> dict[date, CandidateSignal]:
+    wanted = set(all_dates)
+    signals: dict[date, CandidateSignal] = {}
+    industry = industry_of(meta.code, sector_map)
+    for idx, row in enumerate(rows):
+        if row.date not in wanted or idx + 1 < 61:
+            continue
+        point = points[idx]
+        state = regime_by_date.get(row.date, RegimeState("basket", "basket", row.date, "down", False, "missing"))
+        alpha = score_alpha(rows, idx, point, index_rows_by_date, index_prior_by_date)
+        entry = trend_pullback_entry(rows, idx, point)
+        heat = sector_heat_by_date.get(row.date, {}).get(industry)
+        heat_score = heat.heat_score if heat is not None else 0.0
+        heat_bonus = sector_heat_bonus(meta.code, row.date, sector_map, sector_heat_by_date)
+        eligible = meta.code in eligible_by_date.get(row.date, set())
+        market_ok = state.regime != "BEAR"
+        ranking_score = alpha.total + heat_bonus
+        hard_pass = eligible and market_ok and ranking_score >= 70 and entry.score >= 60
+        reasons = list(alpha.reasons) + list(entry.reasons)
+        if not eligible:
+            reasons.append("not_in_dynamic_universe")
+        if not market_ok:
+            reasons.append("bear_market")
+        if ranking_score < 70:
+            reasons.append("alpha_threshold")
+        if entry.score < 60:
+            reasons.append("entry_threshold")
+        signals[row.date] = CandidateSignal(
+            code=meta.code,
+            name=meta.name,
+            date=row.date,
+            industry=industry,
+            market_regime=state.regime,
+            eligible=eligible,
+            market_ok=market_ok,
+            alpha_total=float(alpha.total),
+            trend_score=float(alpha.trend),
+            relative_strength_score=float(alpha.relative_strength),
+            volume_quality_score=float(alpha.volume_quality),
+            risk_score=float(alpha.risk),
+            sector_bonus=float(heat_bonus),
+            sector_heat_score=float(heat_score),
+            entry_score=float(entry.score),
+            ranking_score=float(ranking_score),
+            hard_pass=hard_pass,
+            reasons=tuple(reasons),
+        )
+    return signals
 
 
 def _could_be_standard_520(rows: list[KLine], points: list[IndicatorPoint], idx: int) -> bool:

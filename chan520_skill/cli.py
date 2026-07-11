@@ -53,7 +53,13 @@ def main(argv: list[str] | None = None) -> int:
     backtest_parser.add_argument("--signal-adjust", choices=["none", "qfq", "hfq"], default="none", help="signal price adjustment; none is causal default")
     backtest_parser.add_argument(
         "--strategy",
-        choices=["strategy_v1_baseline", "strategy_v2_modular", "strategy_v5_alpha"],
+        choices=[
+            "strategy_v1_baseline",
+            "strategy_v2_modular",
+            "strategy_v5_alpha",
+            "strategy_v5_alpha_ranked",
+            "strategy_v5_alpha_first_fit_frozen",
+        ],
         default="strategy_v1_baseline",
         help="strategy implementation used for the research run",
     )

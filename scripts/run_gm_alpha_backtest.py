@@ -157,7 +157,7 @@ def run_from_payload(payload: dict, output_root: Path) -> int:
         eligible_by_date,
         PortfolioEngineConfig(max_positions=5),
     )
-    write_research_report(output_dir / "research_report_v5_alpha.md", output_dir, metrics, start, end, len(symbols))
+    write_research_report(output_dir / "research_report_v5_1.md", output_dir, metrics, start, end, len(symbols))
     print(f"GM alpha complete trades={int(metrics['trade_count'])} cagr={metrics['cagr']:.4f} max_dd={metrics['max_drawdown']:.4f}")
     print(f"Trades: {trades_path.resolve()}")
     print(f"Metrics: {metrics_path.resolve()}")
@@ -441,11 +441,11 @@ def write_static_snapshot(path: Path, codes: list[str], names: dict[str, str], s
 def write_research_report(path: Path, output_dir: Path, metrics: dict[str, float], start: date, end: date, symbols: int) -> None:
     yearly = output_dir / f"yearly_report_basket_{start}_{end}.csv"
     lines = [
-        "# chan520 v5 Alpha Research Report",
+        "# chan520 v5.1 Alpha Research Report",
         "",
         f"- Period: `{start}` to `{end}`",
         f"- Symbols loaded: `{symbols}`",
-        "- Strategy: `strategy_v5_alpha`",
+        "- Strategy: `strategy_v5_alpha_ranked`",
         "- Execution: close signal, next-session open fill, unadjusted GM prices.",
         "",
         "## Summary Metrics",
@@ -465,9 +465,9 @@ def write_research_report(path: Path, output_dir: Path, metrics: dict[str, float
             "- Alpha score combines trend structure, relative strength versus HS300, volume quality, and volatility risk.",
             "- Sector heat is a small prior, following the production sector logic pattern: participation, relative strength, breadth, amount and momentum form a 0-100 heat score; hot sectors can add at most 6 points and never replace the entry trigger.",
             "",
-            "## Walk Forward",
+            "## Validation Label",
             "",
-            "Parameters are fixed. `2016-2021` is treated as the research formation window; `2022-2026` yearly rows in the yearly report are out-of-sample checks.",
+            "This report is `retrospective_research_validation` unless a separate frozen training window and untouched future window are supplied.",
             f"Yearly report: `{yearly.name}`",
             "",
             "## Evidence Files",
@@ -477,6 +477,10 @@ def write_research_report(path: Path, output_dir: Path, metrics: dict[str, float
             f"- `{(output_dir / f'drawdown_report_basket_{start}_{end}.csv').name}`",
             f"- `{(output_dir / f'sector_heat_basket_{start}_{end}.csv').name}`",
             f"- `{yearly.name}`",
+            "- `candidate_funnel_daily.csv`",
+            "- `candidate_selection_audit.csv`",
+            "- `signal_snapshots.csv`",
+            "- `trade_attribution.csv`",
             "",
             "## Acceptance",
             "",

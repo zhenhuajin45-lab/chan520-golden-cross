@@ -20,6 +20,7 @@ class PortfolioEngineConfig:
     max_position_pct: float = 0.20
     max_sector_pct: float = 0.40
     cash_reserve_pct: float = 0.20
+    strategy_mode: str = "strategy_v5_alpha_ranked"
 
 
 def run_alpha_portfolio(
@@ -36,7 +37,7 @@ def run_alpha_portfolio(
     config = config or PortfolioEngineConfig()
     backtest_config = BacktestConfig(
         initial_cash=config.initial_cash,
-        strategy_mode="strategy_v5_alpha",
+        strategy_mode=config.strategy_mode,
         split_date=date(2022, 1, 1),
         regime_index="000300",
         require_industry=False,
