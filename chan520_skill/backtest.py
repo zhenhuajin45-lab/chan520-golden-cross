@@ -9,9 +9,12 @@ from pathlib import Path
 from statistics import median, mean, pstdev
 from typing import Callable
 
+from .alpha_score import score_alpha
 from .entry_filters import EntryFilterConfig, apply_four_no_entry, breakeven_win_rate
+from .entry_model import trend_pullback_entry
 from .indicators import build_indicators, crossed_up, pct_change
 from .data import DataError, eastmoney_history, normalize_code, tencent_history
+from .market_regime import breadth_above_ma60, build_market_regime, to_regime_states
 from .microstructure import is_limit_down, is_limit_up, price_limit
 from .models import IndicatorPoint, KLine, RegimeState, StockMeta
 from .quality import ensure_data_quality
@@ -26,6 +29,7 @@ from .risk import (
     update_account_risk,
 )
 from .sector import DEFAULT_SECTOR_MAP, SectorState, industry_of, sector_state_from_members
+from .sector_alpha import SectorAlpha, build_sector_heat, sector_heat_bonus
 from .strategy import analyze
 from .strategy_modular import evaluate_modular, modular_regime_by_date
 
@@ -273,6 +277,8 @@ def portfolio_backtest_symbols(
     sector_map: dict[str, str] | None = None,
     index_rows: list[KLine] | None = None,
     history_loader: HistoryLoader | None = None,
+    eligible_by_date: dict[date, set[str]] | None = None,
+    max_positions: int | None = None,
 ) -> tuple[Path, Path, dict[str, float]]:
     config = config or BacktestConfig()
     risk_config = risk_config or RiskConfig()
@@ -336,24 +342,53 @@ def portfolio_backtest_symbols(
         rows_by_date[code] = {row.date: row for row in execution_rows}
         signal_rows_by_date[code] = {row.date: row for row in signal_rows}
         row_index_by_date[code] = {row.date: row_idx for row_idx, row in enumerate(signal_rows)}
-        print(f"loaded {idx}/{len(symbols)} {code} signal_rows={len(signal_rows)} execution_rows={len(execution_rows)}", flush=True)
+        if idx == 1 or idx == len(symbols) or idx % 100 == 0:
+            print(f"loaded {idx}/{len(symbols)} {code} signal_rows={len(signal_rows)} execution_rows={len(execution_rows)}", flush=True)
 
-    if config.strategy_mode not in {"strategy_v1_baseline", "strategy_v2_modular"}:
-        raise ValueError("strategy_mode must be strategy_v1_baseline or strategy_v2_modular")
+    if config.strategy_mode not in {"strategy_v1_baseline", "strategy_v2_modular", "strategy_v5_alpha"}:
+        raise ValueError("strategy_mode must be strategy_v1_baseline, strategy_v2_modular, or strategy_v5_alpha")
     all_dates = sorted({row.date for rows in execution_histories.values() for row in rows if start <= row.date <= end})
     if index_rows is None:
         lookback = max((end - start).days + 620, 1000)
         index_rows = index_history(config.regime_index, end, lookback_days=lookback)
-    regime_by_date = (
-        modular_regime_by_date(config.regime_index, index_rows, all_dates)
-        if config.strategy_mode == "strategy_v2_modular"
-        else _regime_by_date_from_index(config.regime_index, index_rows, all_dates)
-    )
+    if eligible_by_date is None:
+        eligible_by_date = {day: set(signal_histories) for day in all_dates}
+    if config.strategy_mode == "strategy_v5_alpha":
+        breadth = breadth_above_ma60(signal_histories, points_by_date, rows_by_date, eligible_by_date, all_dates)
+        market_points = build_market_regime(index_rows, breadth, all_dates)
+        regime_by_date = to_regime_states(config.regime_index, market_points)
+    elif config.strategy_mode == "strategy_v2_modular":
+        regime_by_date = modular_regime_by_date(config.regime_index, index_rows, all_dates)
+    else:
+        regime_by_date = _regime_by_date_from_index(config.regime_index, index_rows, all_dates)
+    index_rows_by_date, index_prior_by_date = _index_reference_maps(index_rows, (20, 60))
+    sector_heat_by_date: dict[date, dict[str, SectorAlpha]] = {}
+    if config.strategy_mode == "strategy_v5_alpha":
+        print(f"precompute sector heat dates={len(all_dates)} symbols={len(signal_histories)}", flush=True)
+        sector_heat_by_date = build_sector_heat(
+            signal_histories,
+            sector_map,
+            signal_rows_by_date,
+            points_by_date,
+            row_index_by_date,
+            eligible_by_date,
+            all_dates,
+        )
+        print("precompute sector heat complete", flush=True)
     print(f"precompute regime dates={len(regime_by_date)} strategy={config.strategy_mode}", flush=True)
     for verdict_idx, (code, rows) in enumerate(signal_histories.items(), 1):
-        if config.strategy_mode == "strategy_v2_modular":
+        if config.strategy_mode in {"strategy_v2_modular", "strategy_v5_alpha"}:
             verdicts_by_date[code] = _analyze_verdicts(
-                metas[code], rows, all_dates, config, regime_by_date, indicators[code]
+                metas[code],
+                rows,
+                all_dates,
+                config,
+                regime_by_date,
+                indicators[code],
+                index_rows_by_date,
+                index_prior_by_date,
+                sector_map,
+                sector_heat_by_date,
             )
         else:
             verdicts_by_date[code] = _analyze_verdicts(metas[code], rows, all_dates, config)
@@ -581,6 +616,10 @@ def portfolio_backtest_symbols(
         for code, rows in signal_histories.items():
             if code in positions or risk_state.halted_next_session or risk_state.stopped_for_drawdown:
                 continue
+            if max_positions is not None and len(positions) + sum(1 for order in pending if order.side == "buy") >= max_positions:
+                break
+            if code not in eligible_by_date.get(day, set(signal_histories)):
+                continue
             row = rows_by_date[code].get(day)
             point = points_by_date[code].get(day)
             if row is None or point is None:
@@ -709,10 +748,21 @@ def portfolio_backtest_symbols(
     trades_path = output_dir / f"trades_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
     fills_path = output_dir / f"fills_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
     metrics_path = output_dir / f"metrics_{stem}_{start.isoformat()}_{end.isoformat()}.md"
+    equity_path = output_dir / f"equity_curve_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
+    yearly_path = output_dir / f"yearly_report_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
+    drawdown_path = output_dir / f"drawdown_report_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
+    trade_records_path = output_dir / f"trade_records_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
+    sector_heat_path = output_dir / f"sector_heat_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
     _write_trades(trades_path, trades)
+    _write_trades(trade_records_path, trades)
     _write_fills(fills_path, fills)
     metrics = metrics_from_trades(trades, equity_curve, config.initial_cash, 0, split_date=config.split_date)
     annual_stats = annual_stats_from_trades(trades, equity_curve, config.initial_cash)
+    _write_equity_curve(equity_path, equity_curve)
+    _write_yearly_report(yearly_path, annual_stats)
+    _write_drawdown_report(drawdown_path, equity_curve)
+    if sector_heat_by_date:
+        _write_sector_heat_report(sector_heat_path, sector_heat_by_date)
     _add_discipline_metrics(metrics, discipline)
     metrics["fill_count"] = float(len(fills))
     _write_metrics(
@@ -890,6 +940,76 @@ def _write_fills(path: Path, fills: list[Fill]) -> None:
         writer.writeheader()
         for fill in fills:
             writer.writerow({field: getattr(fill, field) for field in fields})
+
+
+def _write_equity_curve(path: Path, equity_curve: list[tuple[date, float]]) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["date", "equity"])
+        writer.writeheader()
+        for day, equity in equity_curve:
+            writer.writerow({"date": day.isoformat(), "equity": f"{equity:.6f}"})
+
+
+def _write_yearly_report(path: Path, annual_stats: list[dict[str, float | int]]) -> None:
+    fields = ["year", "trades", "return", "max_drawdown", "win_rate"]
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for item in annual_stats:
+            writer.writerow({field: item.get(field, 0) for field in fields})
+
+
+def _write_drawdown_report(path: Path, equity_curve: list[tuple[date, float]]) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["date", "equity", "peak", "drawdown"])
+        writer.writeheader()
+        peak = 0.0
+        for day, equity in equity_curve:
+            peak = max(peak, equity)
+            drawdown = equity / peak - 1 if peak else 0.0
+            writer.writerow(
+                {
+                    "date": day.isoformat(),
+                    "equity": f"{equity:.6f}",
+                    "peak": f"{peak:.6f}",
+                    "drawdown": f"{drawdown:.6f}",
+                }
+            )
+
+
+def _write_sector_heat_report(path: Path, sector_heat_by_date: dict[date, dict[str, SectorAlpha]]) -> None:
+    fields = [
+        "date",
+        "sector",
+        "heat_score",
+        "member_count",
+        "breadth_score",
+        "relative_strength_score",
+        "amount_score",
+        "momentum_score",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for day in sorted(sector_heat_by_date):
+            sectors = sorted(
+                sector_heat_by_date[day].values(),
+                key=lambda item: (item.heat_score, item.member_count),
+                reverse=True,
+            )
+            for item in sectors:
+                writer.writerow(
+                    {
+                        "date": day.isoformat(),
+                        "sector": item.sector,
+                        "heat_score": f"{item.heat_score:.6f}",
+                        "member_count": item.member_count,
+                        "breadth_score": f"{item.breadth_score:.6f}",
+                        "relative_strength_score": f"{item.relative_strength_score:.6f}",
+                        "amount_score": f"{item.amount_score:.6f}",
+                        "momentum_score": f"{item.momentum_score:.6f}",
+                    }
+                )
 
 
 def _write_metrics(
@@ -1175,12 +1295,32 @@ def _analyze_verdicts(
     config: BacktestConfig,
     regime_by_date: dict[date, RegimeState] | None = None,
     points: list[IndicatorPoint] | None = None,
+    index_rows_by_date: dict[date, KLine] | None = None,
+    index_prior_by_date: dict[tuple[date, int], KLine] | None = None,
+    sector_map: dict[str, str] | None = None,
+    sector_heat_by_date: dict[date, dict[str, SectorAlpha]] | None = None,
 ) -> dict[date, str]:
     wanted = set(all_dates)
     verdicts: dict[date, str] = {}
     indicators = points or build_indicators(rows)
     for idx, row in enumerate(rows):
         if row.date not in wanted or idx + 1 < 61:
+            continue
+        if config.strategy_mode == "strategy_v5_alpha":
+            state = regime_by_date.get(row.date) if regime_by_date else None
+            if state is not None and state.regime == "BEAR":
+                verdicts[row.date] = "观察"
+                continue
+            alpha = score_alpha(
+                rows,
+                idx,
+                indicators[idx],
+                index_rows_by_date or {},
+                index_prior_by_date or {},
+            )
+            entry = trend_pullback_entry(rows, idx, indicators[idx])
+            heat_bonus = sector_heat_bonus(meta.code, row.date, sector_map or {}, sector_heat_by_date or {})
+            verdicts[row.date] = "入选" if alpha.total + heat_bonus >= 70 and entry.score >= 60 else "观察"
             continue
         if config.strategy_mode == "strategy_v2_modular":
             state = regime_by_date.get(row.date) if regime_by_date else None
@@ -1289,6 +1429,17 @@ def _regime_by_date_from_index(symbol: str, rows: list[KLine], all_dates: list[d
         detail = f"{symbol} {day.isoformat()} regime={regime}; close={current.close:.2f}, ma20={ma20_text}, ma60={ma60_text}, rise60={rise60:.2f}%"
         out[day] = RegimeState(symbol, symbol, day, regime, ok, detail)
     return out
+
+
+def _index_reference_maps(rows: list[KLine], windows: tuple[int, ...]) -> tuple[dict[date, KLine], dict[tuple[date, int], KLine]]:
+    sorted_rows = sorted(rows, key=lambda row: row.date)
+    by_date = {row.date: row for row in sorted_rows}
+    prior: dict[tuple[date, int], KLine] = {}
+    for idx, row in enumerate(sorted_rows):
+        for window in windows:
+            if idx >= window:
+                prior[(row.date, window)] = sorted_rows[idx - window]
+    return by_date, prior
 
 
 def _point_slope(points: list[IndicatorPoint], idx: int, name: str, window: int) -> float:

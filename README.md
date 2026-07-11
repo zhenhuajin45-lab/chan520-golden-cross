@@ -29,6 +29,20 @@ python -m chan520_skill backtest --basket "600288,300568,688106,002132,603638,30
 python -m chan520_skill backtest --universe-snapshot data/universe_2024-01-01.csv --start 2024-01-01 --end 2026-07-01
 ```
 
+## v5 Alpha 全市场研究框架
+
+v5 将 520 金叉降级为趋势确认，新增市场状态、动态股票池、趋势回踩入场、Alpha 评分、ATR 风控、组合引擎和板块热度轻加分。GM 真实数据只用于构建本地数据底座；后续反复回测直接读取 SQLite。
+
+```powershell
+# 1. 用 GM 缓存构建本地 SQLite 数据库（数据库文件不提交 Git）
+python scripts/gm_alpha_store.py build --cache-dir reports/backtest/v6/all --store data/gm_alpha/chan520_alpha.sqlite --start 2016-01-01 --end 2026-07-09 --universe all --sector-source industry --rebuild
+
+# 2. 从本地 SQLite 跑 2026 全市场回测
+python scripts/gm_alpha_store.py run --store data/gm_alpha/chan520_alpha.sqlite --start 2026-01-01 --end 2026-07-09 --output-dir reports/backtest/v6/store_all_2026 --lookback-days 900
+```
+
+本地库包含 `daily_bars`、`instrument_status`、`sector_map`、`dynamic_universe`、`index_bars` 等表。`data/gm_alpha/*.sqlite*` 已在 `.gitignore` 中排除；GitHub 只提交代码、脚本、测试和轻量回测报告。
+
 部署给其他机器或通过 GitHub 分发时，见 [DEPLOY.md](DEPLOY.md)。
 
 生成报告默认写入：
