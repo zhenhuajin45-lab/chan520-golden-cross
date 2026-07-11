@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .evidence_codes import ReasonCode, VerdictCode
 from .microstructure import price_limit
 from .models import IndicatorPoint, KLine
 
@@ -30,7 +31,7 @@ def breakeven_win_rate(payoff_ratio: float) -> float:
 
 
 def is_entry_verdict(verdict: str) -> bool:
-    return verdict in {"entry", "buy", "入选", "��ѡ"}
+    return verdict in {VerdictCode.ENTRY.value, "buy", "entry", "入选"}
 
 
 def apply_four_no_entry(
@@ -45,19 +46,19 @@ def apply_four_no_entry(
 ) -> EntryDecision:
     reasons: list[str] = []
     if config.entry_tier == "standard" and not is_entry_verdict(verdict):
-        reasons.append("��׼��ѡ:standard_tier_requires_entry_verdict")
+        reasons.append(ReasonCode.STANDARD_TIER_REQUIRES_ENTRY.value)
     if abs(row.pct_chg) >= price_limit(code) * config.acute_move_limit_ratio or row.amplitude >= config.max_amplitude:
-        reasons.append("���Ǽ���:acute_move")
+        reasons.append(ReasonCode.ACUTE_MOVE.value)
     if entry <= stop:
-        reasons.append("invalid_stop")
+        reasons.append(ReasonCode.INVALID_STOP.value)
         rr = 0.0
     else:
         stop_dist = (entry - stop) / entry
         if stop_dist > config.max_stop_dist:
-            reasons.append("ֹ��������:stop_distance_too_wide")
+            reasons.append(ReasonCode.STOP_DISTANCE_TOO_WIDE.value)
         rr = (target - entry) / (entry - stop) if target > entry else 0.0
         if rr < config.min_rr:
-            reasons.append(f"ӯ���Ȳ���:rr_too_low:{rr:.2f}<{config.min_rr:.2f}")
+            reasons.append(ReasonCode.RR_TOO_LOW.value)
     if point.atr14 is None:
-        reasons.append("atr_missing")
+        reasons.append(ReasonCode.ATR_MISSING.value)
     return EntryDecision(not reasons, tuple(reasons), rr=rr, breakeven_win_rate=breakeven_win_rate(rr))

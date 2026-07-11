@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from chan520_skill.backtest import CandidateSignal, Trade
+from chan520_skill.evidence_codes import ReasonCode, SectorDataStatus
 from chan520_skill.models import KLine, RegimeState, StockMeta
 
 
@@ -13,8 +14,9 @@ def make_candidate(
     entry: float = 70.0,
     rs: float = 10.0,
     hard_pass: bool = True,
-) -> CandidateSignal:
+    ) -> CandidateSignal:
     return CandidateSignal(
+        candidate_id=f"cand_{code}",
         code=code,
         name=code,
         date=date(2026, 1, 5),
@@ -22,6 +24,14 @@ def make_candidate(
         market_regime="NORMAL",
         eligible=True,
         market_ok=True,
+        alpha_pass=True,
+        entry_pass=True,
+        regime_pass=True,
+        sector_data_status=SectorDataStatus.MAPPED.value,
+        four_no_pass=True,
+        stop_valid=True,
+        rr_pass=True,
+        sizing_feasible=True,
         alpha_total=ranking,
         trend_score=30.0,
         relative_strength_score=rs,
@@ -31,7 +41,14 @@ def make_candidate(
         sector_heat_score=0.0,
         entry_score=entry,
         ranking_score=ranking,
+        signal_close=10.0,
+        planned_stop=9.0,
+        planned_target=13.0,
+        ex_ante_rr=3.0,
+        initial_risk_cash=100.0,
+        position_neutral_shares=100,
         hard_pass=hard_pass,
+        reason_codes=(ReasonCode.OK.value,) if hard_pass else (ReasonCode.ALPHA_THRESHOLD.value,),
         reasons=("unit",),
     )
 

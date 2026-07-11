@@ -11,9 +11,11 @@ import csv
 import pickle
 import sqlite3
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
+from chan520_skill.evidence_manifest import build_evidence_manifest, stable_hash_json, write_evidence_manifest
 from chan520_skill.models import KLine, StockMeta
 from chan520_skill.portfolio_engine import PortfolioEngineConfig, run_alpha_portfolio
 
@@ -38,13 +40,35 @@ def main() -> int:
     run.add_argument("--output-dir", default="reports/backtest/v6/store_all")
     run.add_argument("--max-symbols", type=int, default=0)
     run.add_argument("--lookback-days", type=int, default=900)
+    run.add_argument("--strategy-mode", default="strategy_v5_alpha_ranked")
+
+    compare = sub.add_parser("compare")
+    compare.add_argument("--store", default="data/gm_alpha/chan520_alpha.sqlite")
+    compare.add_argument("--start", default="2026-01-01")
+    compare.add_argument("--end", default="2026-07-09")
+    compare.add_argument("--output-dir", default="reports/backtest/v7/controlled_compare")
+    compare.add_argument("--max-symbols", type=int, default=0)
+    compare.add_argument("--lookback-days", type=int, default=900)
 
     args = parser.parse_args()
     if args.cmd == "build":
         build_store(args)
         return 0
+    if args.cmd == "compare":
+        compare_store(args)
+        return 0
     run_store(args)
     return 0
+
+
+@dataclass(frozen=True)
+class StoreData:
+    names: dict[str, str]
+    sector_map: dict[str, str]
+    rows_by_code: dict[str, list[KLine]]
+    symbols: list[str]
+    eligible_by_date: dict[date, set[str]]
+    index_rows: list[KLine]
 
 
 def build_store(args) -> None:
@@ -103,40 +127,139 @@ def run_store(args) -> None:
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
     output_dir = Path(args.output_dir)
-    conn = sqlite3.connect(args.store)
-    try:
-        names = load_names(conn)
-        sector_map = load_sector_map(conn)
-        symbol_filter = load_symbol_filter(conn, args.max_symbols)
-        rows_by_code = load_daily_bars(conn, start, end, args.lookback_days, symbol_filter)
-        rows_by_code = {code: rows for code, rows in rows_by_code.items() if len(rows) >= 260}
-        symbols = sorted(rows_by_code)
-        eligible_by_date = load_dynamic_universe(conn, start, end, set(symbols))
-        index_rows = load_index_bars(conn, end)
-    finally:
-        conn.close()
+    data = load_store_data(Path(args.store), start, end, args.lookback_days, args.max_symbols)
 
     def loader(code: str, _end: date, lookback_days: int = 1000, adjust: str = "none"):
         if adjust != "none":
             raise ValueError("SQLite store only contains unadjusted bars")
         market = 1 if code.startswith(("5", "6", "9")) else 0
-        return StockMeta(code, names.get(code, code), market), rows_by_code[code]
+        return StockMeta(code, data.names.get(code, code), market), data.rows_by_code[code]
+
+    engine_config = PortfolioEngineConfig(max_positions=5, strategy_mode=args.strategy_mode)
 
     trades_path, metrics_path, metrics = run_alpha_portfolio(
-        symbols,
+        data.symbols,
         start,
         end,
         output_dir,
         loader,
-        sector_map,
-        index_rows,
-        eligible_by_date,
-        PortfolioEngineConfig(max_positions=5),
+        data.sector_map,
+        data.index_rows,
+        data.eligible_by_date,
+        engine_config,
     )
-    write_research_report(output_dir / "research_report_v5_1.md", output_dir, metrics, start, end, len(symbols))
+    manifest = build_evidence_manifest(
+        store_path=Path(args.store),
+        symbols=data.symbols,
+        ordered_symbols=data.symbols,
+        config=engine_config,
+        cwd=Path.cwd(),
+    )
+    write_evidence_manifest(output_dir / "evidence_manifest.json", manifest)
+    write_research_report(output_dir / "research_report_v5_1.md", output_dir, metrics, start, end, len(data.symbols), args.strategy_mode)
     print(f"SQLite alpha complete trades={int(metrics['trade_count'])} cagr={metrics['cagr']:.4f} max_dd={metrics['max_drawdown']:.4f}")
     print(f"Trades: {trades_path.resolve()}")
     print(f"Metrics: {metrics_path.resolve()}")
+
+
+def compare_store(args) -> None:
+    start = date.fromisoformat(args.start)
+    end = date.fromisoformat(args.end)
+    output_dir = Path(args.output_dir)
+    data = load_store_data(Path(args.store), start, end, args.lookback_days, args.max_symbols)
+
+    def loader(code: str, _end: date, lookback_days: int = 1000, adjust: str = "none"):
+        if adjust != "none":
+            raise ValueError("SQLite store only contains unadjusted bars")
+        market = 1 if code.startswith(("5", "6", "9")) else 0
+        return StockMeta(code, data.names.get(code, code), market), data.rows_by_code[code]
+
+    variants = ["strategy_v5_alpha_first_fit_frozen", "strategy_v5_alpha_ranked"]
+    rows = []
+    shared_hashes = None
+    for variant in variants:
+        engine_config = PortfolioEngineConfig(max_positions=5, strategy_mode=variant)
+        variant_dir = output_dir / variant
+        _trades_path, _metrics_path, metrics = run_alpha_portfolio(
+            data.symbols,
+            start,
+            end,
+            variant_dir,
+            loader,
+            data.sector_map,
+            data.index_rows,
+            data.eligible_by_date,
+            engine_config,
+        )
+        manifest = build_evidence_manifest(
+            store_path=Path(args.store),
+            symbols=data.symbols,
+            ordered_symbols=data.symbols,
+            config=engine_config,
+            cwd=Path.cwd(),
+        )
+        write_evidence_manifest(variant_dir / "evidence_manifest.json", manifest)
+        hashes = {
+            key: manifest[key]
+            for key in (
+                "sqlite_sha256",
+                "symbol_universe_hash",
+                "ordered_symbol_list_hash",
+                "dynamic_universe_hash",
+                "sector_map_hash",
+                "index_data_hash",
+            )
+        }
+        if shared_hashes is None:
+            shared_hashes = hashes
+        same_data = hashes == shared_hashes
+        rows.append(
+            {
+                "variant": variant,
+                "same_data_hashes": int(same_data),
+                "strategy_config_hash": manifest["strategy_config_hash"],
+                "data_hash_bundle": stable_hash_json(hashes),
+                **{key: f"{metrics.get(key, 0):.6f}" for key in ("trade_count", "total_return", "cagr", "max_drawdown", "sharpe", "calmar", "win_rate", "payoff_ratio", "profit_factor")},
+            }
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "controlled_comparison_2026.csv"
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    md_path = output_dir / "controlled_comparison_2026.md"
+    lines = [
+        "# Controlled Comparison",
+        "",
+        "- Variants were run in the same commit with the same SQLite file, ordered symbols, dynamic universe, sector map, and index data.",
+        "- Parameter tuning: none.",
+        "",
+        "| Variant | Same Data Hashes | Trades | CAGR | Max DD | Sharpe |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['variant']} | {row['same_data_hashes']} | {row['trade_count']} | {row['cagr']} | {row['max_drawdown']} | {row['sharpe']} |"
+        )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Controlled comparison complete: {csv_path.resolve()}")
+
+
+def load_store_data(store: Path, start: date, end: date, lookback_days: int, max_symbols: int) -> StoreData:
+    conn = sqlite3.connect(store)
+    try:
+        names = load_names(conn)
+        sector_map = load_sector_map(conn)
+        symbol_filter = load_symbol_filter(conn, max_symbols)
+        rows_by_code = load_daily_bars(conn, start, end, lookback_days, symbol_filter)
+        rows_by_code = {code: rows for code, rows in rows_by_code.items() if len(rows) >= 260}
+        symbols = sorted(rows_by_code)
+        eligible_by_date = load_dynamic_universe(conn, start, end, set(symbols))
+        index_rows = load_index_bars(conn, end)
+        return StoreData(names, sector_map, rows_by_code, symbols, eligible_by_date, index_rows)
+    finally:
+        conn.close()
 
 
 def configure_sqlite(conn: sqlite3.Connection) -> None:
@@ -420,14 +543,14 @@ def load_pickle(path: Path):
         return pickle.load(fh)
 
 
-def write_research_report(path: Path, output_dir: Path, metrics: dict[str, float], start: date, end: date, symbols: int) -> None:
+def write_research_report(path: Path, output_dir: Path, metrics: dict[str, float], start: date, end: date, symbols: int, strategy_mode: str) -> None:
     yearly = output_dir / f"yearly_report_basket_{start}_{end}.csv"
     lines = [
         "# chan520 v5.1 Alpha Research Report",
         "",
         f"- Period: `{start}` to `{end}`",
         f"- Symbols loaded from SQLite store: `{symbols}`",
-        "- Strategy: `strategy_v5_alpha_ranked`",
+        f"- Strategy: `{strategy_mode}`",
         "- Execution: close signal, next-session open fill, unadjusted GM prices.",
         "- Data source: durable local SQLite store generated from GM historical caches.",
         "",

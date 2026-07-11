@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import date
 
 from chan520_skill.backtest import _analyze_v5_candidate_signals
+from chan520_skill.backtest import BacktestConfig
+from chan520_skill.entry_filters import EntryFilterConfig
 from chan520_skill.indicators import build_indicators
+from chan520_skill.risk import RiskConfig
 
 from .v5_1_helpers import make_bars, make_meta, make_regimes
 
@@ -25,6 +28,9 @@ def test_v5_signal_prefix_invariance() -> None:
         {"600000": "tech"},
         {},
         {target_day: {"600000"}},
+        BacktestConfig(strategy_mode="strategy_v5_alpha_ranked"),
+        RiskConfig(),
+        EntryFilterConfig(),
     )
     full_signals = _analyze_v5_candidate_signals(
         make_meta("600000"),
@@ -37,6 +43,9 @@ def test_v5_signal_prefix_invariance() -> None:
         {"600000": "tech"},
         {},
         {target_day: {"600000"}},
+        BacktestConfig(strategy_mode="strategy_v5_alpha_ranked"),
+        RiskConfig(),
+        EntryFilterConfig(),
     )
 
     assert prefix_signals[target_day] == full_signals[target_day]

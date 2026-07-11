@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import math
 import random
+import hashlib
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -10,6 +11,7 @@ from statistics import median, mean, pstdev
 from typing import Callable
 
 from .alpha_score import score_alpha
+from .evidence_codes import ReasonCode, SectorDataStatus, VerdictCode
 from .entry_filters import EntryFilterConfig, apply_four_no_entry, breakeven_win_rate
 from .entry_model import trend_pullback_entry
 from .indicators import build_indicators, crossed_up, pct_change
@@ -39,8 +41,9 @@ MIN_COMMISSION = 5.0
 STAMP_TAX_RATE = 0.0005
 TRANSFER_RATE = 0.00001
 SLIPPAGE_BPS = 5.0
-ENTRY_VERDICT = "��ѡ"
-OBSERVE_VERDICT = "�۲�"
+ENTRY_VERDICT = VerdictCode.ENTRY.value
+OBSERVE_VERDICT = VerdictCode.OBSERVE.value
+REJECT_VERDICT = VerdictCode.REJECT.value
 V5_STRATEGY_MODES = {
     "strategy_v5_alpha",
     "strategy_v5_alpha_ranked",
@@ -87,6 +90,22 @@ class Trade:
     entry_costs: float = 0.0
     exit_costs: float = 0.0
     entry_count: int = 1
+    trade_id: str = ""
+    position_id: str = ""
+    entry_fill_id: str = ""
+    exit_fill_id: str = ""
+    candidate_id: str = ""
+    order_intent_id: str = ""
+    pending_order_id: str = ""
+    signal_date: date | None = None
+    signal_close: float = 0.0
+    next_open: float = 0.0
+    opening_gap: float = 0.0
+    planned_stop: float = 0.0
+    planned_target: float = 0.0
+    ex_ante_rr: float = 0.0
+    initial_risk_cash: float = 0.0
+    realized_r_multiple: float = 0.0
 
 
 @dataclass
@@ -105,6 +124,19 @@ class Position:
     entry_costs: float = 0.0
     entry_count: int = 1
     holding_bars: int = 0
+    position_id: str = ""
+    candidate_id: str = ""
+    order_intent_id: str = ""
+    pending_order_id: str = ""
+    entry_fill_id: str = ""
+    signal_date: date | None = None
+    signal_close: float = 0.0
+    next_open: float = 0.0
+    opening_gap: float = 0.0
+    planned_stop: float = 0.0
+    planned_target: float = 0.0
+    ex_ante_rr: float = 0.0
+    initial_risk_cash: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -118,6 +150,14 @@ class PendingOrder:
     rr: float = 0.0
     signal_date: date | None = None
     signal_regime: str = "down"
+    requested_shares: int = 0
+    candidate_id: str = ""
+    order_intent_id: str = ""
+    pending_order_id: str = ""
+    signal_close: float = 0.0
+    planned_stop: float = 0.0
+    planned_target: float = 0.0
+    initial_risk_cash: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -132,10 +172,20 @@ class Fill:
     signal_date: date | None
     stop: float = 0.0
     target: float = 0.0
+    fill_id: str = ""
+    candidate_id: str = ""
+    order_intent_id: str = ""
+    pending_order_id: str = ""
+    requested_shares: int = 0
+    allowed_at_open_shares: int = 0
+    signal_close: float = 0.0
+    next_open: float = 0.0
+    opening_gap: float = 0.0
 
 
 @dataclass(frozen=True)
 class CandidateSignal:
+    candidate_id: str
     code: str
     name: str
     date: date
@@ -143,6 +193,14 @@ class CandidateSignal:
     market_regime: str
     eligible: bool
     market_ok: bool
+    alpha_pass: bool
+    entry_pass: bool
+    regime_pass: bool
+    sector_data_status: str
+    four_no_pass: bool
+    stop_valid: bool
+    rr_pass: bool
+    sizing_feasible: bool
     alpha_total: float
     trend_score: float
     relative_strength_score: float
@@ -152,8 +210,15 @@ class CandidateSignal:
     sector_heat_score: float
     entry_score: float
     ranking_score: float
+    signal_close: float
+    planned_stop: float
+    planned_target: float
+    ex_ante_rr: float
+    initial_risk_cash: float
+    position_neutral_shares: int
     hard_pass: bool
-    reasons: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    reasons: tuple[str, ...] = ()
 
     @property
     def verdict(self) -> str:
@@ -181,7 +246,13 @@ def rank_candidate_signals(candidates: list[CandidateSignal]) -> list[CandidateS
 
 
 def is_entry_verdict(verdict: str) -> bool:
-    return verdict in {ENTRY_VERDICT, "入选", "��ѡ"}
+    return verdict in {ENTRY_VERDICT, "entry", "buy", "入选"}
+
+
+def stable_id(prefix: str, *parts: object) -> str:
+    payload = "|".join("" if part is None else str(part) for part in parts)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}_{digest}"
 
 
 def backtest_code(
@@ -450,6 +521,9 @@ def portfolio_backtest_symbols(
                 sector_map,
                 sector_heat_by_date,
                 eligible_by_date,
+                config,
+                risk_config,
+                entry_config,
             )
             verdicts_by_date[code] = {
                 day: signal.verdict for day, signal in candidate_signals_by_date[code].items()
@@ -504,6 +578,7 @@ def portfolio_backtest_symbols(
     }
     selection_audit_rows: list[dict[str, str | int | float]] = []
     signal_snapshot_rows: list[dict[str, str | int | float]] = []
+    pending_order_rows: list[dict[str, str | int | float]] = []
     funnel_by_date: dict[date, dict[str, int]] = {}
 
     previous_close_equity = config.initial_cash
@@ -539,7 +614,31 @@ def portfolio_backtest_symbols(
                 total_cost = pos.entry_costs + sell_cost
                 net = gross - total_cost
                 cash += fill * pos.shares - sell_cost
-                fills.append(Fill(day, order.code, "sell", fill, pos.shares, sell_cost, order.reason, order.signal_date, pos.stop, pos.target))
+                exit_fill_id = stable_id("fill", day, order.code, "sell", pos.position_id, len(fills))
+                fills.append(
+                    Fill(
+                        day,
+                        order.code,
+                        "sell",
+                        fill,
+                        pos.shares,
+                        sell_cost,
+                        order.reason,
+                        order.signal_date,
+                        pos.stop,
+                        pos.target,
+                        fill_id=exit_fill_id,
+                        candidate_id=pos.candidate_id,
+                        order_intent_id=pos.order_intent_id,
+                        pending_order_id=order.pending_order_id or pos.pending_order_id,
+                        requested_shares=pos.shares,
+                        allowed_at_open_shares=pos.shares,
+                        signal_close=pos.signal_close,
+                        next_open=row.open,
+                        opening_gap=(row.open / prev.close - 1) if prev.close > 0 else 0.0,
+                    )
+                )
+                initial_risk_cash = pos.initial_risk_cash or max(pos.entry_price - pos.planned_stop, 0) * pos.shares
                 trades.append(
                     Trade(
                         order.code,
@@ -558,6 +657,22 @@ def portfolio_backtest_symbols(
                         pos.entry_costs,
                         sell_cost,
                         pos.entry_count,
+                        trade_id=stable_id("trade", order.code, pos.entry_date, day, pos.position_id),
+                        position_id=pos.position_id,
+                        entry_fill_id=pos.entry_fill_id,
+                        exit_fill_id=exit_fill_id,
+                        candidate_id=pos.candidate_id,
+                        order_intent_id=pos.order_intent_id,
+                        pending_order_id=pos.pending_order_id,
+                        signal_date=pos.signal_date,
+                        signal_close=pos.signal_close,
+                        next_open=pos.next_open,
+                        opening_gap=pos.opening_gap,
+                        planned_stop=pos.planned_stop,
+                        planned_target=pos.planned_target,
+                        ex_ante_rr=pos.ex_ante_rr,
+                        initial_risk_cash=initial_risk_cash,
+                        realized_r_multiple=(net / initial_risk_cash) if initial_risk_cash > 0 else 0.0,
                     )
                 )
                 del positions[order.code]
@@ -600,7 +715,31 @@ def portfolio_backtest_symbols(
                     discipline["rejected_caps"] += 1
                     continue
                 cash -= total
-                fills.append(Fill(day, order.code, order.side, fill, shares, buy_cost, order.reason, order.signal_date, order.stop, order.target))
+                fill_id = stable_id("fill", day, order.code, order.side, order.pending_order_id, len(fills))
+                opening_gap = (fill / order.signal_close - 1) if order.signal_close > 0 else 0.0
+                fills.append(
+                    Fill(
+                        day,
+                        order.code,
+                        order.side,
+                        fill,
+                        shares,
+                        buy_cost,
+                        order.reason,
+                        order.signal_date,
+                        order.stop,
+                        order.target,
+                        fill_id=fill_id,
+                        candidate_id=order.candidate_id,
+                        order_intent_id=order.order_intent_id,
+                        pending_order_id=order.pending_order_id,
+                        requested_shares=order.requested_shares or order.shares,
+                        allowed_at_open_shares=allowed_at_open,
+                        signal_close=order.signal_close,
+                        next_open=row.open,
+                        opening_gap=opening_gap,
+                    )
+                )
                 if pos is not None:
                     new_total = pos.shares + shares
                     pos.entry_price = (pos.entry_price * pos.shares + fill * shares) / new_total
@@ -626,6 +765,19 @@ def portfolio_backtest_symbols(
                         target=order.target,
                         highest_high=row.high,
                         entry_costs=buy_cost,
+                        position_id=stable_id("pos", order.code, order.signal_date, order.pending_order_id),
+                        candidate_id=order.candidate_id,
+                        order_intent_id=order.order_intent_id,
+                        pending_order_id=order.pending_order_id,
+                        entry_fill_id=fill_id,
+                        signal_date=order.signal_date,
+                        signal_close=order.signal_close,
+                        next_open=row.open,
+                        opening_gap=opening_gap,
+                        planned_stop=order.planned_stop or order.stop,
+                        planned_target=order.planned_target or order.target,
+                        ex_ante_rr=order.rr,
+                        initial_risk_cash=max(fill - order.stop, 0) * shares,
                     )
                     discipline["entries"] += 1
                 discipline["rr_values"].append(order.rr)
@@ -637,7 +789,7 @@ def portfolio_backtest_symbols(
         pending = remaining_pending
 
         sector_states = sector_states_by_date.get(day, {})
-        regime = regime_by_date.get(day, RegimeState("basket", "篮子", day, "down", False, "missing"))
+        regime = regime_by_date.get(day, RegimeState("basket", "basket", day, "down", False, "missing"))
         equity = cash + _positions_value(positions, rows_by_date, day)
         current_gross = _positions_value(positions, rows_by_date, day)
         sector_values = _sector_values(positions, rows_by_date, day)
@@ -656,10 +808,48 @@ def portfolio_backtest_symbols(
             pos.holding_bars += 1
             exit_reason = _exit_by_discipline(pos, row, signal_histories[pos.code], day, point, risk_config)
             if exit_reason:
-                pending.append(PendingOrder(pos.code, "sell", exit_reason, signal_date=day, signal_regime=regime.regime))
+                order = PendingOrder(
+                    pos.code,
+                    "sell",
+                    exit_reason,
+                    shares=pos.shares,
+                    stop=pos.stop,
+                    target=pos.target,
+                    signal_date=day,
+                    signal_regime=regime.regime,
+                    requested_shares=pos.shares,
+                    candidate_id=pos.candidate_id,
+                    order_intent_id=stable_id("intent", day, pos.code, "sell", pos.position_id, exit_reason),
+                    pending_order_id=stable_id("pend", day, pos.code, "sell", pos.position_id, exit_reason),
+                    signal_close=row.close,
+                    planned_stop=pos.stop,
+                    planned_target=pos.target,
+                    initial_risk_cash=pos.initial_risk_cash,
+                )
+                pending.append(order)
+                pending_order_rows.append(_pending_order_audit_row(day, order))
                 continue
             if row.close >= pos.target:
-                pending.append(PendingOrder(pos.code, "sell", "target_close_confirmed", signal_date=day, signal_regime=regime.regime))
+                order = PendingOrder(
+                    pos.code,
+                    "sell",
+                    "target_close_confirmed",
+                    shares=pos.shares,
+                    stop=pos.stop,
+                    target=pos.target,
+                    signal_date=day,
+                    signal_regime=regime.regime,
+                    requested_shares=pos.shares,
+                    candidate_id=pos.candidate_id,
+                    order_intent_id=stable_id("intent", day, pos.code, "sell", pos.position_id, "target"),
+                    pending_order_id=stable_id("pend", day, pos.code, "sell", pos.position_id, "target"),
+                    signal_close=row.close,
+                    planned_stop=pos.stop,
+                    planned_target=pos.target,
+                    initial_risk_cash=pos.initial_risk_cash,
+                )
+                pending.append(order)
+                pending_order_rows.append(_pending_order_audit_row(day, order))
                 continue
             signal_row = _row_on_date(signal_histories[pos.code], day)
             if signal_row and _add_signal(pos, signal_row, signal_histories[pos.code], day, point) and not any(
@@ -671,7 +861,7 @@ def portfolio_backtest_symbols(
                     signal_row,
                     row,
                 )
-                add_decision = apply_four_no_entry("入选", row, point, pos.code, row.close, add_stop, add_target, entry_config)
+                add_decision = apply_four_no_entry(ENTRY_VERDICT, row, point, pos.code, row.close, add_stop, add_target, entry_config)
                 if add_decision.ok:
                     shares = allowed_new_position_shares(
                         equity=equity,
@@ -687,7 +877,28 @@ def portfolio_backtest_symbols(
                         size_multiplier=risk_state.active_week_size_multiplier,
                     )
                     if shares > 0:
-                        pending.append(PendingOrder(pos.code, "add", "pyramid_add", shares=shares, stop=add_stop, target=add_target, rr=add_decision.rr, signal_date=day, signal_regime=regime.regime))
+                        pending_order_id = stable_id("pend", day, pos.code, "add", pos.position_id, len(pending))
+                        order = PendingOrder(
+                                pos.code,
+                                "add",
+                                "pyramid_add",
+                                shares=shares,
+                                stop=add_stop,
+                                target=add_target,
+                                rr=add_decision.rr,
+                                signal_date=day,
+                                signal_regime=regime.regime,
+                                requested_shares=shares,
+                                candidate_id=pos.candidate_id,
+                                order_intent_id=stable_id("intent", day, pos.code, "add", pos.position_id),
+                                pending_order_id=pending_order_id,
+                                signal_close=row.close,
+                                planned_stop=add_stop,
+                                planned_target=add_target,
+                                initial_risk_cash=max(row.close - add_stop, 0) * shares,
+                        )
+                        pending.append(order)
+                        pending_order_rows.append(_pending_order_audit_row(day, order))
                         planned_value = row.close * shares
                         planned_cash -= planned_value
                         planned_gross += planned_value
@@ -710,12 +921,12 @@ def portfolio_backtest_symbols(
         for rank, code, rows, candidate_signal in entry_items:
             if code in positions or risk_state.halted_next_session or risk_state.stopped_for_drawdown:
                 if candidate_signal is not None:
-                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "risk_or_position", None))
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.RISK_OR_POSITION.value, None))
                 continue
             if max_positions is not None and len(positions) + sum(1 for order in pending if order.side == "buy") >= max_positions:
                 if is_ranked_v5_strategy_mode(config.strategy_mode):
                     if candidate_signal is not None:
-                        selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "capacity", None))
+                        selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.CAPACITY.value, None))
                         funnel_by_date.setdefault(day, {})["capacity_rejected"] = funnel_by_date.setdefault(day, {}).get("capacity_rejected", 0) + 1
                     continue
                 break
@@ -725,14 +936,14 @@ def portfolio_backtest_symbols(
             point = points_by_date[code].get(day)
             if row is None or point is None:
                 continue
-            verdict = verdicts_by_date.get(code, {}).get(day, "不入选")
+            verdict = verdicts_by_date.get(code, {}).get(day, REJECT_VERDICT)
             if candidate_signal is not None:
                 verdict = candidate_signal.verdict
             industry = industry_of(code, sector_map)
-            if industry == "未知行业" and config.require_industry:
+            if industry.startswith("UNMAPPED") and config.require_industry:
                 discipline["industry_unmapped"] += 1
                 if candidate_signal is not None:
-                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "industry_unmapped", None))
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.INDUSTRY_UNMAPPED.value, None))
                 continue
             sector_state = sector_states.get(industry, SectorState(industry, day, "unknown", False, 0.0, "missing"))
             sector_ok = sector_state.sector_ok if config.use_sector else True
@@ -742,17 +953,17 @@ def portfolio_backtest_symbols(
             if not regime.regime_ok:
                 discipline["regime_rejected"] += 1
                 if candidate_signal is not None:
-                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "regime", None))
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.REGIME_REJECTED.value, None))
                 continue
             if not sector_ok:
                 discipline["sector_rejected"] += 1
                 if candidate_signal is not None:
-                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "sector", None))
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.SECTOR_REJECTED.value, None))
                 continue
             signal_row = _row_on_date(rows, day)
             if signal_row is None:
                 if candidate_signal is not None:
-                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "missing_signal_row", None))
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.MISSING_SIGNAL_ROW.value, None))
                 continue
             stop = _to_execution_price(_initial_stop(signal_row, point, risk_config), signal_row, row)
             target = _to_execution_price(
@@ -763,10 +974,10 @@ def portfolio_backtest_symbols(
                 discipline["rejected_four_no"] += 1
                 if candidate_signal is not None:
                     selection_audit_rows.append(
-                        _candidate_audit_row(candidate_signal, rank, False, "four_no:" + "|".join(decision.reasons), None)
+                        _candidate_audit_row(candidate_signal, rank, False, "|".join(decision.reasons), None)
                     )
                 for reason in decision.reasons:
-                    key = reason.split("：", 1)[0]
+                    key = reason
                     counts = discipline["four_no_reasons"]
                     counts[key] = counts.get(key, 0) + 1
                 continue
@@ -786,10 +997,12 @@ def portfolio_backtest_symbols(
             if shares <= 0:
                 discipline["rejected_caps"] += 1
                 if candidate_signal is not None:
-                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, "position_cap", None))
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.POSITION_CAP.value, None))
                 continue
-            pending.append(
-                PendingOrder(
+            candidate_id = candidate_signal.candidate_id if candidate_signal is not None else stable_id("cand", day, code)
+            order_intent_id = stable_id("intent", day, code, candidate_id, "buy")
+            pending_order_id = stable_id("pend", day, code, order_intent_id, len(pending))
+            order = PendingOrder(
                     code,
                     "buy",
                     f"{config.strategy_mode}_entry",
@@ -799,11 +1012,20 @@ def portfolio_backtest_symbols(
                     rr=decision.rr,
                     signal_date=day,
                     signal_regime=regime.regime,
-                )
+                    requested_shares=shares,
+                    candidate_id=candidate_id,
+                    order_intent_id=order_intent_id,
+                    pending_order_id=pending_order_id,
+                    signal_close=row.close,
+                    planned_stop=stop,
+                    planned_target=target,
+                    initial_risk_cash=max(row.close - stop, 0) * shares,
             )
+            pending.append(order)
+            pending_order_rows.append(_pending_order_audit_row(day, order))
             planned_value = row.close * shares
             if candidate_signal is not None:
-                order_for_audit = pending[-1]
+                order_for_audit = order
                 selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, True, "", order_for_audit))
                 signal_snapshot_rows.append(_candidate_audit_row(candidate_signal, rank, True, "", order_for_audit))
                 funnel_by_date.setdefault(day, {})["selected"] = funnel_by_date.setdefault(day, {}).get("selected", 0) + 1
@@ -839,8 +1061,32 @@ def portfolio_backtest_symbols(
             sell_cost = _costs(code, fill, pos.shares, "sell", config)
             gross = (fill - pos.entry_price) * pos.shares
             total_cost = pos.entry_costs + sell_cost
-            fills.append(Fill(last_day, code, "sell", fill, pos.shares, sell_cost, "end_of_backtest", last_day, pos.stop, pos.target))
+            exit_fill_id = stable_id("fill", last_day, code, "sell", pos.position_id, "eob")
+            fills.append(
+                Fill(
+                    last_day,
+                    code,
+                    "sell",
+                    fill,
+                    pos.shares,
+                    sell_cost,
+                    "end_of_backtest",
+                    last_day,
+                    pos.stop,
+                    pos.target,
+                    fill_id=exit_fill_id,
+                    candidate_id=pos.candidate_id,
+                    order_intent_id=pos.order_intent_id,
+                    pending_order_id=pos.pending_order_id,
+                    requested_shares=pos.shares,
+                    allowed_at_open_shares=pos.shares,
+                    signal_close=pos.signal_close,
+                    next_open=row.open,
+                    opening_gap=(row.open / pos.signal_close - 1) if pos.signal_close > 0 else 0.0,
+                )
+            )
             cash += fill * pos.shares - sell_cost
+            initial_risk_cash = pos.initial_risk_cash or max(pos.entry_price - pos.planned_stop, 0) * pos.shares
             trades.append(
                 Trade(
                     code,
@@ -859,6 +1105,22 @@ def portfolio_backtest_symbols(
                     pos.entry_costs,
                     sell_cost,
                     pos.entry_count,
+                    trade_id=stable_id("trade", code, pos.entry_date, last_day, pos.position_id),
+                    position_id=pos.position_id,
+                    entry_fill_id=pos.entry_fill_id,
+                    exit_fill_id=exit_fill_id,
+                    candidate_id=pos.candidate_id,
+                    order_intent_id=pos.order_intent_id,
+                    pending_order_id=pos.pending_order_id,
+                    signal_date=pos.signal_date,
+                    signal_close=pos.signal_close,
+                    next_open=pos.next_open,
+                    opening_gap=pos.opening_gap,
+                    planned_stop=pos.planned_stop,
+                    planned_target=pos.planned_target,
+                    ex_ante_rr=pos.ex_ante_rr,
+                    initial_risk_cash=initial_risk_cash,
+                    realized_r_multiple=((gross - total_cost) / initial_risk_cash) if initial_risk_cash > 0 else 0.0,
                 )
             )
             del positions[code]
@@ -877,7 +1139,9 @@ def portfolio_backtest_symbols(
     sector_heat_path = output_dir / f"sector_heat_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
     candidate_funnel_daily_path = output_dir / "candidate_funnel_daily.csv"
     candidate_funnel_summary_path = output_dir / "candidate_funnel_summary.md"
+    research_gate_audit_path = output_dir / "research_gate_audit.csv"
     candidate_selection_audit_path = output_dir / "candidate_selection_audit.csv"
+    pending_orders_path = output_dir / "pending_orders.csv"
     signal_snapshots_path = output_dir / "signal_snapshots.csv"
     trade_attribution_path = output_dir / "trade_attribution.csv"
     alpha_decile_path = output_dir / "alpha_decile_analysis.csv"
@@ -898,7 +1162,9 @@ def portfolio_backtest_symbols(
     if is_v5_strategy_mode(config.strategy_mode):
         _write_candidate_funnel_daily(candidate_funnel_daily_path, funnel_by_date)
         _write_candidate_funnel_summary(candidate_funnel_summary_path, funnel_by_date)
+        _write_dict_rows(research_gate_audit_path, _research_gate_rows(candidate_signals_by_date))
         _write_dict_rows(candidate_selection_audit_path, selection_audit_rows)
+        _write_dict_rows(pending_orders_path, pending_order_rows)
         _write_dict_rows(signal_snapshots_path, signal_snapshot_rows)
         _write_trade_attribution(trade_attribution_path, trades, signal_snapshot_rows)
         _write_alpha_decile_analysis(alpha_decile_path, selection_audit_rows)
@@ -996,6 +1262,12 @@ def metrics_from_trades(
     lo, hi = _bootstrap_mean_ci([trade.net_pnl for trade in trades])
     metrics["expectancy_ci95_low"] = lo
     metrics["expectancy_ci95_high"] = hi
+    cluster_lo, cluster_hi = _cluster_expectancy_ci(trades)
+    metrics["cluster_expectancy_ci95_low"] = cluster_lo
+    metrics["cluster_expectancy_ci95_high"] = cluster_hi
+    sharpe_lo, sharpe_hi = _moving_block_sharpe_ci(returns)
+    metrics["moving_block_sharpe_ci95_low"] = sharpe_lo
+    metrics["moving_block_sharpe_ci95_high"] = sharpe_hi
     independent_clusters = _independent_trade_clusters(trades)
     metrics["trade_count_sufficient"] = 1.0 if len(trades) >= 100 else 0.0
     metrics["independent_cluster_count"] = float(independent_clusters)
@@ -1004,8 +1276,12 @@ def metrics_from_trades(
         1.0 if len(trades) >= 100 and independent_clusters >= 26 and lo > 0 and years >= 3 else 0.0
     )
     metrics["sample_sufficient"] = metrics["statistically_supported"]
-    metrics["validation_label"] = 1.0 if split_date and years >= 3 else 0.0
-    if split_date:
+    start_day = equity_curve[0][0] if equity_curve else None
+    end_day = equity_curve[-1][0] if equity_curve else None
+    split_valid = bool(split_date and start_day and end_day and start_day < split_date < end_day)
+    metrics["validation_label"] = 1.0 if split_valid else 0.0
+    metrics["retrospective_research_validation"] = 1.0 if not split_valid else 0.0
+    if split_valid and split_date:
         is_trades = [trade for trade in trades if trade.entry_date < split_date]
         oos_trades = [trade for trade in trades if trade.entry_date >= split_date]
         metrics["is_trade_count"] = float(len(is_trades))
@@ -1055,7 +1331,7 @@ def annual_stats_from_trades(
 
 
 def _entry_signal(report) -> bool:
-    return report.verdict == "入选" or report.verdict == "观察（轻仓试探）"
+    return report.verdict in {ENTRY_VERDICT, "入选", "观察（轻仓试探）"}
 
 
 def _exit_signal(report) -> bool:
@@ -1178,10 +1454,11 @@ def _candidate_audit_row(
     signal: CandidateSignal,
     rank: int,
     selected: bool,
-    rejection_reason: str,
+    reason_code: str,
     order: PendingOrder | None,
 ) -> dict[str, str | int | float]:
     return {
+        "candidate_id": signal.candidate_id,
         "date": signal.date.isoformat(),
         "code": signal.code,
         "name": signal.name,
@@ -1189,6 +1466,14 @@ def _candidate_audit_row(
         "market_regime": signal.market_regime,
         "eligible": int(signal.eligible),
         "market_ok": int(signal.market_ok),
+        "alpha_pass": int(signal.alpha_pass),
+        "entry_pass": int(signal.entry_pass),
+        "regime_pass": int(signal.regime_pass),
+        "sector_data_status": signal.sector_data_status,
+        "four_no_pass": int(signal.four_no_pass),
+        "stop_valid": int(signal.stop_valid),
+        "rr_pass": int(signal.rr_pass),
+        "position_neutral_sizing_feasible": int(signal.sizing_feasible),
         "alpha_total": f"{signal.alpha_total:.6f}",
         "sector_bonus": f"{signal.sector_bonus:.6f}",
         "ranking_score": f"{signal.ranking_score:.6f}",
@@ -1201,13 +1486,57 @@ def _candidate_audit_row(
         "hard_pass": int(signal.hard_pass),
         "rank": rank,
         "selected": int(selected),
-        "rejection_reason": rejection_reason,
+        "reason_code": reason_code or (ReasonCode.OK.value if selected else "|".join(signal.reason_codes)),
+        "order_intent_id": order.order_intent_id if order else "",
+        "pending_order_id": order.pending_order_id if order else "",
+        "requested_shares": order.requested_shares if order else signal.position_neutral_shares,
         "shares": order.shares if order else 0,
+        "signal_close": f"{signal.signal_close:.6f}",
+        "planned_stop": f"{signal.planned_stop:.6f}",
+        "planned_target": f"{signal.planned_target:.6f}",
+        "ex_ante_rr": f"{signal.ex_ante_rr:.6f}",
+        "initial_risk_cash": f"{signal.initial_risk_cash:.6f}",
         "stop": f"{order.stop:.6f}" if order else "",
         "target": f"{order.target:.6f}" if order else "",
         "rr": f"{order.rr:.6f}" if order else "",
+        "reason_codes": "|".join(signal.reason_codes),
         "reasons": "|".join(signal.reasons),
     }
+
+
+def _pending_order_audit_row(day: date, order: PendingOrder) -> dict[str, str | int | float]:
+    return {
+        "decision_date": day.isoformat(),
+        "code": order.code,
+        "side": order.side,
+        "reason": order.reason,
+        "candidate_id": order.candidate_id,
+        "order_intent_id": order.order_intent_id,
+        "pending_order_id": order.pending_order_id,
+        "requested_shares": order.requested_shares or order.shares,
+        "shares": order.shares,
+        "signal_date": order.signal_date.isoformat() if order.signal_date else "",
+        "signal_regime": order.signal_regime,
+        "signal_close": f"{order.signal_close:.6f}",
+        "planned_stop": f"{(order.planned_stop or order.stop):.6f}",
+        "planned_target": f"{(order.planned_target or order.target):.6f}",
+        "rr": f"{order.rr:.6f}",
+        "initial_risk_cash": f"{order.initial_risk_cash:.6f}",
+    }
+
+
+def _research_gate_rows(
+    candidate_signals_by_date: dict[str, dict[date, CandidateSignal]]
+) -> list[dict[str, str | int | float]]:
+    signals = [
+        signal
+        for signals_by_date in candidate_signals_by_date.values()
+        for signal in signals_by_date.values()
+    ]
+    return [
+        _candidate_audit_row(signal, 0, False, ReasonCode.OK.value if signal.hard_pass else "|".join(signal.reason_codes), None)
+        for signal in sorted(signals, key=lambda item: (item.date, item.code))
+    ]
 
 
 def _plan_new_entry_order(
@@ -1231,14 +1560,14 @@ def _plan_new_entry_order(
 ) -> tuple[PendingOrder | None, str, float]:
     signal_row = _row_on_date(rows, day)
     if signal_row is None:
-        return None, "missing_signal_row", 0.0
+        return None, ReasonCode.MISSING_SIGNAL_ROW.value, 0.0
     stop = _to_execution_price(_initial_stop(signal_row, point, risk_config), signal_row, row)
     target = _to_execution_price(
         _target_price_with_point(rows, day, signal_row.close, risk_config, point), signal_row, row
     )
     decision = apply_four_no_entry(verdict, row, point, code, row.close, stop, target, entry_config)
     if not decision.ok:
-        return None, "four_no:" + "|".join(decision.reasons), decision.rr
+        return None, "|".join(decision.reasons), decision.rr
     shares = allowed_new_position_shares(
         equity=equity,
         cash=planned_cash,
@@ -1253,7 +1582,10 @@ def _plan_new_entry_order(
         size_multiplier=risk_state.active_week_size_multiplier,
     )
     if shares <= 0:
-        return None, "position_cap", decision.rr
+        return None, ReasonCode.POSITION_CAP.value, decision.rr
+    candidate_id = stable_id("cand", day, code)
+    order_intent_id = stable_id("intent", day, code, candidate_id, "buy")
+    pending_order_id = stable_id("pend", day, code, order_intent_id)
     return (
         PendingOrder(
             code,
@@ -1265,8 +1597,16 @@ def _plan_new_entry_order(
             rr=decision.rr,
             signal_date=day,
             signal_regime=regime.regime,
+            requested_shares=shares,
+            candidate_id=candidate_id,
+            order_intent_id=order_intent_id,
+            pending_order_id=pending_order_id,
+            signal_close=row.close,
+            planned_stop=stop,
+            planned_target=target,
+            initial_risk_cash=max(row.close - stop, 0) * shares,
         ),
-        "selected",
+        ReasonCode.OK.value,
         row.close * shares,
     )
 
@@ -1420,20 +1760,46 @@ def _write_sector_data_audit(
     sector_map: dict[str, str],
     sector_heat_by_date: dict[date, dict[str, SectorAlpha]],
 ) -> None:
-    mapped = sum(1 for value in sector_map.values() if value)
-    unmapped = len(sector_map) - mapped
+    mapped = sum(1 for value in sector_map.values() if value and not value.startswith("UNMAPPED_"))
+    missing = sum(1 for value in sector_map.values() if not value or value.startswith("UNMAPPED_"))
+    fallback = sum(1 for value in sector_map.values() if value.startswith("FALLBACK_"))
+    static_end_date = sum(1 for value in sector_map.values() if value == "STATIC_END_DATE")
     sector_days = sum(len(items) for items in sector_heat_by_date.values())
     lines = [
         "# Sector Data Audit",
         "",
         "| Item | Value |",
         "| --- | ---: |",
+        f"| symbol_denominator | {len(sector_map)} |",
+        f"| mapped | {mapped} |",
+        f"| missing | {missing} |",
+        f"| fallback | {fallback} |",
+        f"| STATIC_END_DATE | {static_end_date} |",
         f"| symbols_with_sector_label | {mapped} |",
-        f"| symbols_without_sector_label | {unmapped} |",
+        f"| symbols_without_sector_label | {missing} |",
         f"| daily_sector_heat_rows | {sector_days} |",
         "",
         "Sector heat is used only as a capped prior. Missing sector data never creates an artificial hot-sector boost.",
+        "`UNMAPPED_*` labels are audit placeholders and are not counted as mapped sector data.",
+        "",
+        "## Daily Sector Member Counts",
+        "",
+        "| Date | Sector | Members |",
+        "| --- | --- | ---: |",
     ]
+    for day in sorted(sector_heat_by_date):
+        for sector, item in sorted(sector_heat_by_date[day].items()):
+            lines.append(f"| {day.isoformat()} | {sector} | {item.member_count} |")
+    lines.extend(
+        [
+            "",
+            "## Excluded Industry Dates",
+            "",
+            "| Date | Sector | Reason |",
+            "| --- | --- | --- |",
+            "| none | none | no excluded-sector ledger was emitted by this run |",
+        ]
+    )
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -1493,20 +1859,20 @@ def _write_metrics(
         lines.extend(
             [
                 "",
-                "## 纪律合规",
+                "## Discipline Evidence",
                 "",
-                f"- 单股上限：默认 {risk_config.max_position_pct:.0%}，实测最大 {discipline.get('max_symbol_pct', 0):.2%}。",
-                f"- 单行业上限：默认 {risk_config.max_sector_pct:.0%}，实测最大 {discipline.get('max_sector_pct', 0):.2%}。",
-                f"- 总仓位上限：trend_up/range/down = 80%/50%/30%，实测最大 {discipline.get('max_exposure', 0):.2%}。",
-                f"- 四不做：拒绝 {discipline.get('rejected_four_no', 0)} 次；入场档位 `{entry_config.entry_tier}`；最小 R:R {entry_config.min_rr:.2f}。",
-                f"- 四不做原因：{_format_reason_counts(discipline.get('four_no_reasons', {}))}。",
-                f"- 信号漏斗：标准520 {discipline.get('standard_signals', 0)}，市场过滤拒绝 {discipline.get('regime_rejected', 0)}，行业过滤拒绝 {discipline.get('sector_rejected', 0)}，四不做拒绝 {discipline.get('rejected_four_no', 0)}，实际建仓 {discipline.get('entries', 0)}。",
-                f"- 数据门控：行业映射缺失拒绝 {discipline.get('industry_unmapped', 0)} 次；默认不把未知行业合并为同一风险桶。",
-                f"- 盈亏比：实际入场最小 R:R {min_rr:.2f}，平均 R:R {avg_rr:.2f}，对应盈亏平衡胜率 {breakeven_win_rate(avg_rr):.2%}。",
-                f"- 实测风险：平均 {metrics.get('avg_entry_risk_pct', 0):.2%}，最大 {metrics.get('max_entry_risk_pct', 0):.2%}，目标 {risk_config.risk_per_trade:.2%}。",
-                f"- 金字塔：加仓 {discipline.get('adds', 0)} 次。",
-                f"- 熔断/仓位：仓位被 cap/整手约束拒绝 {discipline.get('rejected_caps', 0)} 次，涨跌停阻断 {discipline.get('limit_blocked', 0)} 次。",
-                f"- 样本判定：交易笔数 {metrics.get('trade_count', 0):.0f}，独立周簇 {metrics.get('independent_cluster_count', 0):.0f}，CI95 下沿 {metrics.get('expectancy_ci95_low', 0):.2f}，统计支持={'是' if metrics.get('statistically_supported', 0) else '否'}。",
+                f"- Max single-symbol cap: configured {risk_config.max_position_pct:.0%}; observed {discipline.get('max_symbol_pct', 0):.2%}.",
+                f"- Max sector cap: configured {risk_config.max_sector_pct:.0%}; observed {discipline.get('max_sector_pct', 0):.2%}.",
+                f"- Gross exposure cap: trend_up/range/down = 80%/50%/30%; observed {discipline.get('max_exposure', 0):.2%}.",
+                f"- Four-no gate: rejected {discipline.get('rejected_four_no', 0)}; tier `{entry_config.entry_tier}`; min R:R {entry_config.min_rr:.2f}.",
+                f"- Four-no reason codes: {_format_reason_counts(discipline.get('four_no_reasons', {}))}.",
+                f"- Funnel: standard_signals {discipline.get('standard_signals', 0)}, regime_rejected {discipline.get('regime_rejected', 0)}, sector_rejected {discipline.get('sector_rejected', 0)}, four_no_rejected {discipline.get('rejected_four_no', 0)}, entries {discipline.get('entries', 0)}.",
+                f"- Data gate: industry_unmapped rejected {discipline.get('industry_unmapped', 0)}.",
+                f"- R:R: min {min_rr:.2f}, average {avg_rr:.2f}, breakeven win rate {breakeven_win_rate(avg_rr):.2%}.",
+                f"- Entry risk: average {metrics.get('avg_entry_risk_pct', 0):.2%}, max {metrics.get('max_entry_risk_pct', 0):.2%}, target {risk_config.risk_per_trade:.2%}.",
+                f"- Pyramid adds: {discipline.get('adds', 0)}.",
+                f"- Capacity/limit blocks: cap_or_lot_rejected {discipline.get('rejected_caps', 0)}, open_limit_blocked {discipline.get('limit_blocked', 0)}.",
+                f"- Statistical support: trades {metrics.get('trade_count', 0):.0f}, entry_week_clusters {metrics.get('independent_cluster_count', 0):.0f}, expectancy_ci95_low {metrics.get('expectancy_ci95_low', 0):.2f}, statistically_supported {int(metrics.get('statistically_supported', 0))}.",
                 "",
                 "| Regime | Average Exposure |",
                 "| --- | ---: |",
@@ -1557,8 +1923,8 @@ def _add_discipline_metrics(metrics: dict[str, float], discipline: dict) -> None
 
 def _format_reason_counts(counts: dict[str, int]) -> str:
     if not counts:
-        return "无"
-    return "；".join(f"{reason} {count}" for reason, count in sorted(counts.items()))
+        return "none"
+    return "; ".join(f"{reason} {count}" for reason, count in sorted(counts.items()))
 
 
 def _trimmed_mean(values: list[float], trim_pct: float) -> float:
@@ -1582,6 +1948,42 @@ def _bootstrap_mean_ci(values: list[float], iterations: int = 500, seed: int = 5
     low_idx = int(iterations * 0.025)
     high_idx = min(iterations - 1, int(iterations * 0.975))
     return means[low_idx], means[high_idx]
+
+
+def _cluster_expectancy_ci(trades: list[Trade], iterations: int = 500, seed: int = 520) -> tuple[float, float]:
+    clusters: dict[tuple[int, int], list[float]] = {}
+    for trade in trades:
+        clusters.setdefault(trade.entry_date.isocalendar()[:2], []).append(trade.net_pnl)
+    values = [mean(items) for items in clusters.values()]
+    return _bootstrap_mean_ci(values, iterations=iterations, seed=seed)
+
+
+def _moving_block_sharpe_ci(
+    returns: list[float],
+    *,
+    block_size: int = 10,
+    iterations: int = 500,
+    seed: int = 520,
+) -> tuple[float, float]:
+    if len(returns) < 2:
+        return 0.0, 0.0
+    block_size = max(1, min(block_size, len(returns)))
+    blocks = [returns[idx : idx + block_size] for idx in range(0, len(returns) - block_size + 1)]
+    if not blocks:
+        blocks = [returns]
+    rng = random.Random(seed)
+    sharpes: list[float] = []
+    for _ in range(iterations):
+        sample: list[float] = []
+        while len(sample) < len(returns):
+            sample.extend(blocks[rng.randrange(len(blocks))])
+        sample = sample[: len(returns)]
+        sd = pstdev(sample)
+        sharpes.append((mean(sample) / sd * math.sqrt(252)) if sd > 0 else 0.0)
+    sharpes.sort()
+    low_idx = int(iterations * 0.025)
+    high_idx = min(iterations - 1, int(iterations * 0.975))
+    return sharpes[low_idx], sharpes[high_idx]
 
 
 def _positions_value(positions: dict[str, Position], rows_by_date: dict[str, dict[date, KLine]], day: date) -> float:
@@ -1674,8 +2076,8 @@ def _portfolio_signal(prev: IndicatorPoint, point: IndicatorPoint, row: KLine) -
         and point.macd_dif > point.macd_dea
         and not (point.rsi14 is not None and point.rsi14 > 72)
     ):
-        return "入选"
-    return "观察"
+        return ENTRY_VERDICT
+    return OBSERVE_VERDICT
 
 
 def _initial_stop(row: KLine, point: IndicatorPoint, config: RiskConfig) -> float:
@@ -1721,11 +2123,11 @@ def _basket_regime(histories: dict[str, list[KLine]], day: date) -> RegimeState:
             point = build_indicators(trimmed)[-1]
             valid.append((trimmed, point))
     if not valid:
-        return RegimeState("basket", "篮子", day, "down", False, "篮子regime数据不足")
+        return RegimeState("basket", "basket", day, "down", False, "basket_regime_insufficient_data")
     above60 = sum(1 for rows, point in valid if point.ma60 is not None and rows[-1].close > point.ma60)
     breadth = above60 / len(valid)
     regime = "trend_up" if breadth >= 0.60 else ("range" if breadth >= 0.40 else "down")
-    return RegimeState("basket", "篮子", day, regime, regime == "trend_up", f"basket breadth60={breadth:.2%}")
+    return RegimeState("basket", "basket", day, regime, regime == "trend_up", f"basket breadth60={breadth:.2%}")
 
 
 def _sector_states_for_day(
@@ -1786,7 +2188,7 @@ def _analyze_verdicts(
             verdicts[row.date] = decision.verdict
             continue
         if not _could_be_standard_520(rows, indicators, idx):
-            verdicts[row.date] = "不入选"
+            verdicts[row.date] = REJECT_VERDICT
             continue
         report = analyze(meta, rows[: idx + 1], row.date, regime_state=None, min_history=config.min_history)
         verdicts[row.date] = report.verdict
@@ -1804,6 +2206,9 @@ def _analyze_v5_candidate_signals(
     sector_map: dict[str, str],
     sector_heat_by_date: dict[date, dict[str, SectorAlpha]],
     eligible_by_date: dict[date, set[str]],
+    config: BacktestConfig,
+    risk_config: RiskConfig,
+    entry_config: EntryFilterConfig,
 ) -> dict[date, CandidateSignal]:
     wanted = set(all_dates)
     signals: dict[date, CandidateSignal] = {}
@@ -1819,26 +2224,79 @@ def _analyze_v5_candidate_signals(
         heat_score = heat.heat_score if heat is not None else 0.0
         heat_bonus = sector_heat_bonus(meta.code, row.date, sector_map, sector_heat_by_date)
         eligible = meta.code in eligible_by_date.get(row.date, set())
-        market_ok = state.regime != "BEAR"
+        regime_pass = state.regime != "BEAR"
         ranking_score = alpha.total + heat_bonus
-        hard_pass = eligible and market_ok and ranking_score >= 70 and entry.score >= 60
+        alpha_pass = ranking_score >= 70
+        entry_pass = entry.score >= 60
+        signal_row = row
+        stop = _to_execution_price(_initial_stop(signal_row, point, risk_config), signal_row, row)
+        target = _to_execution_price(_target_price_with_point(rows, row.date, signal_row.close, risk_config, point), signal_row, row)
+        four_no = apply_four_no_entry(ENTRY_VERDICT, row, point, meta.code, row.close, stop, target, entry_config)
+        stop_valid = row.close > stop
+        rr_pass = four_no.rr >= entry_config.min_rr
+        position_neutral_shares = allowed_new_position_shares(
+            equity=config.initial_cash,
+            cash=config.initial_cash,
+            entry=row.close,
+            stop=stop,
+            current_symbol_value=0.0,
+            current_sector_value=0.0,
+            current_gross_value=0.0,
+            regime=state.regime,
+            config=risk_config,
+            pyramid_stage=0,
+            size_multiplier=1.0,
+        )
+        sizing_feasible = position_neutral_shares > 0
+        if industry.startswith("UNMAPPED"):
+            sector_data_status = SectorDataStatus.MISSING.value
+        elif heat is None:
+            sector_data_status = SectorDataStatus.FALLBACK.value
+        else:
+            sector_data_status = SectorDataStatus.MAPPED.value
+        reason_codes: list[str] = []
         reasons = list(alpha.reasons) + list(entry.reasons)
         if not eligible:
-            reasons.append("not_in_dynamic_universe")
-        if not market_ok:
-            reasons.append("bear_market")
-        if ranking_score < 70:
-            reasons.append("alpha_threshold")
-        if entry.score < 60:
-            reasons.append("entry_threshold")
+            reason_codes.append(ReasonCode.NOT_IN_DYNAMIC_UNIVERSE.value)
+        if not regime_pass:
+            reason_codes.append(ReasonCode.BEAR_MARKET.value)
+        if not alpha_pass:
+            reason_codes.append(ReasonCode.ALPHA_THRESHOLD.value)
+        if not entry_pass:
+            reason_codes.append(ReasonCode.ENTRY_THRESHOLD.value)
+        if sector_data_status == SectorDataStatus.MISSING.value:
+            reason_codes.append(ReasonCode.INDUSTRY_UNMAPPED.value)
+        if not four_no.ok:
+            reason_codes.extend(four_no.reasons)
+        if not sizing_feasible:
+            reason_codes.append(ReasonCode.POSITION_CAP.value)
+        hard_pass = (
+            eligible
+            and regime_pass
+            and alpha_pass
+            and entry_pass
+            and four_no.ok
+            and stop_valid
+            and rr_pass
+            and sizing_feasible
+        )
         signals[row.date] = CandidateSignal(
+            candidate_id=stable_id("cand", row.date, meta.code),
             code=meta.code,
             name=meta.name,
             date=row.date,
             industry=industry,
             market_regime=state.regime,
             eligible=eligible,
-            market_ok=market_ok,
+            market_ok=regime_pass,
+            alpha_pass=alpha_pass,
+            entry_pass=entry_pass,
+            regime_pass=regime_pass,
+            sector_data_status=sector_data_status,
+            four_no_pass=four_no.ok,
+            stop_valid=stop_valid,
+            rr_pass=rr_pass,
+            sizing_feasible=sizing_feasible,
             alpha_total=float(alpha.total),
             trend_score=float(alpha.trend),
             relative_strength_score=float(alpha.relative_strength),
@@ -1848,7 +2306,14 @@ def _analyze_v5_candidate_signals(
             sector_heat_score=float(heat_score),
             entry_score=float(entry.score),
             ranking_score=float(ranking_score),
+            signal_close=float(row.close),
+            planned_stop=float(stop),
+            planned_target=float(target),
+            ex_ante_rr=float(four_no.rr),
+            initial_risk_cash=float(max(row.close - stop, 0) * position_neutral_shares),
+            position_neutral_shares=int(position_neutral_shares),
             hard_pass=hard_pass,
+            reason_codes=tuple(reason_codes) if reason_codes else (ReasonCode.OK.value,),
             reasons=tuple(reasons),
         )
     return signals
@@ -1919,10 +2384,10 @@ def _regime_by_date_from_index(symbol: str, rows: list[KLine], all_dates: list[d
             row_idx += 1
         current = sorted_rows[row_idx]
         if current.date > day:
-            out[day] = RegimeState(symbol, symbol, day, "down", False, "指数数据不足")
+            out[day] = RegimeState(symbol, symbol, day, "down", False, "鎸囨暟鏁版嵁涓嶈冻")
             continue
         if row_idx < 60:
-            out[day] = RegimeState(symbol, symbol, day, "down", False, "指数regime数据不足")
+            out[day] = RegimeState(symbol, symbol, day, "down", False, "鎸囨暟regime鏁版嵁涓嶈冻")
             continue
         point = points[row_idx]
         rise60 = pct_change(sorted_rows[row_idx - 60].close, current.close)
@@ -1976,11 +2441,11 @@ def _basket_regime_from_points(
         if row is not None and point is not None and point.ma60 is not None:
             valid.append((row, point))
     if not valid:
-        return RegimeState("basket", "篮子", day, "down", False, "篮子regime数据不足")
+        return RegimeState("basket", "basket", day, "down", False, "basket_regime_insufficient_data")
     above60 = sum(1 for row, point in valid if row.close > (point.ma60 or 0))
     breadth = above60 / len(valid)
     regime = "trend_up" if breadth >= 0.60 else ("range" if breadth >= 0.40 else "down")
-    return RegimeState("basket", "篮子", day, regime, regime == "trend_up", f"basket breadth60={breadth:.2%}")
+    return RegimeState("basket", "basket", day, regime, regime == "trend_up", f"basket breadth60={breadth:.2%}")
 
 
 def _sector_states_from_points(
@@ -2007,7 +2472,7 @@ def _sector_states_from_points(
             old = histories[code][idx - 60].close
             valid.append((row, point, pct_change(old, row.close)))
         if not valid:
-            states[industry] = SectorState(industry, day, "unknown", False, 0.0, "行业数据不足")
+            states[industry] = SectorState(industry, day, "unknown", False, 0.0, "琛屼笟鏁版嵁涓嶈冻")
             continue
         above20 = sum(1 for row, point, _rise in valid if row.close > (point.ma20 or 0))
         breadth = above20 / len(valid)
