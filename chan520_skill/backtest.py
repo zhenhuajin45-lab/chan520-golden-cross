@@ -5,17 +5,19 @@ import gzip
 import math
 import random
 import hashlib
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date
+from enum import Enum
 from pathlib import Path
 from statistics import median, mean, pstdev
 from types import MappingProxyType
-from typing import Callable
+from typing import Any, Callable, Protocol
 
 from .alpha_score import score_alpha
 from .evidence_codes import ReasonCode, SectorDataStatus, VerdictCode
 from .entry_filters import EntryFilterConfig, apply_four_no_entry, breakeven_win_rate
 from .entry_model import trend_pullback_entry
+from .evidence_manifest import git_commit, source_tree_hash, stable_hash_json
 from .indicators import build_indicators, crossed_up, pct_change
 from .data import DataError, eastmoney_history, normalize_code, tencent_history
 from .market_regime import breadth_above_ma60, build_market_regime, to_regime_states
@@ -51,6 +53,25 @@ V5_STRATEGY_MODES = {
     "strategy_v5_alpha_ranked",
     "strategy_v5_alpha_first_fit_frozen",
 }
+DEFAULT_MAX_POSITIONS = 5
+KERNEL_INSTRUMENTATION_COUNTERS = {
+    "history_load_count": 0,
+    "indicator_build_count": 0,
+    "regime_build_count": 0,
+    "sector_heat_build_count": 0,
+    "candidate_analysis_count": 0,
+    "sector_state_build_count": 0,
+    "kernel_execution_count": 0,
+}
+
+
+def reset_kernel_instrumentation() -> None:
+    for key in KERNEL_INSTRUMENTATION_COUNTERS:
+        KERNEL_INSTRUMENTATION_COUNTERS[key] = 0
+
+
+def kernel_instrumentation_snapshot() -> dict[str, int]:
+    return dict(KERNEL_INSTRUMENTATION_COUNTERS)
 
 
 @dataclass(frozen=True)
@@ -258,6 +279,10 @@ class CandidateSignal:
 
 @dataclass(frozen=True)
 class PreparedBacktestContext:
+    requested_start: date
+    requested_end: date
+    first_trading_date: date | None
+    last_trading_date: date | None
     all_dates: tuple[date, ...]
     symbols: tuple[str, ...]
     metas: MappingProxyType
@@ -282,6 +307,254 @@ class PreparedBacktestContext:
     index_rows: tuple[KLine, ...]
     config_hash: str
     data_hash: str
+    candidate_config_hash: str
+    data_content_hash: str
+    ordered_symbol_hash: str
+    candidate_evidence_hash: str
+    prepared_context_hash: str
+
+
+class CaptureLevel(str, Enum):
+    SUMMARY = "SUMMARY"
+    TRADES = "TRADES"
+    FULL = "FULL"
+
+
+@dataclass(frozen=True)
+class KernelRunConfig:
+    selection_policy: str
+    selection_seed: int
+    max_positions: int
+    sizing_policy: str = "current_risk_sizing"
+    exit_policy: str = "current_exit"
+    pyramiding: bool = True
+    capture_level: CaptureLevel = CaptureLevel.FULL
+
+    def __post_init__(self) -> None:
+        if self.max_positions is None:
+            raise ValueError("KernelRunConfig.max_positions must not be None")
+        if self.max_positions <= 0:
+            raise ValueError("KernelRunConfig.max_positions must be positive")
+        if self.selection_policy.upper() not in {
+            "FIRST_FIT_FROZEN",
+            "DETERMINISTIC_RANKED",
+            "RANDOM",
+            "RANDOM_WITHIN_TIES",
+        }:
+            raise ValueError("unsupported selection_policy")
+
+
+@dataclass
+class KernelResult:
+    metrics: dict[str, float]
+    selected_candidate_ids: tuple[str, ...]
+    pending_orders: tuple[dict[str, str | int | float], ...]
+    fills: tuple[Fill, ...]
+    trades: tuple[Trade, ...]
+    equity_curve: tuple[tuple[date, float], ...]
+    funnel: MappingProxyType
+    discipline: MappingProxyType
+    selected_set_hash: str
+    fills_hash: str
+    trades_hash: str
+    kernel_run_hash: str
+    trades_path: Path | None = None
+    metrics_path: Path | None = None
+    artifacts: MappingProxyType | None = None
+    selection_audit_rows: tuple[dict[str, str | int | float], ...] = ()
+    signal_snapshot_rows: tuple[dict[str, str | int | float], ...] = ()
+    position_fill_link_rows: tuple[dict[str, str | int | float], ...] = ()
+
+
+class ArtifactSink(Protocol):
+    def write(
+        self,
+        context: PreparedBacktestContext,
+        run_config: KernelRunConfig,
+        result: KernelResult,
+        annual_stats: list[dict[str, float]],
+    ) -> tuple[Path | None, Path | None, MappingProxyType]:
+        ...
+
+
+class NullArtifactSink:
+    def write(
+        self,
+        context: PreparedBacktestContext,
+        run_config: KernelRunConfig,
+        result: KernelResult,
+        annual_stats: list[dict[str, float]],
+    ) -> tuple[Path | None, Path | None, MappingProxyType]:
+        return None, None, MappingProxyType({})
+
+
+@dataclass(frozen=True)
+class CsvArtifactSink:
+    output_dir: Path
+
+    def write(
+        self,
+        context: PreparedBacktestContext,
+        run_config: KernelRunConfig,
+        result: KernelResult,
+        annual_stats: list[dict[str, float]],
+    ) -> tuple[Path | None, Path | None, MappingProxyType]:
+        config = replace(
+            context.config,
+            selection_policy=run_config.selection_policy,
+            selection_seed=run_config.selection_seed,
+        )
+        risk_config = context.risk_config
+        entry_config = context.entry_config
+        symbols = list(context.symbols)
+        start = context.requested_start
+        end = context.requested_end
+        stem = "basket" if len(symbols) > 1 else normalize_code(symbols[0])
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        paths: dict[str, Path] = {
+            "trades": self.output_dir / f"trades_{stem}_{start.isoformat()}_{end.isoformat()}.csv",
+            "fills": self.output_dir / f"fills_{stem}_{start.isoformat()}_{end.isoformat()}.csv",
+            "metrics": self.output_dir / f"metrics_{stem}_{start.isoformat()}_{end.isoformat()}.md",
+            "equity": self.output_dir / f"equity_curve_{stem}_{start.isoformat()}_{end.isoformat()}.csv",
+            "yearly": self.output_dir / f"yearly_report_{stem}_{start.isoformat()}_{end.isoformat()}.csv",
+            "drawdown": self.output_dir / f"drawdown_report_{stem}_{start.isoformat()}_{end.isoformat()}.csv",
+            "trade_records": self.output_dir / f"trade_records_{stem}_{start.isoformat()}_{end.isoformat()}.csv",
+            "sector_heat": self.output_dir / f"sector_heat_{stem}_{start.isoformat()}_{end.isoformat()}.csv",
+            "candidate_funnel_daily": self.output_dir / "candidate_funnel_daily.csv",
+            "candidate_funnel_summary": self.output_dir / "candidate_funnel_summary.md",
+            "research_gate_funnel": self.output_dir / "research_gate_funnel.csv",
+            "portfolio_selection_funnel": self.output_dir / "portfolio_selection_funnel.csv",
+            "research_gate_audit": self.output_dir / "research_gate_audit.csv.gz",
+            "candidate_selection_audit": self.output_dir / "candidate_selection_audit.csv",
+            "pending_orders": self.output_dir / "pending_orders.csv",
+            "position_fill_links": self.output_dir / "position_fill_links.csv",
+            "signal_snapshots": self.output_dir / "signal_snapshots.csv",
+            "trade_attribution": self.output_dir / "trade_attribution.csv",
+            "alpha_decile": self.output_dir / "alpha_decile_analysis.csv",
+            "alpha_ic": self.output_dir / "alpha_ic_report.md",
+            "sector_data_audit": self.output_dir / "sector_data_audit.md",
+            "excluded_sector_daily": self.output_dir / "excluded_sector_daily.csv",
+            "controlled_comparison_csv": self.output_dir / "controlled_comparison_2026.csv",
+            "controlled_comparison_md": self.output_dir / "controlled_comparison_2026.md",
+        }
+        if run_config.capture_level in {CaptureLevel.TRADES, CaptureLevel.FULL}:
+            _write_trades(paths["trades"], list(result.trades))
+            _write_trades(paths["trade_records"], list(result.trades))
+            _write_fills(paths["fills"], list(result.fills))
+            _write_equity_curve(paths["equity"], list(result.equity_curve))
+            _write_yearly_report(paths["yearly"], annual_stats)
+            _write_drawdown_report(paths["drawdown"], list(result.equity_curve))
+        if run_config.capture_level == CaptureLevel.FULL:
+            if context.sector_heat_by_date:
+                _write_sector_heat_report(paths["sector_heat"], context.sector_heat_by_date)
+            if is_v5_strategy_mode(config.strategy_mode):
+                funnel = {day: dict(values) for day, values in result.funnel.items()}
+                _write_candidate_funnel_daily(paths["candidate_funnel_daily"], funnel)
+                _write_research_gate_funnel(paths["research_gate_funnel"], funnel)
+                _write_portfolio_selection_funnel(paths["portfolio_selection_funnel"], funnel)
+                _write_candidate_funnel_summary(paths["candidate_funnel_summary"], funnel)
+                _write_dict_rows_gzip(paths["research_gate_audit"], _research_gate_rows(context.candidate_signals_by_date))
+                _write_dict_rows(paths["candidate_selection_audit"], list(result.selection_audit_rows))
+                _write_dict_rows(paths["pending_orders"], list(result.pending_orders))
+                _write_dict_rows(paths["position_fill_links"], list(result.position_fill_link_rows))
+                _write_dict_rows(paths["signal_snapshots"], list(result.signal_snapshot_rows))
+                _write_trade_attribution(paths["trade_attribution"], list(result.trades), list(result.signal_snapshot_rows))
+                _write_alpha_decile_analysis(paths["alpha_decile"], list(result.selection_audit_rows))
+                _write_alpha_ic_report(paths["alpha_ic"], list(result.selection_audit_rows), list(result.trades))
+                _write_sector_data_audit(
+                    paths["sector_data_audit"],
+                    context.sector_map,
+                    context.sector_heat_by_date,
+                    loaded_symbols=symbols,
+                    exclusions=context.sector_heat_exclusions,
+                )
+                _write_excluded_sector_daily(paths["excluded_sector_daily"], context.sector_heat_exclusions)
+                _write_controlled_comparison_note(paths["controlled_comparison_csv"], paths["controlled_comparison_md"], config)
+        if run_config.capture_level != CaptureLevel.SUMMARY:
+            _write_metrics(
+                paths["metrics"],
+                result.metrics,
+                config,
+                discipline=dict(result.discipline),
+                risk_config=risk_config,
+                entry_config=entry_config,
+                annual_stats=annual_stats,
+            )
+            return paths["trades"], paths["metrics"], MappingProxyType(paths)
+        return None, None, MappingProxyType({})
+
+
+def _freeze_date_map(value: dict[date, Any]) -> MappingProxyType:
+    return MappingProxyType(dict(value))
+
+
+def _freeze_nested_mapping(value: dict[str, dict[date, Any]]) -> MappingProxyType:
+    return MappingProxyType({key: MappingProxyType(dict(inner)) for key, inner in value.items()})
+
+
+def _freeze_daily_nested_mapping(value: dict[date, dict[str, Any]]) -> MappingProxyType:
+    return MappingProxyType({key: MappingProxyType(dict(inner)) for key, inner in value.items()})
+
+
+def _freeze_eligible(value: dict[date, set[str] | frozenset[str]]) -> MappingProxyType:
+    return MappingProxyType({key: frozenset(items) for key, items in value.items()})
+
+
+def _dataclass_payload(value: Any) -> Any:
+    return asdict(value) if hasattr(value, "__dataclass_fields__") else value
+
+
+def _hash_rows(histories: dict[str, tuple[KLine, ...]]) -> str:
+    return stable_hash_json(
+        {
+            code: [
+                (
+                    row.date.isoformat(),
+                    row.open,
+                    row.close,
+                    row.high,
+                    row.low,
+                    row.volume,
+                    row.amount,
+                    row.pct_chg,
+                )
+                for row in rows
+            ]
+            for code, rows in histories.items()
+        }
+    )
+
+
+def _hash_candidate_evidence(candidate_signals_by_date: dict[str, dict[date, CandidateSignal]]) -> str:
+    return stable_hash_json(
+        [
+            {
+                "candidate_id": signal.candidate_id,
+                "code": signal.code,
+                "date": signal.date.isoformat(),
+                "hard_pass": signal.hard_pass,
+                "ranking_score": round(signal.ranking_score, 6),
+                "entry_score": round(signal.entry_score, 6),
+                "reason_codes": signal.reason_codes,
+            }
+            for code in sorted(candidate_signals_by_date)
+            for _day, signal in sorted(candidate_signals_by_date[code].items())
+        ]
+    )
+
+
+def _hash_kernel_run(context: PreparedBacktestContext, run_config: KernelRunConfig) -> str:
+    return stable_hash_json(
+        {
+            "prepared_context_hash": context.prepared_context_hash,
+            "selection_policy": run_config.selection_policy,
+            "selection_seed": run_config.selection_seed,
+            "max_positions": run_config.max_positions,
+            "sizing_policy": run_config.sizing_policy,
+            "exit_policy": run_config.exit_policy,
+            "pyramiding": run_config.pyramiding,
+        }
+    )
 
 
 def is_v5_strategy_mode(strategy_mode: str) -> bool:
@@ -542,9 +815,9 @@ def prepare_backtest_context(
         )
 
     metas: dict[str, StockMeta] = {}
-    signal_histories: dict[str, list[KLine]] = {}
-    execution_histories: dict[str, list[KLine]] = {}
-    indicators: dict[str, list[IndicatorPoint]] = {}
+    signal_histories: dict[str, tuple[KLine, ...]] = {}
+    execution_histories: dict[str, tuple[KLine, ...]] = {}
+    indicators: dict[str, tuple[IndicatorPoint, ...]] = {}
     points_by_date: dict[str, dict[date, IndicatorPoint]] = {}
     rows_by_date: dict[str, dict[date, KLine]] = {}
     signal_rows_by_date: dict[str, dict[date, KLine]] = {}
@@ -555,44 +828,51 @@ def prepare_backtest_context(
     for idx, symbol in enumerate(symbols, 1):
         code = normalize_code(symbol)
         lookback = max((end - start).days + 620, 1000)
+        KERNEL_INSTRUMENTATION_COUNTERS["history_load_count"] += 1
         if history_loader is not None:
             meta, execution_rows = history_loader(code, end, lookback_days=lookback, adjust="none")
             if config.signal_adjust == "none":
-                signal_rows = list(execution_rows)
+                signal_rows = execution_rows
             else:
                 _signal_meta, signal_rows = history_loader(code, end, lookback_days=lookback, adjust=config.signal_adjust)
         else:
             try:
                 meta, execution_rows = tencent_history(code, end, lookback_days=lookback, adjust="none")
                 if config.signal_adjust == "none":
-                    signal_rows = list(execution_rows)
+                    signal_rows = execution_rows
                 else:
                     _signal_meta, signal_rows = tencent_history(code, end, lookback_days=lookback, adjust=config.signal_adjust)
             except Exception:
                 meta, execution_rows = eastmoney_history(code, end, lookback_days=lookback, adjust=0)
                 adjust_map = {"none": 0, "qfq": 1, "hfq": 2}
                 if config.signal_adjust == "none":
-                    signal_rows = list(execution_rows)
+                    signal_rows = execution_rows
                 else:
                     _signal_meta, signal_rows = eastmoney_history(
                         code, end, lookback_days=lookback, adjust=adjust_map.get(config.signal_adjust, 0)
                     )
         execution_rows = [row for row in execution_rows if row.date <= end]
-        signal_rows = [row for row in signal_rows if row.date <= end]
-        common_dates = {row.date for row in execution_rows} & {row.date for row in signal_rows}
-        execution_rows = [row for row in execution_rows if row.date in common_dates]
-        signal_rows = [row for row in signal_rows if row.date in common_dates]
+        if config.signal_adjust == "none":
+            signal_rows = execution_rows
+        else:
+            signal_rows = [row for row in signal_rows if row.date <= end]
+            common_dates = {row.date for row in execution_rows} & {row.date for row in signal_rows}
+            execution_rows = [row for row in execution_rows if row.date in common_dates]
+            signal_rows = [row for row in signal_rows if row.date in common_dates]
         ensure_data_quality(execution_rows, min_bars=61)
         ensure_data_quality(signal_rows, min_bars=61)
         metas[code] = meta
-        execution_histories[code] = execution_rows
-        signal_histories[code] = signal_rows
-        pts = build_indicators(signal_rows)
+        execution_tuple = tuple(execution_rows)
+        signal_tuple = execution_tuple if config.signal_adjust == "none" else tuple(signal_rows)
+        execution_histories[code] = execution_tuple
+        signal_histories[code] = signal_tuple
+        KERNEL_INSTRUMENTATION_COUNTERS["indicator_build_count"] += 1
+        pts = tuple(build_indicators(list(signal_tuple)))
         indicators[code] = pts
         points_by_date[code] = {point.date: point for point in pts}
-        rows_by_date[code] = {row.date: row for row in execution_rows}
-        signal_rows_by_date[code] = {row.date: row for row in signal_rows}
-        row_index_by_date[code] = {row.date: row_idx for row_idx, row in enumerate(signal_rows)}
+        rows_by_date[code] = {row.date: row for row in execution_tuple}
+        signal_rows_by_date[code] = {row.date: row for row in signal_tuple}
+        row_index_by_date[code] = {row.date: row_idx for row_idx, row in enumerate(signal_tuple)}
         if idx == 1 or idx == len(symbols) or idx % 100 == 0:
             print(f"loaded {idx}/{len(symbols)} {code} signal_rows={len(signal_rows)} execution_rows={len(execution_rows)}", flush=True)
 
@@ -603,18 +883,22 @@ def prepare_backtest_context(
     if eligible_by_date is None:
         eligible_by_date = {day: set(signal_histories) for day in all_dates}
     if is_v5_strategy_mode(config.strategy_mode):
+        KERNEL_INSTRUMENTATION_COUNTERS["regime_build_count"] += 1
         breadth = breadth_above_ma60(signal_histories, points_by_date, rows_by_date, eligible_by_date, list(all_dates))
         market_points = build_market_regime(index_rows, breadth, list(all_dates))
         regime_by_date = to_regime_states(config.regime_index, market_points)
     elif config.strategy_mode == "strategy_v2_modular":
+        KERNEL_INSTRUMENTATION_COUNTERS["regime_build_count"] += 1
         regime_by_date = modular_regime_by_date(config.regime_index, index_rows, list(all_dates))
     else:
+        KERNEL_INSTRUMENTATION_COUNTERS["regime_build_count"] += 1
         regime_by_date = _regime_by_date_from_index(config.regime_index, index_rows, list(all_dates))
     index_rows_by_date, index_prior_by_date = _index_reference_maps(index_rows, (20, 60))
     sector_heat_by_date: dict[date, dict[str, SectorAlpha]] = {}
     sector_heat_exclusions: list[dict[str, str | int]] = []
     if is_v5_strategy_mode(config.strategy_mode):
         print(f"precompute sector heat dates={len(all_dates)} symbols={len(signal_histories)}", flush=True)
+        KERNEL_INSTRUMENTATION_COUNTERS["sector_heat_build_count"] += 1
         sector_heat_result = build_sector_heat(
             signal_histories,
             sector_map,
@@ -630,6 +914,7 @@ def prepare_backtest_context(
     print(f"precompute regime dates={len(regime_by_date)} strategy={config.strategy_mode}", flush=True)
     for verdict_idx, (code, rows) in enumerate(signal_histories.items(), 1):
         if is_v5_strategy_mode(config.strategy_mode):
+            KERNEL_INSTRUMENTATION_COUNTERS["candidate_analysis_count"] += 1
             candidate_signals_by_date[code] = _analyze_v5_candidate_signals(
                 metas[code],
                 rows,
@@ -647,6 +932,7 @@ def prepare_backtest_context(
             )
             verdicts_by_date[code] = {day: signal.verdict for day, signal in candidate_signals_by_date[code].items()}
         elif config.strategy_mode == "strategy_v2_modular":
+            KERNEL_INSTRUMENTATION_COUNTERS["candidate_analysis_count"] += 1
             verdicts_by_date[code] = _analyze_verdicts(
                 metas[code],
                 rows,
@@ -660,35 +946,66 @@ def prepare_backtest_context(
                 sector_heat_by_date,
             )
         else:
+            KERNEL_INSTRUMENTATION_COUNTERS["candidate_analysis_count"] += 1
             verdicts_by_date[code] = _analyze_verdicts(metas[code], rows, list(all_dates), config)
         if verdict_idx == len(signal_histories) or verdict_idx % 50 == 0:
             print(f"precompute verdicts {verdict_idx}/{len(signal_histories)}", flush=True)
     print(f"precompute sectors dates={len(regime_by_date)} symbols={len(signal_histories)}", flush=True)
+    KERNEL_INSTRUMENTATION_COUNTERS["sector_state_build_count"] += 1
     sector_states_by_date = {
         day: _sector_states_from_points(signal_histories, sector_map, signal_rows_by_date, points_by_date, row_index_by_date, day)
         for day in all_dates
     }
     print("precompute sectors complete", flush=True)
-    config_hash = stable_id("cfg", config, risk_config, entry_config, selection_policy_for(config))
-    data_hash = stable_id("data", tuple(sorted(signal_histories)), all_dates[0] if all_dates else "", all_dates[-1] if all_dates else "")
+    candidate_config_hash = stable_hash_json(
+        {
+            "backtest_config": _dataclass_payload(config),
+            "risk_config": _dataclass_payload(risk_config),
+            "entry_config": _dataclass_payload(entry_config),
+            "strategy_logic_id": "strategy_v5_alpha" if is_v5_strategy_mode(config.strategy_mode) else config.strategy_mode,
+        }
+    )
+    data_content_hash = _hash_rows(execution_histories)
+    ordered_symbol_hash = stable_hash_json(list(signal_histories))
+    candidate_evidence_hash = _hash_candidate_evidence(candidate_signals_by_date)
+    config_hash = candidate_config_hash
+    data_hash = data_content_hash
+    prepared_context_hash = stable_hash_json(
+        {
+            "run_code_commit": git_commit(Path.cwd()),
+            "source_tree_hash": source_tree_hash(Path.cwd()),
+            "candidate_config_hash": candidate_config_hash,
+            "data_content_hash": data_content_hash,
+            "ordered_symbol_hash": ordered_symbol_hash,
+            "candidate_evidence_hash": candidate_evidence_hash,
+            "requested_start": start.isoformat(),
+            "requested_end": end.isoformat(),
+            "first_trading_date": all_dates[0].isoformat() if all_dates else "",
+            "last_trading_date": all_dates[-1].isoformat() if all_dates else "",
+        }
+    )
     return PreparedBacktestContext(
+        requested_start=start,
+        requested_end=end,
+        first_trading_date=all_dates[0] if all_dates else None,
+        last_trading_date=all_dates[-1] if all_dates else None,
         all_dates=all_dates,
         symbols=tuple(signal_histories),
         metas=MappingProxyType(metas),
         execution_histories=MappingProxyType(execution_histories),
         signal_histories=MappingProxyType(signal_histories),
         indicators=MappingProxyType(indicators),
-        points_by_date=MappingProxyType(points_by_date),
-        rows_by_date=MappingProxyType(rows_by_date),
-        signal_rows_by_date=MappingProxyType(signal_rows_by_date),
-        row_index_by_date=MappingProxyType(row_index_by_date),
-        eligible_by_date=MappingProxyType(eligible_by_date),
-        regime_by_date=MappingProxyType(regime_by_date),
-        sector_heat_by_date=MappingProxyType(sector_heat_by_date),
-        sector_heat_exclusions=tuple(sector_heat_exclusions),
-        candidate_signals_by_date=MappingProxyType(candidate_signals_by_date),
-        verdicts_by_date=MappingProxyType(verdicts_by_date),
-        sector_states_by_date=MappingProxyType(sector_states_by_date),
+        points_by_date=_freeze_nested_mapping(points_by_date),
+        rows_by_date=_freeze_nested_mapping(rows_by_date),
+        signal_rows_by_date=_freeze_nested_mapping(signal_rows_by_date),
+        row_index_by_date=_freeze_nested_mapping(row_index_by_date),
+        eligible_by_date=_freeze_eligible(eligible_by_date),
+        regime_by_date=_freeze_date_map(regime_by_date),
+        sector_heat_by_date=_freeze_daily_nested_mapping(sector_heat_by_date),
+        sector_heat_exclusions=tuple(MappingProxyType(dict(row)) for row in sector_heat_exclusions),
+        candidate_signals_by_date=_freeze_nested_mapping(candidate_signals_by_date),
+        verdicts_by_date=_freeze_nested_mapping(verdicts_by_date),
+        sector_states_by_date=_freeze_daily_nested_mapping(sector_states_by_date),
         config=config,
         risk_config=risk_config,
         entry_config=entry_config,
@@ -696,6 +1013,11 @@ def prepare_backtest_context(
         index_rows=tuple(index_rows),
         config_hash=config_hash,
         data_hash=data_hash,
+        candidate_config_hash=candidate_config_hash,
+        data_content_hash=data_content_hash,
+        ordered_symbol_hash=ordered_symbol_hash,
+        candidate_evidence_hash=candidate_evidence_hash,
+        prepared_context_hash=prepared_context_hash,
     )
 
 
@@ -707,69 +1029,26 @@ def run_portfolio_kernel(
     sizing_policy: str = "current_risk_sizing",
     exit_policy: str = "current_exit",
     pyramiding: bool = True,
-    artifact_sink: Path | None = None,
+    artifact_sink: ArtifactSink | Path | None = None,
     max_positions: int | None = None,
-) -> tuple[Path, Path, dict[str, float]]:
-    if sizing_policy != "current_risk_sizing":
-        raise NotImplementedError("V5.2C kernel currently supports current_risk_sizing only")
-    if exit_policy != "current_exit":
-        raise NotImplementedError("V5.2C kernel currently supports current_exit only")
-    if not pyramiding:
-        raise NotImplementedError("V5.2C kernel currently supports current pyramiding only")
-    if context.config.signal_adjust != "none":
-        raise NotImplementedError("Prepared context kernel currently supports unadjusted signal series only")
-    if not context.all_dates:
-        raise ValueError("PreparedBacktestContext has no trading dates")
-    output_dir = artifact_sink or Path("reports/backtest/kernel_tmp")
-    config = replace(context.config, selection_policy=selection_policy, selection_seed=selection_seed)
-    indicator_by_rows = {_rows_cache_key(rows): context.indicators[code] for code, rows in context.signal_histories.items()}
-
-    def loader(code: str, _end: date, lookback_days: int = 1000, adjust: str = "none"):
-        if adjust != "none":
-            raise ValueError("Prepared context contains unadjusted histories only")
-        return context.metas[code], list(context.execution_histories[code])
-
-    original_build_indicators = globals()["build_indicators"]
-    original_build_sector_heat = globals()["build_sector_heat"]
-    original_analyze_v5 = globals()["_analyze_v5_candidate_signals"]
-
-    def cached_build_indicators(rows: list[KLine]) -> list[IndicatorPoint]:
-        key = _rows_cache_key(rows)
-        if key in indicator_by_rows:
-            return list(indicator_by_rows[key])
-        return original_build_indicators(rows)
-
-    def cached_build_sector_heat(*_args, **_kwargs) -> SectorHeatBuildResult:
-        return SectorHeatBuildResult(
-            heat_by_date={day: dict(items) for day, items in context.sector_heat_by_date.items()},
-            exclusions=[dict(row) for row in context.sector_heat_exclusions],
-        )
-
-    def cached_analyze_v5(meta, *_args, **_kwargs):
-        return dict(context.candidate_signals_by_date.get(meta.code, {}))
-
-    try:
-        globals()["build_indicators"] = cached_build_indicators
-        globals()["build_sector_heat"] = cached_build_sector_heat
-        globals()["_analyze_v5_candidate_signals"] = cached_analyze_v5
-        return portfolio_backtest_symbols(
-            list(context.symbols),
-            context.all_dates[0],
-            context.all_dates[-1],
-            output_dir,
-            config=config,
-            risk_config=context.risk_config,
-            entry_config=context.entry_config,
-            sector_map=dict(context.sector_map),
-            index_rows=list(context.index_rows),
-            history_loader=loader,
-            eligible_by_date={day: set(codes) for day, codes in context.eligible_by_date.items()},
-            max_positions=max_positions,
-        )
-    finally:
-        globals()["build_indicators"] = original_build_indicators
-        globals()["build_sector_heat"] = original_build_sector_heat
-        globals()["_analyze_v5_candidate_signals"] = original_analyze_v5
+    capture_level: CaptureLevel = CaptureLevel.FULL,
+) -> KernelResult:
+    run_config = KernelRunConfig(
+        selection_policy=selection_policy.upper(),
+        selection_seed=selection_seed,
+        max_positions=DEFAULT_MAX_POSITIONS if max_positions is None else max_positions,
+        sizing_policy=sizing_policy,
+        exit_policy=exit_policy,
+        pyramiding=pyramiding,
+        capture_level=capture_level,
+    )
+    if artifact_sink is None:
+        sink: ArtifactSink = NullArtifactSink()
+    elif isinstance(artifact_sink, Path):
+        sink = CsvArtifactSink(artifact_sink)
+    else:
+        sink = artifact_sink
+    return execute_prepared_context(context, run_config, sink)
 
 
 def _rows_cache_key(rows: list[KLine]) -> tuple[int, date | None, date | None, int, int]:
@@ -778,166 +1057,46 @@ def _rows_cache_key(rows: list[KLine]) -> tuple[int, date | None, date | None, i
     return (len(rows), rows[0].date, rows[-1].date, id(rows[0]), id(rows[-1]))
 
 
-def portfolio_backtest_symbols(
-    symbols: list[str],
-    start: date,
-    end: date,
-    output_dir: Path,
-    config: BacktestConfig | None = None,
-    risk_config: RiskConfig | None = None,
-    entry_config: EntryFilterConfig | None = None,
-    sector_map: dict[str, str] | None = None,
-    index_rows: list[KLine] | None = None,
-    history_loader: HistoryLoader | None = None,
-    eligible_by_date: dict[date, set[str]] | None = None,
-    max_positions: int | None = None,
-) -> tuple[Path, Path, dict[str, float]]:
-    config = config or BacktestConfig()
-    risk_config = risk_config or RiskConfig()
-    entry_config = entry_config or EntryFilterConfig()
-    sector_map = sector_map or DEFAULT_SECTOR_MAP
-    if config.signal_adjust not in {"none", "qfq", "hfq"}:
-        raise ValueError("signal_adjust must be one of: none, qfq, hfq")
-    metas: dict[str, StockMeta] = {}
-    # Signal and execution series are distinct contracts.  The default signal
-    # series is unadjusted to avoid endpoint-normalized qfq lookahead; callers
-    # may inject a separately audited signal adjustment series for research.
-    signal_histories: dict[str, list[KLine]] = {}
-    execution_histories: dict[str, list[KLine]] = {}
-    indicators: dict[str, list[IndicatorPoint]] = {}
-    points_by_date: dict[str, dict[date, IndicatorPoint]] = {}
-    rows_by_date: dict[str, dict[date, KLine]] = {}
-    signal_rows_by_date: dict[str, dict[date, KLine]] = {}
-    row_index_by_date: dict[str, dict[date, int]] = {}
-    verdicts_by_date: dict[str, dict[date, str]] = {}
-    candidate_signals_by_date: dict[str, dict[date, CandidateSignal]] = {}
+def execute_prepared_context(
+    context: PreparedBacktestContext,
+    run_config: KernelRunConfig,
+    artifact_sink: ArtifactSink | None = None,
+) -> KernelResult:
+    if run_config.sizing_policy != "current_risk_sizing":
+        raise NotImplementedError("V5.2C kernel currently supports current_risk_sizing only")
+    if run_config.exit_policy != "current_exit":
+        raise NotImplementedError("V5.2C kernel currently supports current_exit only")
+    if not run_config.pyramiding:
+        raise NotImplementedError("V5.2C kernel currently supports current pyramiding only")
+    if is_v5_strategy_mode(context.config.strategy_mode) and context.config.signal_adjust != "none":
+        raise NotImplementedError("Prepared context kernel currently supports unadjusted signal series only")
+    if not context.all_dates:
+        raise ValueError("PreparedBacktestContext has no trading dates")
 
-    for idx, symbol in enumerate(symbols, 1):
-        code = normalize_code(symbol)
-        lookback = max((end - start).days + 620, 1000)
-        if history_loader is not None:
-            meta, execution_rows = history_loader(code, end, lookback_days=lookback, adjust="none")
-            if config.signal_adjust == "none":
-                signal_rows = list(execution_rows)
-            else:
-                _signal_meta, signal_rows = history_loader(
-                    code, end, lookback_days=lookback, adjust=config.signal_adjust
-                )
-        else:
-            try:
-                meta, execution_rows = tencent_history(code, end, lookback_days=lookback, adjust="none")
-                if config.signal_adjust == "none":
-                    signal_rows = list(execution_rows)
-                else:
-                    _signal_meta, signal_rows = tencent_history(code, end, lookback_days=lookback, adjust=config.signal_adjust)
-            except Exception:
-                meta, execution_rows = eastmoney_history(code, end, lookback_days=lookback, adjust=0)
-                adjust_map = {"none": 0, "qfq": 1, "hfq": 2}
-                if config.signal_adjust == "none":
-                    signal_rows = list(execution_rows)
-                else:
-                    _signal_meta, signal_rows = eastmoney_history(
-                        code, end, lookback_days=lookback, adjust=adjust_map.get(config.signal_adjust, 0)
-                    )
-        execution_rows = [row for row in execution_rows if row.date <= end]
-        signal_rows = [row for row in signal_rows if row.date <= end]
-        common_dates = {row.date for row in execution_rows} & {row.date for row in signal_rows}
-        execution_rows = [row for row in execution_rows if row.date in common_dates]
-        signal_rows = [row for row in signal_rows if row.date in common_dates]
-        ensure_data_quality(execution_rows, min_bars=61)
-        ensure_data_quality(signal_rows, min_bars=61)
-        metas[code] = meta
-        execution_histories[code] = execution_rows
-        signal_histories[code] = signal_rows
-        pts = build_indicators(signal_rows)
-        indicators[code] = pts
-        points_by_date[code] = {point.date: point for point in pts}
-        rows_by_date[code] = {row.date: row for row in execution_rows}
-        signal_rows_by_date[code] = {row.date: row for row in signal_rows}
-        row_index_by_date[code] = {row.date: row_idx for row_idx, row in enumerate(signal_rows)}
-        if idx == 1 or idx == len(symbols) or idx % 100 == 0:
-            print(f"loaded {idx}/{len(symbols)} {code} signal_rows={len(signal_rows)} execution_rows={len(execution_rows)}", flush=True)
+    KERNEL_INSTRUMENTATION_COUNTERS["kernel_execution_count"] += 1
+    artifact_sink = artifact_sink or NullArtifactSink()
+    config = replace(
+        context.config,
+        selection_policy=run_config.selection_policy,
+        selection_seed=run_config.selection_seed,
+    )
+    risk_config = context.risk_config
+    entry_config = context.entry_config
+    symbols = list(context.symbols)
+    all_dates = list(context.all_dates)
+    metas = context.metas
+    signal_histories = context.signal_histories
+    execution_histories = context.execution_histories
+    points_by_date = context.points_by_date
+    rows_by_date = context.rows_by_date
+    verdicts_by_date = context.verdicts_by_date
+    candidate_signals_by_date = context.candidate_signals_by_date
+    eligible_by_date = context.eligible_by_date
+    regime_by_date = context.regime_by_date
+    sector_states_by_date = context.sector_states_by_date
+    sector_map = context.sector_map
+    max_positions = run_config.max_positions
 
-    if config.strategy_mode not in {"strategy_v1_baseline", "strategy_v2_modular"} | V5_STRATEGY_MODES:
-        raise ValueError(
-            "strategy_mode must be strategy_v1_baseline, strategy_v2_modular, "
-            "strategy_v5_alpha, strategy_v5_alpha_ranked, or strategy_v5_alpha_first_fit_frozen"
-        )
-    all_dates = sorted({row.date for rows in execution_histories.values() for row in rows if start <= row.date <= end})
-    if index_rows is None:
-        lookback = max((end - start).days + 620, 1000)
-        index_rows = index_history(config.regime_index, end, lookback_days=lookback)
-    if eligible_by_date is None:
-        eligible_by_date = {day: set(signal_histories) for day in all_dates}
-    if is_v5_strategy_mode(config.strategy_mode):
-        breadth = breadth_above_ma60(signal_histories, points_by_date, rows_by_date, eligible_by_date, all_dates)
-        market_points = build_market_regime(index_rows, breadth, all_dates)
-        regime_by_date = to_regime_states(config.regime_index, market_points)
-    elif config.strategy_mode == "strategy_v2_modular":
-        regime_by_date = modular_regime_by_date(config.regime_index, index_rows, all_dates)
-    else:
-        regime_by_date = _regime_by_date_from_index(config.regime_index, index_rows, all_dates)
-    index_rows_by_date, index_prior_by_date = _index_reference_maps(index_rows, (20, 60))
-    sector_heat_by_date: dict[date, dict[str, SectorAlpha]] = {}
-    sector_heat_exclusions: list[dict[str, str | int]] = []
-    if is_v5_strategy_mode(config.strategy_mode):
-        print(f"precompute sector heat dates={len(all_dates)} symbols={len(signal_histories)}", flush=True)
-        sector_heat_result = build_sector_heat(
-            signal_histories,
-            sector_map,
-            signal_rows_by_date,
-            points_by_date,
-            row_index_by_date,
-            eligible_by_date,
-            all_dates,
-        )
-        sector_heat_by_date = sector_heat_result.heat_by_date
-        sector_heat_exclusions = sector_heat_result.exclusions
-        print("precompute sector heat complete", flush=True)
-    print(f"precompute regime dates={len(regime_by_date)} strategy={config.strategy_mode}", flush=True)
-    for verdict_idx, (code, rows) in enumerate(signal_histories.items(), 1):
-        if is_v5_strategy_mode(config.strategy_mode):
-            candidate_signals_by_date[code] = _analyze_v5_candidate_signals(
-                metas[code],
-                rows,
-                all_dates,
-                regime_by_date,
-                indicators[code],
-                index_rows_by_date,
-                index_prior_by_date,
-                sector_map,
-                sector_heat_by_date,
-                eligible_by_date,
-                config,
-                risk_config,
-                entry_config,
-            )
-            verdicts_by_date[code] = {
-                day: signal.verdict for day, signal in candidate_signals_by_date[code].items()
-            }
-        elif config.strategy_mode == "strategy_v2_modular":
-            verdicts_by_date[code] = _analyze_verdicts(
-                metas[code],
-                rows,
-                all_dates,
-                config,
-                regime_by_date,
-                indicators[code],
-                index_rows_by_date,
-                index_prior_by_date,
-                sector_map,
-                sector_heat_by_date,
-            )
-        else:
-            verdicts_by_date[code] = _analyze_verdicts(metas[code], rows, all_dates, config)
-        if verdict_idx == len(signal_histories) or verdict_idx % 50 == 0:
-            print(f"precompute verdicts {verdict_idx}/{len(signal_histories)}", flush=True)
-    print(f"precompute sectors dates={len(all_dates)} symbols={len(signal_histories)}", flush=True)
-    sector_states_by_date = {
-        day: _sector_states_from_points(signal_histories, sector_map, signal_rows_by_date, points_by_date, row_index_by_date, day)
-        for day in all_dates
-    }
-    print("precompute sectors complete", flush=True)
     cash = config.initial_cash
     positions: dict[str, Position] = {}
     pending: list[PendingOrder] = []
@@ -1384,7 +1543,7 @@ def portfolio_backtest_symbols(
                     selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.RISK_OR_POSITION.value, None))
                 continue
             if max_positions is not None and len(positions) + sum(1 for order in pending if order.side == "buy") >= max_positions:
-                if is_ranked_v5_strategy_mode(config.strategy_mode):
+                if run_config.selection_policy != "FIRST_FIT_FROZEN":
                     if candidate_signal is not None:
                         selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.CAPACITY.value, None))
                         funnel_by_date.setdefault(day, {})["capacity_rejected"] = funnel_by_date.setdefault(day, {}).get("capacity_rejected", 0) + 1
@@ -1617,76 +1776,78 @@ def portfolio_backtest_symbols(
         if equity_curve:
             equity_curve[-1] = (last_day, cash)
 
-    stem = "basket" if len(symbols) > 1 else normalize_code(symbols[0])
-    output_dir.mkdir(parents=True, exist_ok=True)
-    trades_path = output_dir / f"trades_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
-    fills_path = output_dir / f"fills_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
-    metrics_path = output_dir / f"metrics_{stem}_{start.isoformat()}_{end.isoformat()}.md"
-    equity_path = output_dir / f"equity_curve_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
-    yearly_path = output_dir / f"yearly_report_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
-    drawdown_path = output_dir / f"drawdown_report_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
-    trade_records_path = output_dir / f"trade_records_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
-    sector_heat_path = output_dir / f"sector_heat_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
-    candidate_funnel_daily_path = output_dir / "candidate_funnel_daily.csv"
-    candidate_funnel_summary_path = output_dir / "candidate_funnel_summary.md"
-    research_gate_funnel_path = output_dir / "research_gate_funnel.csv"
-    portfolio_selection_funnel_path = output_dir / "portfolio_selection_funnel.csv"
-    research_gate_audit_path = output_dir / "research_gate_audit.csv.gz"
-    candidate_selection_audit_path = output_dir / "candidate_selection_audit.csv"
-    pending_orders_path = output_dir / "pending_orders.csv"
-    position_fill_links_path = output_dir / "position_fill_links.csv"
-    signal_snapshots_path = output_dir / "signal_snapshots.csv"
-    trade_attribution_path = output_dir / "trade_attribution.csv"
-    alpha_decile_path = output_dir / "alpha_decile_analysis.csv"
-    alpha_ic_path = output_dir / "alpha_ic_report.md"
-    sector_data_audit_path = output_dir / "sector_data_audit.md"
-    excluded_sector_daily_path = output_dir / "excluded_sector_daily.csv"
-    controlled_comparison_csv_path = output_dir / "controlled_comparison_2026.csv"
-    controlled_comparison_md_path = output_dir / "controlled_comparison_2026.md"
-    _write_trades(trades_path, trades)
-    _write_trades(trade_records_path, trades)
-    _write_fills(fills_path, fills)
     metrics = metrics_from_trades(trades, equity_curve, config.initial_cash, 0, split_date=config.split_date)
     annual_stats = annual_stats_from_trades(trades, equity_curve, config.initial_cash)
-    _write_equity_curve(equity_path, equity_curve)
-    _write_yearly_report(yearly_path, annual_stats)
-    _write_drawdown_report(drawdown_path, equity_curve)
-    if sector_heat_by_date:
-        _write_sector_heat_report(sector_heat_path, sector_heat_by_date)
-    if is_v5_strategy_mode(config.strategy_mode):
-        _write_candidate_funnel_daily(candidate_funnel_daily_path, funnel_by_date)
-        _write_research_gate_funnel(research_gate_funnel_path, funnel_by_date)
-        _write_portfolio_selection_funnel(portfolio_selection_funnel_path, funnel_by_date)
-        _write_candidate_funnel_summary(candidate_funnel_summary_path, funnel_by_date)
-        _write_dict_rows_gzip(research_gate_audit_path, _research_gate_rows(candidate_signals_by_date))
-        _write_dict_rows(candidate_selection_audit_path, selection_audit_rows)
-        _write_dict_rows(pending_orders_path, pending_order_rows)
-        _write_dict_rows(position_fill_links_path, position_fill_link_rows)
-        _write_dict_rows(signal_snapshots_path, signal_snapshot_rows)
-        _write_trade_attribution(trade_attribution_path, trades, signal_snapshot_rows)
-        _write_alpha_decile_analysis(alpha_decile_path, selection_audit_rows)
-        _write_alpha_ic_report(alpha_ic_path, selection_audit_rows, trades)
-        _write_sector_data_audit(
-            sector_data_audit_path,
-            sector_map,
-            sector_heat_by_date,
-            loaded_symbols=symbols,
-            exclusions=sector_heat_exclusions,
-        )
-        _write_excluded_sector_daily(excluded_sector_daily_path, sector_heat_exclusions)
-        _write_controlled_comparison_note(controlled_comparison_csv_path, controlled_comparison_md_path, config)
     _add_discipline_metrics(metrics, discipline)
     metrics["fill_count"] = float(len(fills))
-    _write_metrics(
-        metrics_path,
-        metrics,
-        config,
-        discipline=discipline,
+    selected_candidate_ids = tuple(
+        str(row.get("candidate_id", ""))
+        for row in selection_audit_rows
+        if int(row.get("selected", 0)) == 1 and row.get("candidate_id")
+    )
+    result = KernelResult(
+        metrics=metrics,
+        selected_candidate_ids=selected_candidate_ids,
+        pending_orders=tuple(dict(row) for row in pending_order_rows),
+        fills=tuple(fills),
+        trades=tuple(trades),
+        equity_curve=tuple(equity_curve),
+        funnel=MappingProxyType({day: MappingProxyType(dict(values)) for day, values in funnel_by_date.items()}),
+        discipline=MappingProxyType(dict(discipline)),
+        selected_set_hash=stable_hash_json(sorted(selected_candidate_ids)),
+        fills_hash=stable_hash_json([asdict(fill) for fill in fills]),
+        trades_hash=stable_hash_json([asdict(trade) for trade in trades]),
+        kernel_run_hash=_hash_kernel_run(context, run_config),
+        selection_audit_rows=tuple(dict(row) for row in selection_audit_rows),
+        signal_snapshot_rows=tuple(dict(row) for row in signal_snapshot_rows),
+        position_fill_link_rows=tuple(dict(row) for row in position_fill_link_rows),
+    )
+    trades_path, metrics_path, artifacts = artifact_sink.write(context, run_config, result, annual_stats)
+    result.trades_path = trades_path
+    result.metrics_path = metrics_path
+    result.artifacts = artifacts
+    return result
+
+
+def portfolio_backtest_symbols(
+    symbols: list[str],
+    start: date,
+    end: date,
+    output_dir: Path,
+    config: BacktestConfig | None = None,
+    risk_config: RiskConfig | None = None,
+    entry_config: EntryFilterConfig | None = None,
+    sector_map: dict[str, str] | None = None,
+    index_rows: list[KLine] | None = None,
+    history_loader: HistoryLoader | None = None,
+    eligible_by_date: dict[date, set[str]] | None = None,
+    max_positions: int | None = None,
+) -> tuple[Path, Path, dict[str, float]]:
+    config = config or BacktestConfig()
+    risk_config = risk_config or RiskConfig()
+    entry_config = entry_config or EntryFilterConfig()
+    context = prepare_backtest_context(
+        symbols,
+        start,
+        end,
+        config=config,
         risk_config=risk_config,
         entry_config=entry_config,
-        annual_stats=annual_stats,
+        sector_map=sector_map,
+        index_rows=index_rows,
+        history_loader=history_loader,
+        eligible_by_date=eligible_by_date,
     )
-    return trades_path, metrics_path, metrics
+    run_config = KernelRunConfig(
+        selection_policy=selection_policy_for(config),
+        selection_seed=config.selection_seed,
+        max_positions=DEFAULT_MAX_POSITIONS if max_positions is None else max_positions,
+        capture_level=CaptureLevel.FULL,
+    )
+    result = execute_prepared_context(context, run_config, CsvArtifactSink(output_dir))
+    if result.trades_path is None or result.metrics_path is None:
+        raise RuntimeError("CsvArtifactSink did not produce portfolio artifacts")
+    return result.trades_path, result.metrics_path, result.metrics
 
 
 def _legacy_backtest_symbols(

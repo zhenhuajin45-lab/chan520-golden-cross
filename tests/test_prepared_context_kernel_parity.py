@@ -63,8 +63,8 @@ def test_prepared_context_ranked_kernel_matches_formal_engine(monkeypatch, tmp_p
 
     formal_dir = tmp_path / "formal"
     kernel_dir = tmp_path / "kernel"
-    start = context.all_dates[0]
-    end = context.all_dates[-1]
+    start = context.requested_start
+    end = context.requested_end
     portfolio_backtest_symbols(
         list(context.symbols),
         start,
@@ -115,3 +115,28 @@ def test_kernel_reuses_prepared_candidate_evidence(monkeypatch, tmp_path) -> Non
     )
 
     assert calls["count"] == 3
+
+
+def test_kernel_does_not_call_formal_portfolio_entry(monkeypatch, tmp_path) -> None:
+    histories = _install_fakes(monkeypatch)
+    context = prepare_backtest_context(
+        SYMBOLS[:3],
+        START,
+        END,
+        config=BacktestConfig(strategy_mode="strategy_v5_alpha_ranked", require_industry=False),
+        risk_config=RiskConfig(max_sector_pct=1.0, cash_reserve_pct=0.0),
+        sector_map={code: "tech" for code in SYMBOLS},
+        index_rows=make_index_rows(),
+        history_loader=_loader(histories),
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("kernel must execute prepared context directly")
+
+    monkeypatch.setattr(bt, "portfolio_backtest_symbols", forbidden)
+    run_portfolio_kernel(
+        context,
+        selection_policy="DETERMINISTIC_RANKED",
+        artifact_sink=tmp_path / "kernel_direct",
+        max_positions=2,
+    )

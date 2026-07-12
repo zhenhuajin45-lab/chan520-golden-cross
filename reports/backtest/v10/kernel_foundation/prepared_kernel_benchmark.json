@@ -1,0 +1,27 @@
+{
+  "artifact_bytes": 0,
+  "kernel_counters": {
+    "candidate_analysis_count": 6,
+    "history_load_count": 6,
+    "indicator_build_count": 6,
+    "kernel_execution_count": 11,
+    "regime_build_count": 1,
+    "sector_heat_build_count": 1,
+    "sector_state_build_count": 1
+  },
+  "kernel_p50_seconds": 4.752870899996196,
+  "kernel_p95_seconds": 5.747854000001098,
+  "peak_rss_mb": 2.607388496398926,
+  "precompute_counters": {
+    "candidate_analysis_count": 6,
+    "history_load_count": 6,
+    "indicator_build_count": 6,
+    "kernel_execution_count": 0,
+    "regime_build_count": 1,
+    "sector_heat_build_count": 1,
+    "sector_state_build_count": 1
+  },
+  "prepare_seconds": 4.8567402999979095,
+  "random_seed_runs": 10,
+  "ranked_summary_hash": "82d1b3ca05744a9170d3a0c20d4e96c92ad8a8455268fcbbca8bcb4fbfc56f2b"
+}
