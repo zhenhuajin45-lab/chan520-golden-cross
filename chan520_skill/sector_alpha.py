@@ -19,6 +19,24 @@ class SectorAlpha:
     momentum_score: float
 
 
+@dataclass(frozen=True)
+class SectorHeatBuildResult:
+    heat_by_date: dict[date, dict[str, SectorAlpha]]
+    exclusions: list[dict[str, str | int]]
+
+    def __getitem__(self, day: date) -> dict[str, SectorAlpha]:
+        return self.heat_by_date[day]
+
+    def get(self, day: date, default=None):
+        return self.heat_by_date.get(day, default)
+
+    def values(self):
+        return self.heat_by_date.values()
+
+    def items(self):
+        return self.heat_by_date.items()
+
+
 def build_sector_heat(
     histories: dict[str, list[KLine]],
     sector_map: dict[str, str],
@@ -31,7 +49,7 @@ def build_sector_heat(
     min_members: int = 20,
     max_members: int = 1200,
     min_sample_members: int = 30,
-) -> dict[date, dict[str, SectorAlpha]]:
+) -> SectorHeatBuildResult:
     """Daily sector heat from history available at that date.
 
     This mirrors the production strategy's idea: sector is a small Alpha prior,
@@ -40,6 +58,7 @@ def build_sector_heat(
     """
 
     heat_by_date: dict[date, dict[str, SectorAlpha]] = {}
+    exclusions: list[dict[str, str | int]] = []
     for day in all_dates:
         grouped: dict[str, list[str]] = {}
         eligible = eligible_by_date.get(day, set(histories))
@@ -53,19 +72,59 @@ def build_sector_heat(
         amount_values: list[float] = []
         raw_stats: dict[str, dict[str, float]] = {}
         for sector, codes in grouped.items():
-            if len(codes) < min_members or len(codes) > max_members:
+            if len(codes) < min_members:
+                exclusions.append(
+                    {
+                        "date": day.isoformat(),
+                        "sector": sector,
+                        "reason_code": "below_min_members",
+                        "member_count": len(codes),
+                        "sample_count": 0,
+                    }
+                )
+                continue
+            if len(codes) > max_members:
+                exclusions.append(
+                    {
+                        "date": day.isoformat(),
+                        "sector": sector,
+                        "reason_code": "above_max_members",
+                        "member_count": len(codes),
+                        "sample_count": 0,
+                    }
+                )
                 continue
             samples = []
+            missing_rows = 0
+            missing_indicators = 0
             for code in codes:
                 row = rows_by_date.get(code, {}).get(day)
                 point = points_by_date.get(code, {}).get(day)
                 idx = row_index_by_date.get(code, {}).get(day)
-                if row is None or point is None or idx is None or idx < 20:
+                if row is None:
+                    missing_rows += 1
+                    continue
+                if point is None or idx is None or idx < 20:
+                    missing_indicators += 1
                     continue
                 prior = histories[code][idx - 20]
                 prev = histories[code][idx - 1] if idx > 0 else None
                 samples.append((row, point, prior, prev))
             if len(samples) < min_sample_members:
+                reason = "below_min_sample_members"
+                if missing_rows and not samples:
+                    reason = "missing_rows"
+                elif missing_indicators and not samples:
+                    reason = "missing_indicators"
+                exclusions.append(
+                    {
+                        "date": day.isoformat(),
+                        "sector": sector,
+                        "reason_code": reason,
+                        "member_count": len(codes),
+                        "sample_count": len(samples),
+                    }
+                )
                 continue
 
             breadth = sum(1 for row, point, _prior, _prev in samples if point.ma20 and row.close > point.ma20) / len(samples)
@@ -105,7 +164,7 @@ def build_sector_heat(
                 momentum_score=momentum_score,
             )
         heat_by_date[day] = day_heat
-    return heat_by_date
+    return SectorHeatBuildResult(heat_by_date=heat_by_date, exclusions=exclusions)
 
 
 def sector_heat_bonus(
