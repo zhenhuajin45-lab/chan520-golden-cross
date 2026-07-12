@@ -1,0 +1,47 @@
+{
+    "dynamic_universe_hash":  "c556d50e204c4439e27969f7220ed7b1a1224ca11f1b3d854d325d0a2fa77e16",
+    "git_commit":  "0e5c90190fd3d78286c45a9eb05152092adb456b",
+    "index_data_hash":  "f8d4760aef4f4fa9a4186fed4f6bfab30438fbe81894560cc498a8be69ed3c5f",
+    "ordered_symbol_list_hash":  "e8f6ed11af8105d1cefe10bab112ddde0d2e569d2d3697569030dba536c6b808",
+    "sector_map_hash":  "3662d9de0dd2d4faa803d5ff0e247d88f6bcdfbc88c3292353c21be009ef843e",
+    "sqlite_sha256":  "3f4fe7f4c4aefd2a6e6abca98ce9b9a4a081da5c2a62eba4e75feae8ffb7f943",
+    "strategy_config_hash":  "5cabb97495ad1fd00933dd5f7184a3d24858bad2402350b862bcedd6199a6a75",
+    "symbol_universe_hash":  "e8f6ed11af8105d1cefe10bab112ddde0d2e569d2d3697569030dba536c6b808",
+    "tables":  {
+                   "daily_bars":  {
+                                      "max_date":  "2026-07-09",
+                                      "min_date":  "2014-04-21",
+                                      "row_count":  11805450
+                                  },
+                   "dynamic_universe":  {
+                                            "max_date":  "2026-07-09",
+                                            "min_date":  "2016-01-04",
+                                            "row_count":  1646943
+                                        },
+                   "index_bars":  {
+                                      "max_date":  "2026-07-09",
+                                      "min_date":  "2014-04-21",
+                                      "row_count":  2971
+                                  },
+                   "instrument_status":  {
+                                             "max_date":  "2026-07-09",
+                                             "min_date":  "2016-01-04",
+                                             "row_count":  10978788
+                                         },
+                   "metadata":  {
+                                    "max_date":  null,
+                                    "min_date":  null,
+                                    "row_count":  6
+                                },
+                   "sector_map":  {
+                                      "max_date":  null,
+                                      "min_date":  null,
+                                      "row_count":  5198
+                                  },
+                   "stock_meta":  {
+                                      "max_date":  null,
+                                      "min_date":  null,
+                                      "row_count":  5550
+                                  }
+               }
+}

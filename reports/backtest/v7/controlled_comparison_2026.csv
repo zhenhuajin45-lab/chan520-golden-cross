@@ -1,3 +1,0 @@
-variant,selection_policy,period,trades,total_return,cagr,max_drawdown,sharpe,win_rate,payoff_ratio,profit_factor,statistically_supported,source
-frozen_v5_2026,input_order_first_fit,2026-01-01..2026-07-09,105,0.206239,0.448025,-0.087793,1.940947,0.400000,2.183245,1.455497,0,reports/backtest/v7/frozen_v5_2026
-ranked_all_2026,deterministic_ranked_candidates,2026-01-01..2026-07-09,103,0.001747,0.003452,-0.107914,0.110857,0.349515,1.870365,1.004972,0,reports/backtest/v7/ranked_all_2026
