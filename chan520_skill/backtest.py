@@ -5,10 +5,11 @@ import gzip
 import math
 import random
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from statistics import median, mean, pstdev
+from types import MappingProxyType
 from typing import Callable
 
 from .alpha_score import score_alpha
@@ -32,7 +33,7 @@ from .risk import (
     update_account_risk,
 )
 from .sector import DEFAULT_SECTOR_MAP, SectorState, industry_of, sector_state_from_members
-from .sector_alpha import SectorAlpha, build_sector_heat, sector_heat_bonus
+from .sector_alpha import SectorAlpha, SectorHeatBuildResult, build_sector_heat, sector_heat_bonus
 from .strategy import analyze
 from .strategy_modular import evaluate_modular, modular_regime_by_date
 
@@ -253,6 +254,34 @@ class CandidateSignal:
     @property
     def verdict(self) -> str:
         return ENTRY_VERDICT if self.hard_pass else OBSERVE_VERDICT
+
+
+@dataclass(frozen=True)
+class PreparedBacktestContext:
+    all_dates: tuple[date, ...]
+    symbols: tuple[str, ...]
+    metas: MappingProxyType
+    execution_histories: MappingProxyType
+    signal_histories: MappingProxyType
+    indicators: MappingProxyType
+    points_by_date: MappingProxyType
+    rows_by_date: MappingProxyType
+    signal_rows_by_date: MappingProxyType
+    row_index_by_date: MappingProxyType
+    eligible_by_date: MappingProxyType
+    regime_by_date: MappingProxyType
+    sector_heat_by_date: MappingProxyType
+    sector_heat_exclusions: tuple[dict[str, str | int], ...]
+    candidate_signals_by_date: MappingProxyType
+    verdicts_by_date: MappingProxyType
+    sector_states_by_date: MappingProxyType
+    config: BacktestConfig
+    risk_config: RiskConfig
+    entry_config: EntryFilterConfig
+    sector_map: MappingProxyType
+    index_rows: tuple[KLine, ...]
+    config_hash: str
+    data_hash: str
 
 
 def is_v5_strategy_mode(strategy_mode: str) -> bool:
@@ -486,6 +515,267 @@ def backtest_symbols(
 ) -> tuple[Path, Path, dict[str, float]]:
     config = config or BacktestConfig()
     return portfolio_backtest_symbols(symbols, start, end, output_dir, config=config, sector_map=sector_map)
+
+
+def prepare_backtest_context(
+    symbols: list[str],
+    start: date,
+    end: date,
+    config: BacktestConfig | None = None,
+    risk_config: RiskConfig | None = None,
+    entry_config: EntryFilterConfig | None = None,
+    sector_map: dict[str, str] | None = None,
+    index_rows: list[KLine] | None = None,
+    history_loader: HistoryLoader | None = None,
+    eligible_by_date: dict[date, set[str]] | None = None,
+) -> PreparedBacktestContext:
+    config = config or BacktestConfig()
+    risk_config = risk_config or RiskConfig()
+    entry_config = entry_config or EntryFilterConfig()
+    sector_map = sector_map or DEFAULT_SECTOR_MAP
+    if config.signal_adjust not in {"none", "qfq", "hfq"}:
+        raise ValueError("signal_adjust must be one of: none, qfq, hfq")
+    if config.strategy_mode not in {"strategy_v1_baseline", "strategy_v2_modular"} | V5_STRATEGY_MODES:
+        raise ValueError(
+            "strategy_mode must be strategy_v1_baseline, strategy_v2_modular, "
+            "strategy_v5_alpha, strategy_v5_alpha_ranked, or strategy_v5_alpha_first_fit_frozen"
+        )
+
+    metas: dict[str, StockMeta] = {}
+    signal_histories: dict[str, list[KLine]] = {}
+    execution_histories: dict[str, list[KLine]] = {}
+    indicators: dict[str, list[IndicatorPoint]] = {}
+    points_by_date: dict[str, dict[date, IndicatorPoint]] = {}
+    rows_by_date: dict[str, dict[date, KLine]] = {}
+    signal_rows_by_date: dict[str, dict[date, KLine]] = {}
+    row_index_by_date: dict[str, dict[date, int]] = {}
+    verdicts_by_date: dict[str, dict[date, str]] = {}
+    candidate_signals_by_date: dict[str, dict[date, CandidateSignal]] = {}
+
+    for idx, symbol in enumerate(symbols, 1):
+        code = normalize_code(symbol)
+        lookback = max((end - start).days + 620, 1000)
+        if history_loader is not None:
+            meta, execution_rows = history_loader(code, end, lookback_days=lookback, adjust="none")
+            if config.signal_adjust == "none":
+                signal_rows = list(execution_rows)
+            else:
+                _signal_meta, signal_rows = history_loader(code, end, lookback_days=lookback, adjust=config.signal_adjust)
+        else:
+            try:
+                meta, execution_rows = tencent_history(code, end, lookback_days=lookback, adjust="none")
+                if config.signal_adjust == "none":
+                    signal_rows = list(execution_rows)
+                else:
+                    _signal_meta, signal_rows = tencent_history(code, end, lookback_days=lookback, adjust=config.signal_adjust)
+            except Exception:
+                meta, execution_rows = eastmoney_history(code, end, lookback_days=lookback, adjust=0)
+                adjust_map = {"none": 0, "qfq": 1, "hfq": 2}
+                if config.signal_adjust == "none":
+                    signal_rows = list(execution_rows)
+                else:
+                    _signal_meta, signal_rows = eastmoney_history(
+                        code, end, lookback_days=lookback, adjust=adjust_map.get(config.signal_adjust, 0)
+                    )
+        execution_rows = [row for row in execution_rows if row.date <= end]
+        signal_rows = [row for row in signal_rows if row.date <= end]
+        common_dates = {row.date for row in execution_rows} & {row.date for row in signal_rows}
+        execution_rows = [row for row in execution_rows if row.date in common_dates]
+        signal_rows = [row for row in signal_rows if row.date in common_dates]
+        ensure_data_quality(execution_rows, min_bars=61)
+        ensure_data_quality(signal_rows, min_bars=61)
+        metas[code] = meta
+        execution_histories[code] = execution_rows
+        signal_histories[code] = signal_rows
+        pts = build_indicators(signal_rows)
+        indicators[code] = pts
+        points_by_date[code] = {point.date: point for point in pts}
+        rows_by_date[code] = {row.date: row for row in execution_rows}
+        signal_rows_by_date[code] = {row.date: row for row in signal_rows}
+        row_index_by_date[code] = {row.date: row_idx for row_idx, row in enumerate(signal_rows)}
+        if idx == 1 or idx == len(symbols) or idx % 100 == 0:
+            print(f"loaded {idx}/{len(symbols)} {code} signal_rows={len(signal_rows)} execution_rows={len(execution_rows)}", flush=True)
+
+    all_dates = tuple(sorted({row.date for rows in execution_histories.values() for row in rows if start <= row.date <= end}))
+    if index_rows is None:
+        lookback = max((end - start).days + 620, 1000)
+        index_rows = index_history(config.regime_index, end, lookback_days=lookback)
+    if eligible_by_date is None:
+        eligible_by_date = {day: set(signal_histories) for day in all_dates}
+    if is_v5_strategy_mode(config.strategy_mode):
+        breadth = breadth_above_ma60(signal_histories, points_by_date, rows_by_date, eligible_by_date, list(all_dates))
+        market_points = build_market_regime(index_rows, breadth, list(all_dates))
+        regime_by_date = to_regime_states(config.regime_index, market_points)
+    elif config.strategy_mode == "strategy_v2_modular":
+        regime_by_date = modular_regime_by_date(config.regime_index, index_rows, list(all_dates))
+    else:
+        regime_by_date = _regime_by_date_from_index(config.regime_index, index_rows, list(all_dates))
+    index_rows_by_date, index_prior_by_date = _index_reference_maps(index_rows, (20, 60))
+    sector_heat_by_date: dict[date, dict[str, SectorAlpha]] = {}
+    sector_heat_exclusions: list[dict[str, str | int]] = []
+    if is_v5_strategy_mode(config.strategy_mode):
+        print(f"precompute sector heat dates={len(all_dates)} symbols={len(signal_histories)}", flush=True)
+        sector_heat_result = build_sector_heat(
+            signal_histories,
+            sector_map,
+            signal_rows_by_date,
+            points_by_date,
+            row_index_by_date,
+            eligible_by_date,
+            list(all_dates),
+        )
+        sector_heat_by_date = sector_heat_result.heat_by_date
+        sector_heat_exclusions = sector_heat_result.exclusions
+        print("precompute sector heat complete", flush=True)
+    print(f"precompute regime dates={len(regime_by_date)} strategy={config.strategy_mode}", flush=True)
+    for verdict_idx, (code, rows) in enumerate(signal_histories.items(), 1):
+        if is_v5_strategy_mode(config.strategy_mode):
+            candidate_signals_by_date[code] = _analyze_v5_candidate_signals(
+                metas[code],
+                rows,
+                list(all_dates),
+                regime_by_date,
+                indicators[code],
+                index_rows_by_date,
+                index_prior_by_date,
+                sector_map,
+                sector_heat_by_date,
+                eligible_by_date,
+                config,
+                risk_config,
+                entry_config,
+            )
+            verdicts_by_date[code] = {day: signal.verdict for day, signal in candidate_signals_by_date[code].items()}
+        elif config.strategy_mode == "strategy_v2_modular":
+            verdicts_by_date[code] = _analyze_verdicts(
+                metas[code],
+                rows,
+                list(all_dates),
+                config,
+                regime_by_date,
+                indicators[code],
+                index_rows_by_date,
+                index_prior_by_date,
+                sector_map,
+                sector_heat_by_date,
+            )
+        else:
+            verdicts_by_date[code] = _analyze_verdicts(metas[code], rows, list(all_dates), config)
+        if verdict_idx == len(signal_histories) or verdict_idx % 50 == 0:
+            print(f"precompute verdicts {verdict_idx}/{len(signal_histories)}", flush=True)
+    print(f"precompute sectors dates={len(regime_by_date)} symbols={len(signal_histories)}", flush=True)
+    sector_states_by_date = {
+        day: _sector_states_from_points(signal_histories, sector_map, signal_rows_by_date, points_by_date, row_index_by_date, day)
+        for day in all_dates
+    }
+    print("precompute sectors complete", flush=True)
+    config_hash = stable_id("cfg", config, risk_config, entry_config, selection_policy_for(config))
+    data_hash = stable_id("data", tuple(sorted(signal_histories)), all_dates[0] if all_dates else "", all_dates[-1] if all_dates else "")
+    return PreparedBacktestContext(
+        all_dates=all_dates,
+        symbols=tuple(signal_histories),
+        metas=MappingProxyType(metas),
+        execution_histories=MappingProxyType(execution_histories),
+        signal_histories=MappingProxyType(signal_histories),
+        indicators=MappingProxyType(indicators),
+        points_by_date=MappingProxyType(points_by_date),
+        rows_by_date=MappingProxyType(rows_by_date),
+        signal_rows_by_date=MappingProxyType(signal_rows_by_date),
+        row_index_by_date=MappingProxyType(row_index_by_date),
+        eligible_by_date=MappingProxyType(eligible_by_date),
+        regime_by_date=MappingProxyType(regime_by_date),
+        sector_heat_by_date=MappingProxyType(sector_heat_by_date),
+        sector_heat_exclusions=tuple(sector_heat_exclusions),
+        candidate_signals_by_date=MappingProxyType(candidate_signals_by_date),
+        verdicts_by_date=MappingProxyType(verdicts_by_date),
+        sector_states_by_date=MappingProxyType(sector_states_by_date),
+        config=config,
+        risk_config=risk_config,
+        entry_config=entry_config,
+        sector_map=MappingProxyType(sector_map),
+        index_rows=tuple(index_rows),
+        config_hash=config_hash,
+        data_hash=data_hash,
+    )
+
+
+def run_portfolio_kernel(
+    context: PreparedBacktestContext,
+    *,
+    selection_policy: str,
+    selection_seed: int = 0,
+    sizing_policy: str = "current_risk_sizing",
+    exit_policy: str = "current_exit",
+    pyramiding: bool = True,
+    artifact_sink: Path | None = None,
+    max_positions: int | None = None,
+) -> tuple[Path, Path, dict[str, float]]:
+    if sizing_policy != "current_risk_sizing":
+        raise NotImplementedError("V5.2C kernel currently supports current_risk_sizing only")
+    if exit_policy != "current_exit":
+        raise NotImplementedError("V5.2C kernel currently supports current_exit only")
+    if not pyramiding:
+        raise NotImplementedError("V5.2C kernel currently supports current pyramiding only")
+    if context.config.signal_adjust != "none":
+        raise NotImplementedError("Prepared context kernel currently supports unadjusted signal series only")
+    if not context.all_dates:
+        raise ValueError("PreparedBacktestContext has no trading dates")
+    output_dir = artifact_sink or Path("reports/backtest/kernel_tmp")
+    config = replace(context.config, selection_policy=selection_policy, selection_seed=selection_seed)
+    indicator_by_rows = {_rows_cache_key(rows): context.indicators[code] for code, rows in context.signal_histories.items()}
+
+    def loader(code: str, _end: date, lookback_days: int = 1000, adjust: str = "none"):
+        if adjust != "none":
+            raise ValueError("Prepared context contains unadjusted histories only")
+        return context.metas[code], list(context.execution_histories[code])
+
+    original_build_indicators = globals()["build_indicators"]
+    original_build_sector_heat = globals()["build_sector_heat"]
+    original_analyze_v5 = globals()["_analyze_v5_candidate_signals"]
+
+    def cached_build_indicators(rows: list[KLine]) -> list[IndicatorPoint]:
+        key = _rows_cache_key(rows)
+        if key in indicator_by_rows:
+            return list(indicator_by_rows[key])
+        return original_build_indicators(rows)
+
+    def cached_build_sector_heat(*_args, **_kwargs) -> SectorHeatBuildResult:
+        return SectorHeatBuildResult(
+            heat_by_date={day: dict(items) for day, items in context.sector_heat_by_date.items()},
+            exclusions=[dict(row) for row in context.sector_heat_exclusions],
+        )
+
+    def cached_analyze_v5(meta, *_args, **_kwargs):
+        return dict(context.candidate_signals_by_date.get(meta.code, {}))
+
+    try:
+        globals()["build_indicators"] = cached_build_indicators
+        globals()["build_sector_heat"] = cached_build_sector_heat
+        globals()["_analyze_v5_candidate_signals"] = cached_analyze_v5
+        return portfolio_backtest_symbols(
+            list(context.symbols),
+            context.all_dates[0],
+            context.all_dates[-1],
+            output_dir,
+            config=config,
+            risk_config=context.risk_config,
+            entry_config=context.entry_config,
+            sector_map=dict(context.sector_map),
+            index_rows=list(context.index_rows),
+            history_loader=loader,
+            eligible_by_date={day: set(codes) for day, codes in context.eligible_by_date.items()},
+            max_positions=max_positions,
+        )
+    finally:
+        globals()["build_indicators"] = original_build_indicators
+        globals()["build_sector_heat"] = original_build_sector_heat
+        globals()["_analyze_v5_candidate_signals"] = original_analyze_v5
+
+
+def _rows_cache_key(rows: list[KLine]) -> tuple[int, date | None, date | None, int, int]:
+    if not rows:
+        return (0, None, None, 0, 0)
+    return (len(rows), rows[0].date, rows[-1].date, id(rows[0]), id(rows[-1]))
 
 
 def portfolio_backtest_symbols(
