@@ -6,10 +6,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         pythonhashseed: ["0", "1", "520", "2026", "42"]
     env:
       PYTHONHASHSEED: ${{ matrix.pythonhashseed }}
@@ -23,7 +24,13 @@ jobs:
       - name: Compile
         run: python -m compileall chan520_skill scripts tests
       - name: Diff check
-        run: git diff --check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            git diff --check "origin/${{ github.base_ref }}"...HEAD
+          else
+            git diff --check
+          fi
       - name: Pytest
         run: pytest -q
-

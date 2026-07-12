@@ -4,6 +4,7 @@ import sqlite3
 
 from chan520_skill.evidence_manifest import build_evidence_manifest, write_evidence_manifest
 from chan520_skill.portfolio_engine import PortfolioEngineConfig
+from chan520_skill.research_config import ResearchRunConfig
 
 
 def test_evidence_manifest_schema_and_hashes(tmp_path) -> None:
@@ -34,12 +35,27 @@ def test_evidence_manifest_schema_and_hashes(tmp_path) -> None:
         symbols=["600001"],
         ordered_symbols=["600001"],
         config=PortfolioEngineConfig(strategy_mode="strategy_v5_alpha_ranked"),
+        full_config=ResearchRunConfig(),
         cwd=tmp_path,
     )
     required = {
         "git_commit",
+        "run_code_commit",
+        "artifact_commit",
+        "git_dirty",
+        "source_tree_hash",
         "strategy_config_hash",
+        "full_config_hash",
+        "backtest_config_hash",
+        "risk_config_hash",
+        "entry_config_hash",
+        "alpha_config_hash",
+        "sector_config_hash",
+        "statistics_config_hash",
         "sqlite_sha256",
+        "schema_hash",
+        "daily_bars_logical_hash",
+        "instrument_status_logical_hash",
         "tables",
         "symbol_universe_hash",
         "ordered_symbol_list_hash",
@@ -54,4 +70,3 @@ def test_evidence_manifest_schema_and_hashes(tmp_path) -> None:
     out = tmp_path / "evidence_manifest.json"
     write_evidence_manifest(out, manifest)
     assert out.read_text(encoding="utf-8").startswith("{")
-

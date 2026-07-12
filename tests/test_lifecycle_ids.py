@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from chan520_skill.backtest import Fill, Trade
+from chan520_skill.backtest import Fill, Trade, opening_gap_parts
 
 
 def test_lifecycle_ids_link_candidate_order_fill_position_trade() -> None:
@@ -60,3 +60,10 @@ def test_lifecycle_ids_link_candidate_order_fill_position_trade() -> None:
     assert trade.entry_fill_id == fill.fill_id
     assert trade.realized_r_multiple == trade.net_pnl / trade.initial_risk_cash
 
+
+def test_opening_gap_parts_split_slippage_from_raw_gap() -> None:
+    raw_gap, execution_slippage, all_in_entry_move = opening_gap_parts(10.0, 10.0, 10.005)
+
+    assert raw_gap == 0.0
+    assert round(execution_slippage, 6) == 0.0005
+    assert round(all_in_entry_move, 6) == 0.0005

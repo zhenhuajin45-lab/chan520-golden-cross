@@ -19,3 +19,5 @@ def test_sector_membership_audit_writes_mapping_counts(tmp_path) -> None:
     text = path.read_text(encoding="utf-8")
     assert "symbols_with_sector_label | 1" in text
     assert "daily_sector_heat_rows | 1" in text
+    assert "sector_point_in_time: `false`" in text
+    assert "mapped_static_end_date | 1" in text

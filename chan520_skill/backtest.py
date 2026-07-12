@@ -102,11 +102,19 @@ class Trade:
     signal_close: float = 0.0
     next_open: float = 0.0
     opening_gap: float = 0.0
+    raw_opening_gap: float = 0.0
+    execution_slippage: float = 0.0
+    all_in_entry_move: float = 0.0
     planned_stop: float = 0.0
     planned_target: float = 0.0
     ex_ante_rr: float = 0.0
     initial_risk_cash: float = 0.0
     realized_r_multiple: float = 0.0
+    total_committed_risk_cash: float = 0.0
+    realized_r_on_initial_risk: float = 0.0
+    realized_r_on_total_risk: float = 0.0
+    add_count: int = 0
+    all_fill_ids: str = ""
 
 
 @dataclass
@@ -134,10 +142,20 @@ class Position:
     signal_close: float = 0.0
     next_open: float = 0.0
     opening_gap: float = 0.0
+    raw_opening_gap: float = 0.0
+    execution_slippage: float = 0.0
+    all_in_entry_move: float = 0.0
     planned_stop: float = 0.0
     planned_target: float = 0.0
     ex_ante_rr: float = 0.0
     initial_risk_cash: float = 0.0
+    initial_entry_risk_cash: float = 0.0
+    cumulative_added_risk_cash: float = 0.0
+    total_committed_risk_cash: float = 0.0
+    maximum_open_risk_cash: float = 0.0
+    entry_fill_ids: tuple[str, ...] = ()
+    add_fill_ids: tuple[str, ...] = ()
+    exit_fill_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -182,6 +200,9 @@ class Fill:
     signal_close: float = 0.0
     next_open: float = 0.0
     opening_gap: float = 0.0
+    raw_opening_gap: float = 0.0
+    execution_slippage: float = 0.0
+    all_in_entry_move: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -254,6 +275,13 @@ def stable_id(prefix: str, *parts: object) -> str:
     payload = "|".join("" if part is None else str(part) for part in parts)
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
     return f"{prefix}_{digest}"
+
+
+def opening_gap_parts(signal_close: float, next_open: float, fill_price: float) -> tuple[float, float, float]:
+    raw_opening_gap = next_open / signal_close - 1 if signal_close > 0 else 0.0
+    execution_slippage = fill_price / next_open - 1 if next_open > 0 else 0.0
+    all_in_entry_move = fill_price / signal_close - 1 if signal_close > 0 else 0.0
+    return raw_opening_gap, execution_slippage, all_in_entry_move
 
 
 def backtest_code(
@@ -580,6 +608,7 @@ def portfolio_backtest_symbols(
     selection_audit_rows: list[dict[str, str | int | float]] = []
     signal_snapshot_rows: list[dict[str, str | int | float]] = []
     pending_order_rows: list[dict[str, str | int | float]] = []
+    position_fill_link_rows: list[dict[str, str | int | float]] = []
     funnel_by_date: dict[date, dict[str, int]] = {}
 
     previous_close_equity = config.initial_cash
@@ -616,6 +645,8 @@ def portfolio_backtest_symbols(
                 net = gross - total_cost
                 cash += fill * pos.shares - sell_cost
                 exit_fill_id = stable_id("fill", day, order.code, "sell", pos.position_id, len(fills))
+                trade_id = stable_id("trade", order.code, pos.entry_date, day, pos.position_id)
+                raw_gap, exec_slip, all_in_move = opening_gap_parts(pos.signal_close, pos.next_open, pos.entry_price)
                 fills.append(
                     Fill(
                         day,
@@ -637,9 +668,18 @@ def portfolio_backtest_symbols(
                         signal_close=pos.signal_close,
                         next_open=row.open,
                         opening_gap=(row.open / prev.close - 1) if prev.close > 0 else 0.0,
+                        raw_opening_gap=(row.open / prev.close - 1) if prev.close > 0 else 0.0,
+                        execution_slippage=(fill / row.open - 1) if row.open > 0 else 0.0,
+                        all_in_entry_move=(fill / prev.close - 1) if prev.close > 0 else 0.0,
                     )
                 )
                 initial_risk_cash = pos.initial_risk_cash or max(pos.entry_price - pos.planned_stop, 0) * pos.shares
+                total_risk_cash = pos.total_committed_risk_cash or initial_risk_cash
+                _attach_trade_id_to_position_links(position_fill_link_rows, pos.position_id, trade_id)
+                position_fill_link_rows.append(
+                    _position_fill_link_row(pos, trade_id, exit_fill_id, "final_exit", pos.shares, fill, sell_cost, 0.0)
+                )
+                all_fill_ids = "|".join([*pos.entry_fill_ids, *pos.add_fill_ids, exit_fill_id])
                 trades.append(
                     Trade(
                         order.code,
@@ -658,7 +698,7 @@ def portfolio_backtest_symbols(
                         pos.entry_costs,
                         sell_cost,
                         pos.entry_count,
-                        trade_id=stable_id("trade", order.code, pos.entry_date, day, pos.position_id),
+                        trade_id=trade_id,
                         position_id=pos.position_id,
                         entry_fill_id=pos.entry_fill_id,
                         exit_fill_id=exit_fill_id,
@@ -669,13 +709,25 @@ def portfolio_backtest_symbols(
                         signal_close=pos.signal_close,
                         next_open=pos.next_open,
                         opening_gap=pos.opening_gap,
+                        raw_opening_gap=raw_gap,
+                        execution_slippage=exec_slip,
+                        all_in_entry_move=all_in_move,
                         planned_stop=pos.planned_stop,
                         planned_target=pos.planned_target,
                         ex_ante_rr=pos.ex_ante_rr,
                         initial_risk_cash=initial_risk_cash,
                         realized_r_multiple=(net / initial_risk_cash) if initial_risk_cash > 0 else 0.0,
+                        total_committed_risk_cash=total_risk_cash,
+                        realized_r_on_initial_risk=(net / initial_risk_cash) if initial_risk_cash > 0 else 0.0,
+                        realized_r_on_total_risk=(net / total_risk_cash) if total_risk_cash > 0 else 0.0,
+                        add_count=len(pos.add_fill_ids),
+                        all_fill_ids=all_fill_ids,
                     )
                 )
+                if pos.signal_date:
+                    funnel_by_date.setdefault(pos.signal_date, {})["completed_trade"] = (
+                        funnel_by_date.setdefault(pos.signal_date, {}).get("completed_trade", 0) + 1
+                    )
                 del positions[order.code]
             elif order.side in {"buy", "add"}:
                 pos = positions.get(order.code)
@@ -717,7 +769,9 @@ def portfolio_backtest_symbols(
                     continue
                 cash -= total
                 fill_id = stable_id("fill", day, order.code, order.side, order.pending_order_id, len(fills))
-                opening_gap = (fill / order.signal_close - 1) if order.signal_close > 0 else 0.0
+                raw_gap, exec_slip, all_in_move = opening_gap_parts(order.signal_close, row.open, fill)
+                opening_gap = all_in_move
+                added_risk_cash = max(fill - order.stop, 0) * shares
                 fills.append(
                     Fill(
                         day,
@@ -739,9 +793,15 @@ def portfolio_backtest_symbols(
                         signal_close=order.signal_close,
                         next_open=row.open,
                         opening_gap=opening_gap,
+                        raw_opening_gap=raw_gap,
+                        execution_slippage=exec_slip,
+                        all_in_entry_move=all_in_move,
                     )
                 )
                 if pos is not None:
+                    position_fill_link_rows.append(
+                        _position_fill_link_row(pos, "", fill_id, "pyramid_add", shares, fill, buy_cost, added_risk_cash)
+                    )
                     new_total = pos.shares + shares
                     pos.entry_price = (pos.entry_price * pos.shares + fill * shares) / new_total
                     pos.shares = new_total
@@ -751,9 +811,14 @@ def portfolio_backtest_symbols(
                     pos.pyramid_stage += 1
                     pos.entry_costs += buy_cost
                     pos.entry_count += 1
+                    pos.cumulative_added_risk_cash += added_risk_cash
+                    pos.total_committed_risk_cash = pos.initial_entry_risk_cash + pos.cumulative_added_risk_cash
+                    pos.maximum_open_risk_cash = max(pos.maximum_open_risk_cash, pos.total_committed_risk_cash)
+                    pos.add_fill_ids = (*pos.add_fill_ids, fill_id)
                     discipline["adds"] += 1
                 else:
                     meta = metas[order.code]
+                    position_id = stable_id("pos", order.code, order.signal_date, order.pending_order_id)
                     positions[order.code] = Position(
                         code=order.code,
                         name=meta.name,
@@ -766,7 +831,7 @@ def portfolio_backtest_symbols(
                         target=order.target,
                         highest_high=row.high,
                         entry_costs=buy_cost,
-                        position_id=stable_id("pos", order.code, order.signal_date, order.pending_order_id),
+                        position_id=position_id,
                         candidate_id=order.candidate_id,
                         order_intent_id=order.order_intent_id,
                         pending_order_id=order.pending_order_id,
@@ -775,12 +840,35 @@ def portfolio_backtest_symbols(
                         signal_close=order.signal_close,
                         next_open=row.open,
                         opening_gap=opening_gap,
+                        raw_opening_gap=raw_gap,
+                        execution_slippage=exec_slip,
+                        all_in_entry_move=all_in_move,
                         planned_stop=order.planned_stop or order.stop,
                         planned_target=order.planned_target or order.target,
                         ex_ante_rr=order.rr,
-                        initial_risk_cash=max(fill - order.stop, 0) * shares,
+                        initial_risk_cash=added_risk_cash,
+                        initial_entry_risk_cash=added_risk_cash,
+                        total_committed_risk_cash=added_risk_cash,
+                        maximum_open_risk_cash=added_risk_cash,
+                        entry_fill_ids=(fill_id,),
+                    )
+                    position_fill_link_rows.append(
+                        _position_fill_link_row(
+                            positions[order.code],
+                            "",
+                            fill_id,
+                            "initial_entry",
+                            shares,
+                            fill,
+                            buy_cost,
+                            added_risk_cash,
+                        )
                     )
                     discipline["entries"] += 1
+                    if order.signal_date:
+                        funnel_by_date.setdefault(order.signal_date, {})["filled"] = (
+                            funnel_by_date.setdefault(order.signal_date, {}).get("filled", 0) + 1
+                        )
                 discipline["rr_values"].append(order.rr)
                 if current_equity > 0:
                     active = positions[order.code]
@@ -1024,6 +1112,7 @@ def portfolio_backtest_symbols(
             )
             pending.append(order)
             pending_order_rows.append(_pending_order_audit_row(day, order))
+            funnel_by_date.setdefault(day, {})["pending"] = funnel_by_date.setdefault(day, {}).get("pending", 0) + 1
             planned_value = row.close * shares
             if candidate_signal is not None:
                 order_for_audit = order
@@ -1063,6 +1152,8 @@ def portfolio_backtest_symbols(
             gross = (fill - pos.entry_price) * pos.shares
             total_cost = pos.entry_costs + sell_cost
             exit_fill_id = stable_id("fill", last_day, code, "sell", pos.position_id, "eob")
+            trade_id = stable_id("trade", code, pos.entry_date, last_day, pos.position_id)
+            raw_gap, exec_slip, all_in_move = opening_gap_parts(pos.signal_close, pos.next_open, pos.entry_price)
             fills.append(
                 Fill(
                     last_day,
@@ -1084,10 +1175,19 @@ def portfolio_backtest_symbols(
                     signal_close=pos.signal_close,
                     next_open=row.open,
                     opening_gap=(row.open / pos.signal_close - 1) if pos.signal_close > 0 else 0.0,
+                    raw_opening_gap=(row.open / pos.signal_close - 1) if pos.signal_close > 0 else 0.0,
+                    execution_slippage=(fill / row.open - 1) if row.open > 0 else 0.0,
+                    all_in_entry_move=(fill / pos.signal_close - 1) if pos.signal_close > 0 else 0.0,
                 )
             )
             cash += fill * pos.shares - sell_cost
             initial_risk_cash = pos.initial_risk_cash or max(pos.entry_price - pos.planned_stop, 0) * pos.shares
+            total_risk_cash = pos.total_committed_risk_cash or initial_risk_cash
+            _attach_trade_id_to_position_links(position_fill_link_rows, pos.position_id, trade_id)
+            position_fill_link_rows.append(
+                _position_fill_link_row(pos, trade_id, exit_fill_id, "final_exit", pos.shares, fill, sell_cost, 0.0)
+            )
+            all_fill_ids = "|".join([*pos.entry_fill_ids, *pos.add_fill_ids, exit_fill_id])
             trades.append(
                 Trade(
                     code,
@@ -1106,7 +1206,7 @@ def portfolio_backtest_symbols(
                     pos.entry_costs,
                     sell_cost,
                     pos.entry_count,
-                    trade_id=stable_id("trade", code, pos.entry_date, last_day, pos.position_id),
+                    trade_id=trade_id,
                     position_id=pos.position_id,
                     entry_fill_id=pos.entry_fill_id,
                     exit_fill_id=exit_fill_id,
@@ -1117,13 +1217,25 @@ def portfolio_backtest_symbols(
                     signal_close=pos.signal_close,
                     next_open=pos.next_open,
                     opening_gap=pos.opening_gap,
+                    raw_opening_gap=raw_gap,
+                    execution_slippage=exec_slip,
+                    all_in_entry_move=all_in_move,
                     planned_stop=pos.planned_stop,
                     planned_target=pos.planned_target,
                     ex_ante_rr=pos.ex_ante_rr,
                     initial_risk_cash=initial_risk_cash,
                     realized_r_multiple=((gross - total_cost) / initial_risk_cash) if initial_risk_cash > 0 else 0.0,
+                    total_committed_risk_cash=total_risk_cash,
+                    realized_r_on_initial_risk=((gross - total_cost) / initial_risk_cash) if initial_risk_cash > 0 else 0.0,
+                    realized_r_on_total_risk=((gross - total_cost) / total_risk_cash) if total_risk_cash > 0 else 0.0,
+                    add_count=len(pos.add_fill_ids),
+                    all_fill_ids=all_fill_ids,
                 )
             )
+            if pos.signal_date:
+                funnel_by_date.setdefault(pos.signal_date, {})["completed_trade"] = (
+                    funnel_by_date.setdefault(pos.signal_date, {}).get("completed_trade", 0) + 1
+                )
             del positions[code]
         if equity_curve:
             equity_curve[-1] = (last_day, cash)
@@ -1140,14 +1252,18 @@ def portfolio_backtest_symbols(
     sector_heat_path = output_dir / f"sector_heat_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
     candidate_funnel_daily_path = output_dir / "candidate_funnel_daily.csv"
     candidate_funnel_summary_path = output_dir / "candidate_funnel_summary.md"
+    research_gate_funnel_path = output_dir / "research_gate_funnel.csv"
+    portfolio_selection_funnel_path = output_dir / "portfolio_selection_funnel.csv"
     research_gate_audit_path = output_dir / "research_gate_audit.csv.gz"
     candidate_selection_audit_path = output_dir / "candidate_selection_audit.csv"
     pending_orders_path = output_dir / "pending_orders.csv"
+    position_fill_links_path = output_dir / "position_fill_links.csv"
     signal_snapshots_path = output_dir / "signal_snapshots.csv"
     trade_attribution_path = output_dir / "trade_attribution.csv"
     alpha_decile_path = output_dir / "alpha_decile_analysis.csv"
     alpha_ic_path = output_dir / "alpha_ic_report.md"
     sector_data_audit_path = output_dir / "sector_data_audit.md"
+    excluded_sector_daily_path = output_dir / "excluded_sector_daily.csv"
     controlled_comparison_csv_path = output_dir / "controlled_comparison_2026.csv"
     controlled_comparison_md_path = output_dir / "controlled_comparison_2026.md"
     _write_trades(trades_path, trades)
@@ -1162,15 +1278,19 @@ def portfolio_backtest_symbols(
         _write_sector_heat_report(sector_heat_path, sector_heat_by_date)
     if is_v5_strategy_mode(config.strategy_mode):
         _write_candidate_funnel_daily(candidate_funnel_daily_path, funnel_by_date)
+        _write_research_gate_funnel(research_gate_funnel_path, funnel_by_date)
+        _write_portfolio_selection_funnel(portfolio_selection_funnel_path, funnel_by_date)
         _write_candidate_funnel_summary(candidate_funnel_summary_path, funnel_by_date)
         _write_dict_rows_gzip(research_gate_audit_path, _research_gate_rows(candidate_signals_by_date))
         _write_dict_rows(candidate_selection_audit_path, selection_audit_rows)
         _write_dict_rows(pending_orders_path, pending_order_rows)
+        _write_dict_rows(position_fill_links_path, position_fill_link_rows)
         _write_dict_rows(signal_snapshots_path, signal_snapshot_rows)
         _write_trade_attribution(trade_attribution_path, trades, signal_snapshot_rows)
         _write_alpha_decile_analysis(alpha_decile_path, selection_audit_rows)
         _write_alpha_ic_report(alpha_ic_path, selection_audit_rows, trades)
-        _write_sector_data_audit(sector_data_audit_path, sector_map, sector_heat_by_date)
+        _write_sector_data_audit(sector_data_audit_path, sector_map, sector_heat_by_date, loaded_symbols=symbols)
+        _write_excluded_sector_daily(excluded_sector_daily_path, sector_heat_by_date)
         _write_controlled_comparison_note(controlled_comparison_csv_path, controlled_comparison_md_path, config)
     _add_discipline_metrics(metrics, discipline)
     metrics["fill_count"] = float(len(fills))
@@ -1263,18 +1383,41 @@ def metrics_from_trades(
     lo, hi = _bootstrap_mean_ci([trade.net_pnl for trade in trades])
     metrics["expectancy_ci95_low"] = lo
     metrics["expectancy_ci95_high"] = hi
-    cluster_lo, cluster_hi = _cluster_expectancy_ci(trades)
+    metrics["ordinary_trade_expectancy_ci95_low"] = lo
+    metrics["ordinary_trade_expectancy_ci95_high"] = hi
+    cluster_lo, cluster_hi = _cluster_expectancy_ci(trades, iterations=2000)
+    metrics["cluster_trade_expectancy_ci95_low"] = cluster_lo
+    metrics["cluster_trade_expectancy_ci95_high"] = cluster_hi
     metrics["cluster_expectancy_ci95_low"] = cluster_lo
     metrics["cluster_expectancy_ci95_high"] = cluster_hi
+    weekly_lo, weekly_hi = _weekly_total_pnl_ci(trades, iterations=2000)
+    metrics["weekly_total_pnl_ci95_low"] = weekly_lo
+    metrics["weekly_total_pnl_ci95_high"] = weekly_hi
     sharpe_lo, sharpe_hi = _moving_block_sharpe_ci(returns)
     metrics["moving_block_sharpe_ci95_low"] = sharpe_lo
     metrics["moving_block_sharpe_ci95_high"] = sharpe_hi
+    cagr_lo, cagr_hi = _moving_block_cagr_ci(returns)
+    metrics["moving_block_cagr_ci95_low"] = cagr_lo
+    metrics["moving_block_cagr_ci95_high"] = cagr_hi
+    dd_lo, dd_hi = _max_drawdown_bootstrap_ci(returns)
+    metrics["max_drawdown_bootstrap_ci95_low"] = dd_lo
+    metrics["max_drawdown_bootstrap_ci95_high"] = dd_hi
     independent_clusters = _independent_trade_clusters(trades)
+    full_year_count = len({day.year for day, _equity in (equity_curve or [])})
     metrics["trade_count_sufficient"] = 1.0 if len(trades) >= 100 else 0.0
     metrics["independent_cluster_count"] = float(independent_clusters)
     metrics["expectancy_ci95_positive"] = 1.0 if lo > 0 else 0.0
+    metrics["cluster_trade_expectancy_ci95_positive"] = 1.0 if cluster_lo > 0 else 0.0
+    metrics["moving_block_sharpe_ci95_positive"] = 1.0 if sharpe_lo > 0 else 0.0
+    metrics["full_year_count"] = float(full_year_count)
     metrics["statistically_supported"] = (
-        1.0 if len(trades) >= 100 and independent_clusters >= 26 and lo > 0 and years >= 3 else 0.0
+        1.0
+        if len(trades) >= 100
+        and independent_clusters >= 26
+        and cluster_lo > 0
+        and sharpe_lo > 0
+        and full_year_count >= 3
+        else 0.0
     )
     metrics["sample_sufficient"] = metrics["statistically_supported"]
     start_day = equity_curve[0][0] if equity_curve else None
@@ -1442,11 +1585,25 @@ def _candidate_funnel_for_day(
     signals = [signals_by_day[day] for signals_by_day in candidate_signals_by_date.values() if day in signals_by_day]
     hard_pass = [signal for signal in signals if signal.hard_pass]
     return {
+        "loaded": len(signal_histories),
         "eligible": len(eligible),
+        "data_ready": len(signals),
         "evaluated": len(signals),
+        "alpha_pass": sum(1 for signal in signals if signal.alpha_pass),
+        "entry_pass": sum(1 for signal in signals if signal.entry_pass),
+        "regime_pass": sum(1 for signal in signals if signal.regime_pass),
+        "sector_data_available": sum(1 for signal in signals if signal.sector_data_status != SectorDataStatus.MISSING.value),
+        "four_no_pass": sum(1 for signal in signals if signal.four_no_pass),
+        "stop_valid": sum(1 for signal in signals if signal.stop_valid),
+        "rr_pass": sum(1 for signal in signals if signal.rr_pass),
+        "position_neutral_sizing_feasible": sum(1 for signal in signals if signal.sizing_feasible),
         "hard_pass": len(hard_pass),
+        "portfolio_ranked_count": len(hard_pass),
         "selected": 0,
         "capacity_rejected": 0,
+        "pending": 0,
+        "filled": 0,
+        "completed_trade": 0,
         "all_symbols": len(signal_histories),
     }
 
@@ -1524,6 +1681,37 @@ def _pending_order_audit_row(day: date, order: PendingOrder) -> dict[str, str | 
         "rr": f"{order.rr:.6f}",
         "initial_risk_cash": f"{order.initial_risk_cash:.6f}",
     }
+
+
+def _position_fill_link_row(
+    pos: Position,
+    trade_id: str,
+    fill_id: str,
+    fill_role: str,
+    shares: int,
+    price: float,
+    fee: float,
+    risk_cash_added: float,
+) -> dict[str, str | int | float]:
+    return {
+        "position_id": pos.position_id,
+        "trade_id": trade_id,
+        "fill_id": fill_id,
+        "fill_role": fill_role,
+        "candidate_id": pos.candidate_id,
+        "order_intent_id": pos.order_intent_id,
+        "pending_order_id": pos.pending_order_id,
+        "shares": shares,
+        "price": f"{price:.6f}",
+        "fee": f"{fee:.6f}",
+        "risk_cash_added": f"{risk_cash_added:.6f}",
+    }
+
+
+def _attach_trade_id_to_position_links(rows: list[dict[str, str | int | float]], position_id: str, trade_id: str) -> None:
+    for row in rows:
+        if row.get("position_id") == position_id and not row.get("trade_id"):
+            row["trade_id"] = trade_id
 
 
 def _research_gate_rows(
@@ -1681,6 +1869,66 @@ def _write_candidate_funnel_daily(path: Path, funnel_by_date: dict[date, dict[st
             writer.writerow({"date": day.isoformat(), **{field: row.get(field, 0) for field in fields if field != "date"}})
 
 
+def _write_research_gate_funnel(path: Path, funnel_by_date: dict[date, dict[str, int]]) -> None:
+    fields = [
+        "date",
+        "loaded",
+        "data_ready",
+        "eligible",
+        "alpha_pass",
+        "entry_pass",
+        "regime_pass",
+        "sector_data_available",
+        "four_no_pass",
+        "stop_valid",
+        "rr_pass",
+        "position_neutral_sizing_feasible",
+        "hard_pass",
+    ]
+    _write_funnel_fields(path, funnel_by_date, fields)
+
+
+def _write_portfolio_selection_funnel(path: Path, funnel_by_date: dict[date, dict[str, int]]) -> None:
+    fields = [
+        "date",
+        "hard_pass",
+        "already_in_position",
+        "risk_halted",
+        "ranked",
+        "sector_cap_rejected",
+        "gross_exposure_rejected",
+        "cash_rejected",
+        "lot_size_rejected",
+        "max_positions_rejected",
+        "pending",
+        "open_limit_blocked",
+        "filled",
+        "completed_trade",
+    ]
+    _write_funnel_fields(path, funnel_by_date, fields)
+
+
+def _write_funnel_fields(path: Path, funnel_by_date: dict[date, dict[str, int]], fields: list[str]) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for day in sorted(funnel_by_date):
+            row = funnel_by_date[day]
+            data = {"date": day.isoformat()}
+            for field in fields:
+                if field == "date":
+                    continue
+                if field == "ranked":
+                    data[field] = row.get("portfolio_ranked_count", row.get("hard_pass", 0))
+                elif field == "max_positions_rejected":
+                    data[field] = row.get("capacity_rejected", 0)
+                elif field == "open_limit_blocked":
+                    data[field] = row.get("limit_blocked", 0)
+                else:
+                    data[field] = row.get(field, 0)
+            writer.writerow(data)
+
+
 def _write_candidate_funnel_summary(path: Path, funnel_by_date: dict[date, dict[str, int]]) -> None:
     totals: dict[str, int] = {}
     for row in funnel_by_date.values():
@@ -1698,29 +1946,36 @@ def _write_candidate_funnel_summary(path: Path, funnel_by_date: dict[date, dict[
 
 
 def _write_trade_attribution(path: Path, trades: list[Trade], signal_rows: list[dict[str, str | int | float]]) -> None:
-    by_code: dict[str, list[dict[str, str | int | float]]] = {}
-    for row in signal_rows:
-        by_code.setdefault(str(row["code"]), []).append(row)
+    by_candidate = {str(row.get("candidate_id", "")): row for row in signal_rows if row.get("candidate_id")}
     output: list[dict[str, str | int | float]] = []
     for trade in trades:
-        signals = by_code.get(trade.code, [])
-        eligible_signals = [
-            row for row in signals if str(row.get("date", "")) <= trade.entry_date.isoformat()
-        ]
-        chosen = max(eligible_signals, key=lambda row: str(row.get("date", ""))) if eligible_signals else {}
+        chosen = by_candidate.get(trade.candidate_id, {})
         output.append(
             {
+                "trade_id": trade.trade_id,
+                "position_id": trade.position_id,
+                "candidate_id": trade.candidate_id,
+                "order_intent_id": trade.order_intent_id,
+                "pending_order_id": trade.pending_order_id,
+                "entry_fill_id": trade.entry_fill_id,
+                "exit_fill_id": trade.exit_fill_id,
                 "code": trade.code,
                 "entry_date": trade.entry_date.isoformat(),
                 "exit_date": trade.exit_date.isoformat(),
                 "net_pnl": f"{trade.net_pnl:.6f}",
                 "exit_reason": trade.exit_reason,
-                "signal_date": chosen.get("date", ""),
+                "signal_date": trade.signal_date.isoformat() if trade.signal_date else chosen.get("date", ""),
                 "rank": chosen.get("rank", ""),
                 "ranking_score": chosen.get("ranking_score", ""),
                 "entry_score": chosen.get("entry_score", ""),
                 "relative_strength_score": chosen.get("relative_strength_score", ""),
-                "reasons": chosen.get("reasons", ""),
+                "raw_opening_gap": f"{trade.raw_opening_gap:.6f}",
+                "execution_slippage": f"{trade.execution_slippage:.6f}",
+                "all_in_entry_move": f"{trade.all_in_entry_move:.6f}",
+                "realized_r_on_initial_risk": f"{trade.realized_r_on_initial_risk:.6f}",
+                "realized_r_on_total_risk": f"{trade.realized_r_on_total_risk:.6f}",
+                "add_count": trade.add_count,
+                "reason_code": chosen.get("reason_code", ""),
             }
         )
     _write_dict_rows(path, output)
@@ -1772,18 +2027,39 @@ def _write_sector_data_audit(
     path: Path,
     sector_map: dict[str, str],
     sector_heat_by_date: dict[date, dict[str, SectorAlpha]],
+    loaded_symbols: list[str] | None = None,
 ) -> None:
-    mapped = sum(1 for value in sector_map.values() if value and not value.startswith("UNMAPPED_"))
-    missing = sum(1 for value in sector_map.values() if not value or value.startswith("UNMAPPED_"))
+    denominator_symbols = list(loaded_symbols) if loaded_symbols is not None else list(sector_map)
+    mapped_static = sum(
+        1
+        for code in denominator_symbols
+        for value in [sector_map.get(code, "")]
+        if value and not value.startswith(("UNMAPPED_", "FALLBACK_"))
+    )
+    mapped = mapped_static
+    missing = sum(
+        1
+        for code in denominator_symbols
+        for value in [sector_map.get(code, "")]
+        if not value or value.startswith("UNMAPPED_")
+    )
     fallback = sum(1 for value in sector_map.values() if value.startswith("FALLBACK_"))
-    static_end_date = sum(1 for value in sector_map.values() if value == "STATIC_END_DATE")
+    static_end_date = mapped_static
     sector_days = sum(len(items) for items in sector_heat_by_date.values())
     lines = [
         "# Sector Data Audit",
         "",
+        "- sector_source: `gm_alpha_store.sector_map`",
+        "- sector_classification_level: `industry`",
+        "- sector_effective_date: `backtest_end_date`",
+        "- sector_point_in_time: `false`",
+        "- sector_status: `static_end_date`",
+        "",
         "| Item | Value |",
         "| --- | ---: |",
-        f"| symbol_denominator | {len(sector_map)} |",
+        f"| symbol_denominator | {len(denominator_symbols)} |",
+        f"| mapped_point_in_time | 0 |",
+        f"| mapped_static_end_date | {mapped_static} |",
         f"| mapped | {mapped} |",
         f"| missing | {missing} |",
         f"| fallback | {fallback} |",
@@ -1814,6 +2090,15 @@ def _write_sector_data_audit(
         ]
     )
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_excluded_sector_daily(path: Path, sector_heat_by_date: dict[date, dict[str, SectorAlpha]]) -> None:
+    fields = ["date", "sector", "reason_code", "member_count"]
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        if not sector_heat_by_date:
+            writer.writerow({"date": "", "sector": "", "reason_code": "sector_heat_not_computed", "member_count": 0})
 
 
 def _write_controlled_comparison_note(csv_path: Path, md_path: Path, config: BacktestConfig) -> None:
@@ -1879,13 +2164,13 @@ def _write_metrics(
                 f"- Gross exposure cap: trend_up/range/down = 80%/50%/30%; observed {discipline.get('max_exposure', 0):.2%}.",
                 f"- Four-no gate: rejected {discipline.get('rejected_four_no', 0)}; tier `{entry_config.entry_tier}`; min R:R {entry_config.min_rr:.2f}.",
                 f"- Four-no reason codes: {_format_reason_counts(discipline.get('four_no_reasons', {}))}.",
-                f"- Funnel: standard_signals {discipline.get('standard_signals', 0)}, regime_rejected {discipline.get('regime_rejected', 0)}, sector_rejected {discipline.get('sector_rejected', 0)}, four_no_rejected {discipline.get('rejected_four_no', 0)}, entries {discipline.get('entries', 0)}.",
+                f"- Funnel: alpha_hard_pass_count {discipline.get('standard_signals', 0)}, regime_rejected {discipline.get('regime_rejected', 0)}, sector_rejected {discipline.get('sector_rejected', 0)}, four_no_rejected {discipline.get('rejected_four_no', 0)}, filled_entry_count {discipline.get('entries', 0)}.",
                 f"- Data gate: industry_unmapped rejected {discipline.get('industry_unmapped', 0)}.",
                 f"- R:R: min {min_rr:.2f}, average {avg_rr:.2f}, breakeven win rate {breakeven_win_rate(avg_rr):.2%}.",
                 f"- Entry risk: average {metrics.get('avg_entry_risk_pct', 0):.2%}, max {metrics.get('max_entry_risk_pct', 0):.2%}, target {risk_config.risk_per_trade:.2%}.",
                 f"- Pyramid adds: {discipline.get('adds', 0)}.",
                 f"- Capacity/limit blocks: cap_or_lot_rejected {discipline.get('rejected_caps', 0)}, open_limit_blocked {discipline.get('limit_blocked', 0)}.",
-                f"- Statistical support: trades {metrics.get('trade_count', 0):.0f}, entry_week_clusters {metrics.get('independent_cluster_count', 0):.0f}, expectancy_ci95_low {metrics.get('expectancy_ci95_low', 0):.2f}, statistically_supported {int(metrics.get('statistically_supported', 0))}.",
+                f"- Statistical support: trades {metrics.get('trade_count', 0):.0f}, entry_week_clusters {metrics.get('independent_cluster_count', 0):.0f}, cluster_trade_expectancy_ci95_low {metrics.get('cluster_trade_expectancy_ci95_low', 0):.2f}, moving_block_sharpe_ci95_low {metrics.get('moving_block_sharpe_ci95_low', 0):.2f}, statistically_supported {int(metrics.get('statistically_supported', 0))}.",
                 "",
                 "| Regime | Average Exposure |",
                 "| --- | ---: |",
@@ -1920,7 +2205,10 @@ def _add_discipline_metrics(metrics: dict[str, float], discipline: dict) -> None
     metrics["max_sector_pct"] = discipline.get("max_sector_pct", 0.0)
     metrics["max_exposure"] = discipline.get("max_exposure", 0.0)
     metrics["discipline_entries"] = float(discipline.get("entries", 0))
-    metrics["standard_signal_count"] = float(discipline.get("standard_signals", 0))
+    metrics["alpha_hard_pass_count"] = float(discipline.get("standard_signals", 0))
+    metrics["portfolio_ranked_count"] = float(discipline.get("standard_signals", 0))
+    metrics["order_intent_count"] = float(discipline.get("entries", 0) + discipline.get("adds", 0))
+    metrics["filled_entry_count"] = float(discipline.get("entries", 0))
     metrics["regime_rejected_count"] = float(discipline.get("regime_rejected", 0))
     metrics["sector_rejected_count"] = float(discipline.get("sector_rejected", 0))
     metrics["industry_unmapped_count"] = float(discipline.get("industry_unmapped", 0))
@@ -1963,11 +2251,30 @@ def _bootstrap_mean_ci(values: list[float], iterations: int = 500, seed: int = 5
     return means[low_idx], means[high_idx]
 
 
-def _cluster_expectancy_ci(trades: list[Trade], iterations: int = 500, seed: int = 520) -> tuple[float, float]:
+def _cluster_expectancy_ci(trades: list[Trade], iterations: int = 2000, seed: int = 520) -> tuple[float, float]:
     clusters: dict[tuple[int, int], list[float]] = {}
     for trade in trades:
         clusters.setdefault(trade.entry_date.isocalendar()[:2], []).append(trade.net_pnl)
-    values = [mean(items) for items in clusters.values()]
+    weeks = list(clusters.values())
+    if not weeks:
+        return 0.0, 0.0
+    rng = random.Random(seed)
+    sampled_means: list[float] = []
+    for _ in range(iterations):
+        sample: list[float] = []
+        for _week in weeks:
+            sample.extend(weeks[rng.randrange(len(weeks))])
+        sampled_means.append(mean(sample) if sample else 0.0)
+    sampled_means.sort()
+    return _percentile_pair(sampled_means)
+
+
+def _weekly_total_pnl_ci(trades: list[Trade], iterations: int = 2000, seed: int = 521) -> tuple[float, float]:
+    clusters: dict[tuple[int, int], float] = {}
+    for trade in trades:
+        key = trade.entry_date.isocalendar()[:2]
+        clusters[key] = clusters.get(key, 0.0) + trade.net_pnl
+    values = list(clusters.values())
     return _bootstrap_mean_ci(values, iterations=iterations, seed=seed)
 
 
@@ -1994,9 +2301,70 @@ def _moving_block_sharpe_ci(
         sd = pstdev(sample)
         sharpes.append((mean(sample) / sd * math.sqrt(252)) if sd > 0 else 0.0)
     sharpes.sort()
-    low_idx = int(iterations * 0.025)
-    high_idx = min(iterations - 1, int(iterations * 0.975))
-    return sharpes[low_idx], sharpes[high_idx]
+    return _percentile_pair(sharpes)
+
+
+def _moving_block_cagr_ci(
+    returns: list[float],
+    *,
+    block_size: int = 10,
+    iterations: int = 500,
+    seed: int = 522,
+) -> tuple[float, float]:
+    if not returns:
+        return 0.0, 0.0
+    block_size = max(1, min(block_size, len(returns)))
+    blocks = [returns[idx : idx + block_size] for idx in range(0, len(returns) - block_size + 1)] or [returns]
+    rng = random.Random(seed)
+    values: list[float] = []
+    years = max(len(returns) / 252, 1 / 252)
+    for _ in range(iterations):
+        sample: list[float] = []
+        while len(sample) < len(returns):
+            sample.extend(blocks[rng.randrange(len(blocks))])
+        equity = 1.0
+        for ret in sample[: len(returns)]:
+            equity *= 1 + ret
+        values.append(equity ** (1 / years) - 1 if equity > 0 else -1.0)
+    values.sort()
+    return _percentile_pair(values)
+
+
+def _max_drawdown_bootstrap_ci(
+    returns: list[float],
+    *,
+    block_size: int = 10,
+    iterations: int = 500,
+    seed: int = 523,
+) -> tuple[float, float]:
+    if not returns:
+        return 0.0, 0.0
+    block_size = max(1, min(block_size, len(returns)))
+    blocks = [returns[idx : idx + block_size] for idx in range(0, len(returns) - block_size + 1)] or [returns]
+    rng = random.Random(seed)
+    values: list[float] = []
+    for _ in range(iterations):
+        sample: list[float] = []
+        while len(sample) < len(returns):
+            sample.extend(blocks[rng.randrange(len(blocks))])
+        equity = 1.0
+        curve: list[tuple[date, float]] = []
+        base = date(2000, 1, 1)
+        for idx, ret in enumerate(sample[: len(returns)]):
+            equity *= 1 + ret
+            curve.append((base, equity))
+            base = date.fromordinal(base.toordinal() + 1)
+        values.append(_max_drawdown(curve))
+    values.sort()
+    return _percentile_pair(values)
+
+
+def _percentile_pair(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    low_idx = int(len(values) * 0.025)
+    high_idx = min(len(values) - 1, int(len(values) * 0.975))
+    return values[low_idx], values[high_idx]
 
 
 def _positions_value(positions: dict[str, Position], rows_by_date: dict[str, dict[date, KLine]], day: date) -> float:
@@ -2397,10 +2765,10 @@ def _regime_by_date_from_index(symbol: str, rows: list[KLine], all_dates: list[d
             row_idx += 1
         current = sorted_rows[row_idx]
         if current.date > day:
-            out[day] = RegimeState(symbol, symbol, day, "down", False, "鎸囨暟鏁版嵁涓嶈冻")
+            out[day] = RegimeState(symbol, symbol, day, "down", False, "index_data_insufficient")
             continue
         if row_idx < 60:
-            out[day] = RegimeState(symbol, symbol, day, "down", False, "鎸囨暟regime鏁版嵁涓嶈冻")
+            out[day] = RegimeState(symbol, symbol, day, "down", False, "index_regime_data_insufficient")
             continue
         point = points[row_idx]
         rise60 = pct_change(sorted_rows[row_idx - 60].close, current.close)
@@ -2485,7 +2853,7 @@ def _sector_states_from_points(
             old = histories[code][idx - 60].close
             valid.append((row, point, pct_change(old, row.close)))
         if not valid:
-            states[industry] = SectorState(industry, day, "unknown", False, 0.0, "琛屼笟鏁版嵁涓嶈冻")
+            states[industry] = SectorState(industry, day, "unknown", False, 0.0, "sector_data_insufficient")
             continue
         above20 = sum(1 for row, point, _rise in valid if row.close > (point.ma20 or 0))
         breadth = above20 / len(valid)

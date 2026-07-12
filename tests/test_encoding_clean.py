@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TEXT_GLOBS = ("*.py", "*.md", "*.csv", "*.json", "*.yml", "*.yaml")
-SCAN_DIRS = ("chan520_skill", "scripts", "tests", "reports/backtest/v7", ".github")
+SCAN_DIRS = ("chan520_skill", "scripts", "tests", "reports/backtest/v7", "reports/backtest/v8", ".github")
 BAD_MARKERS = (
     chr(0xFFFD),
     b"\xe9\x94\x9f".decode("utf-8"),
@@ -32,6 +32,7 @@ def test_no_unicode_replacement_or_mojibake_markers() -> None:
     offenders: list[str] = []
     for path in iter_text_files():
         text = path.read_text(encoding="utf-8-sig", errors="replace")
+        assert text.encode("utf-8").decode("utf-8") == text
         if any(marker in text for marker in BAD_MARKERS):
             offenders.append(str(path.relative_to(ROOT)))
     assert offenders == []

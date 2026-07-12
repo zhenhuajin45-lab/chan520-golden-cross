@@ -11,13 +11,17 @@ import csv
 import pickle
 import sqlite3
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
+from chan520_skill.backtest import BacktestConfig
+from chan520_skill.entry_filters import EntryFilterConfig
 from chan520_skill.evidence_manifest import build_evidence_manifest, stable_hash_json, write_evidence_manifest
 from chan520_skill.models import KLine, StockMeta
 from chan520_skill.portfolio_engine import PortfolioEngineConfig, run_alpha_portfolio
+from chan520_skill.research_config import ResearchRunConfig
+from chan520_skill.risk import RiskConfig
 
 
 def main() -> int:
@@ -136,6 +140,7 @@ def run_store(args) -> None:
         return StockMeta(code, data.names.get(code, code), market), data.rows_by_code[code]
 
     engine_config = PortfolioEngineConfig(max_positions=5, strategy_mode=args.strategy_mode)
+    run_config = build_run_config(engine_config)
 
     trades_path, metrics_path, metrics = run_alpha_portfolio(
         data.symbols,
@@ -153,9 +158,11 @@ def run_store(args) -> None:
         symbols=data.symbols,
         ordered_symbols=data.symbols,
         config=engine_config,
+        full_config=run_config,
         cwd=Path.cwd(),
     )
     write_evidence_manifest(output_dir / "evidence_manifest.json", manifest)
+    write_full_config(output_dir / "full_config.json", run_config)
     write_research_report(output_dir / "research_report_v5_1.md", output_dir, metrics, start, end, len(data.symbols), args.strategy_mode)
     print(f"SQLite alpha complete trades={int(metrics['trade_count'])} cagr={metrics['cagr']:.4f} max_dd={metrics['max_drawdown']:.4f}")
     print(f"Trades: {trades_path.resolve()}")
@@ -179,6 +186,7 @@ def compare_store(args) -> None:
     shared_hashes = None
     for variant in variants:
         engine_config = PortfolioEngineConfig(max_positions=5, strategy_mode=variant)
+        run_config = build_run_config(engine_config)
         variant_dir = output_dir / variant
         _trades_path, _metrics_path, metrics = run_alpha_portfolio(
             data.symbols,
@@ -196,9 +204,11 @@ def compare_store(args) -> None:
             symbols=data.symbols,
             ordered_symbols=data.symbols,
             config=engine_config,
+            full_config=run_config,
             cwd=Path.cwd(),
         )
         write_evidence_manifest(variant_dir / "evidence_manifest.json", manifest)
+        write_full_config(variant_dir / "full_config.json", run_config)
         hashes = {
             key: manifest[key]
             for key in (
@@ -218,6 +228,7 @@ def compare_store(args) -> None:
                 "variant": variant,
                 "same_data_hashes": int(same_data),
                 "strategy_config_hash": manifest["strategy_config_hash"],
+                "full_config_hash": manifest["full_config_hash"],
                 "data_hash_bundle": stable_hash_json(hashes),
                 **{key: f"{metrics.get(key, 0):.6f}" for key in ("trade_count", "total_return", "cagr", "max_drawdown", "sharpe", "calmar", "win_rate", "payoff_ratio", "profit_factor")},
             }
@@ -244,6 +255,38 @@ def compare_store(args) -> None:
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Controlled comparison complete: {csv_path.resolve()}")
+
+
+def build_run_config(engine_config: PortfolioEngineConfig) -> ResearchRunConfig:
+    backtest_config = BacktestConfig(
+        initial_cash=engine_config.initial_cash,
+        strategy_mode=engine_config.strategy_mode,
+        split_date=date(2022, 1, 1),
+        regime_index="000300",
+        require_industry=False,
+    )
+    risk_config = RiskConfig(
+        max_position_pct=engine_config.max_position_pct,
+        max_sector_pct=engine_config.max_sector_pct,
+        cash_reserve_pct=engine_config.cash_reserve_pct,
+    )
+    return ResearchRunConfig(
+        portfolio_engine=engine_config,
+        backtest=asdict(backtest_config),
+        risk=risk_config,
+        entry_filter=EntryFilterConfig(),
+    )
+
+
+def write_full_config(path: Path, config: ResearchRunConfig) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(stable_json(config.to_dict()), encoding="utf-8")
+
+
+def stable_json(value) -> str:
+    import json
+
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n"
 
 
 def load_store_data(store: Path, start: date, end: date, lookback_days: int, max_symbols: int) -> StoreData:
