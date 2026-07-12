@@ -1,0 +1,94 @@
+{
+  "alpha": {
+    "hard_pass_threshold": 70,
+    "relative_strength_weight": 20,
+    "risk_weight": 20,
+    "trend_weight": 40,
+    "volume_quality_weight": 20
+  },
+  "backtest": {
+    "commission_rate": 0.00025,
+    "fill": "next_open",
+    "initial_cash": 100000.0,
+    "min_commission": 5.0,
+    "min_history": 250,
+    "regime_index": "000300",
+    "require_industry": false,
+    "signal_adjust": "none",
+    "slippage_bps": 5.0,
+    "split_date": "2022-01-01",
+    "stamp_tax_rate": 0.0005,
+    "strategy_mode": "strategy_v5_alpha_ranked",
+    "transfer_rate": 1e-05,
+    "use_sector": false
+  },
+  "entry_filter": {
+    "acute_move_limit_ratio": 0.7,
+    "entry_tier": "standard",
+    "max_amplitude": 12.0,
+    "max_stop_dist": 0.12,
+    "min_rr": 2.0
+  },
+  "entry_model": {
+    "ma_fast": 20,
+    "ma_slow": 60,
+    "pullback_entry_threshold": 60
+  },
+  "market_regime": {
+    "bear_breadth": 0.35,
+    "bear_volatility": 0.04,
+    "bull_breadth": 0.55,
+    "index_symbol": "000300"
+  },
+  "portfolio_engine": {
+    "cash_reserve_pct": 0.2,
+    "initial_cash": 100000.0,
+    "max_position_pct": 0.2,
+    "max_positions": 5,
+    "max_sector_pct": 0.4,
+    "strategy_mode": "strategy_v5_alpha_ranked"
+  },
+  "risk": {
+    "atr_k": 2.0,
+    "cash_reserve_pct": 0.2,
+    "daily_loss_stop": 0.015,
+    "first_tranche_pct": 0.15,
+    "max_dd_stop": 0.15,
+    "max_position_pct": 0.2,
+    "max_sector_pct": 0.4,
+    "min_sector_members": 8,
+    "pyramid_increment_pcts": [
+      0.05
+    ],
+    "regime_exposure": {
+      "BEAR": 0.3,
+      "BULL": 0.8,
+      "NORMAL": 0.5,
+      "down": 0.3,
+      "range": 0.5,
+      "trend_up": 0.8
+    },
+    "risk_per_trade": 0.01,
+    "target_atr_k": 3.0,
+    "time_stop_days": 7,
+    "trail_activation": 0.04,
+    "weekly_loss_stop": 0.04
+  },
+  "sector": {
+    "classification_level": "industry",
+    "max_members": 1200,
+    "min_members": 20,
+    "min_sample_members": 30,
+    "point_in_time": false,
+    "source": "static_end_date"
+  },
+  "statistics": {
+    "bootstrap_seed": 520,
+    "cluster_bootstrap_iterations": 2000,
+    "min_entry_week_clusters": 26,
+    "min_full_years": 3,
+    "min_trades": 100,
+    "moving_block_iterations": 500,
+    "ordinary_bootstrap_iterations": 500
+  }
+}

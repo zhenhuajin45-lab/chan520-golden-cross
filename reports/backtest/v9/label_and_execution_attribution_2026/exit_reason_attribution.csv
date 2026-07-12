@@ -1,0 +1,6 @@
+﻿exit_reason,count,total_pnl,average_pnl,average_R,median_R,win_rate,MFE_before_exit,MAE_before_exit,post_exit_3d_return,post_exit_5d_return,post_exit_10d_return
+close_stop,41,-24102.877817,-587.875069,-1.196252,-1.293892,0.121951,,,,,
+end_of_backtest,1,-916.995740,-916.995740,-1.057300,-1.057300,0.000000,,,,,
+target_close_confirmed,16,24822.947729,1551.434233,3.567515,3.186865,1.000000,,,,,
+three_bars_no_high,39,1267.723096,32.505720,-0.075071,-0.203755,0.358974,,,,,
+time_stop,6,-896.080097,-149.346683,-0.216368,-0.319722,0.166667,,,,,
