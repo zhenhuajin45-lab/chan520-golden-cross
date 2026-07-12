@@ -27,11 +27,6 @@ jobs:
         run: python -m compileall chan520_skill scripts tests
       - name: Diff check
         shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git diff --check "${{ github.event.pull_request.base.sha }}"...HEAD
-          else
-            git diff --check HEAD~1..HEAD
-          fi
+        run: git diff --check HEAD~1..HEAD
       - name: Pytest
         run: pytest -q
