@@ -78,9 +78,9 @@ def main() -> int:
         runs=args.random_runs,
         seed=520,
     )
-    write_csv(output_dir / "random_full_portfolio_distribution.csv", random_rows)
+    write_csv(output_dir / "random_fixed_20d_simplified_replay.csv", random_rows)
     write_random_report(
-        output_dir / "random_full_portfolio_report.md",
+        output_dir / "random_fixed_20d_simplified_replay_report.md",
         random_rows,
         trades_first,
         trades_ranked,
@@ -95,8 +95,8 @@ def main() -> int:
         seed=521,
         overlap_reference=ranked_selected,
     )
-    write_csv(output_dir / "tie_break_full_portfolio_distribution.csv", tie_rows)
-    write_tie_break_report(output_dir / "tie_break_report.md", tie_rows)
+    write_csv(output_dir / "tie_break_fixed_20d_simplified_replay.csv", tie_rows)
+    write_tie_break_report(output_dir / "tie_break_fixed_20d_simplified_replay_report.md", tie_rows)
     write_alpha_ic_reports(output_dir, labels)
     write_statistical_validation(
         output_dir / "statistical_validation.md",
@@ -830,23 +830,21 @@ def write_random_report(
     label_by_id = {str(row["candidate_id"]): row for row in labels}
     first_proxy = mean_group(label_by_id, set(first_selected), "forward_return_20d")
     ranked_proxy = mean_group(label_by_id, set(ranked_selected), "forward_return_20d")
-    first_realized_return = sum(parse_float(row.get("net_pnl")) for row in first_trades.values()) / 100000.0
-    ranked_realized_return = sum(parse_float(row.get("net_pnl")) for row in ranked_trades.values()) / 100000.0
     cagr_values = sorted(parse_float(row.get("cagr")) for row in rows)
     dd_values = sorted(parse_float(row.get("max_drawdown")) for row in rows)
     lines = [
-        "# Random Full Portfolio Report",
+        "# Random Fixed-20d Simplified Replay Report",
         "",
-        "- Scope: stateful replay over full-engine hard-pass candidates with RANDOM policy.",
-        "- This avoids re-running invariant indicator and candidate precomputation for every seed.",
+        "- NOT COMPARABLE TO EXECUTION BACKTEST.",
+        "- Scope: fixed-20d simplified replay over full-engine hard-pass candidates with RANDOM policy.",
+        "- Simplifications: fixed 20d label exit, fixed 20% notional sizing, no formal fees/exits/pyramiding/regime/sector constraints, and no execution-faithful daily mark-to-market.",
+        "- This distribution is label-path selection evidence only and must not be directly compared with first-fit/ranked execution backtests.",
         "",
         f"- random median total_return: {percentile(values, 0.50):.6f}",
         f"- random total_return 5% interval: {percentile(values, 0.05):.6f}",
         f"- random total_return 95% interval: {percentile(values, 0.95):.6f}",
         f"- random median CAGR: {percentile(cagr_values, 0.50):.6f}",
         f"- random median MaxDD: {percentile(dd_values, 0.50):.6f}",
-        f"- first-fit realized total_return percentile: {empirical_percentile(values, first_realized_return):.6f}",
-        f"- ranked realized total_return percentile: {empirical_percentile(values, ranked_realized_return):.6f}",
         f"- first-fit proxy avg_20d_return: {first_proxy:.6f}",
         f"- ranked proxy avg_20d_return: {ranked_proxy:.6f}",
         f"- first-fit realized PnL: {sum(parse_float(row.get('net_pnl')) for row in first_trades.values()):.2f}",
@@ -858,16 +856,17 @@ def write_random_report(
 def write_tie_break_report(path: Path, rows: list[dict]) -> None:
     hashes = {str(row.get("selected_candidate_set_hash", "")) for row in rows}
     lines = [
-        "# Tie Break Full Portfolio Report",
+        "# Tie Break Fixed-20d Simplified Replay Report",
         "",
-        "- Scope: RANDOM_WITHIN_TIES policy inside the full portfolio engine.",
+        "- NOT COMPARABLE TO EXECUTION BACKTEST.",
+        "- Scope: RANDOM_WITHIN_TIES policy inside fixed-20d simplified replay over full-engine hard-pass evidence.",
         f"- runs: {len(rows)}",
         f"- unique selected candidate sets: {len(hashes)}",
     ]
     if len(hashes) == 1:
-        lines.append("- interpretation: all runs selected the same candidate set; capacity did not cut into a randomized tie bucket or no material tie bucket existed.")
+        lines.append("- interpretation: all runs selected the same candidate set under simplified replay; capacity did not cut into a randomized tie bucket or no material tie bucket existed.")
     else:
-        lines.append("- interpretation: tie break changes selected candidate sets under the full portfolio state machine.")
+        lines.append("- interpretation: tie break changes selected candidate sets under the simplified replay state machine.")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -988,27 +987,25 @@ def write_statistical_validation(
 ) -> None:
     first_ids = set(first_selected)
     ranked_ids = set(ranked_selected)
-    values = sorted(parse_float(row.get("total_return", row.get("total_return_proxy"))) for row in random_rows)
     label_by_id = {str(row["candidate_id"]): row for row in labels}
-    first_proxy = mean_group(label_by_id, first_ids, "forward_return_20d")
-    ranked_proxy = mean_group(label_by_id, ranked_ids, "forward_return_20d")
     lines = [
         "# Statistical Validation",
         "",
         "- Parameter tuning in this phase: none.",
         "- Future labels are offline research artifacts only.",
         "- Current 2026 result remains retrospective research validation.",
+        "- Fixed-20d simplified replay is NOT COMPARABLE TO EXECUTION BACKTEST.",
         f"- Hard-pass labels: {len(labels)}",
         "",
-        "## V5.2A Answers",
+        "## V5.2B Closeout",
         "",
         f"1. Selection overlap Jaccard: {len(first_ids & ranked_ids) / len(first_ids | ranked_ids):.6f}.",
         f"2. First-fit-only vs ranked-only 20d proxy return: {mean_group(label_by_id, first_ids - ranked_ids, 'forward_return_20d'):.6f} vs {mean_group(label_by_id, ranked_ids - first_ids, 'forward_return_20d'):.6f}.",
-        f"3. First-fit random percentile: {empirical_percentile(values, first_proxy):.6f}; ranked percentile: {empirical_percentile(values, ranked_proxy):.6f}.",
+        "3. Simplified replay percentiles against formal first-fit/ranked execution backtests are intentionally not reported.",
         "4. Factor exposure: see first_fit_vs_ranked_features.csv for industry, score, sector heat, opening gap and ex-ante R:R differences.",
-        "5. Ranking score IC: see alpha_ic_5d.csv, alpha_ic_10d.csv and alpha_ic_20d.csv; no parameter changes were made.",
+        "5. Ranking score IC: see alpha_ic_summary.csv and alpha_quantile_returns.csv; no parameter changes were made.",
         "6. Decile monotonicity: see alpha_monotonicity_report.md; current run is not monotonic for 5d/10d/20d.",
-        "7. Tie-break sensitivity: see tie_bucket_randomization.csv; effective_ranking_resolution records whether score resolution is insufficient.",
+        "7. Tie-break sensitivity: see tie_break_fixed_20d_simplified_replay.csv.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1106,20 +1103,32 @@ def write_clean_manifest(path: Path, store: Path, ranked_dir: Path, args, labels
     commit = git_output(["rev-parse", "HEAD"])
     source_tree = git_output(["rev-parse", "HEAD^{tree}"])
     dirty = bool(git_output(["status", "--porcelain"]))
+    input_dir = Path(args.input_dir)
+    first_dir = input_dir / "strategy_v5_alpha_first_fit_frozen"
+    ranked_trades = next(ranked_dir.glob("trades_basket_*.csv"), None)
+    first_trades = next(first_dir.glob("trades_basket_*.csv"), None)
     manifest.update(
         {
             "git_commit": commit,
             "run_code_commit": commit,
+            "artifact_commit": commit,
+            "artifact_tree_hash": source_tree,
             "source_tree_hash": source_tree,
             "git_dirty": dirty,
             "acceptance_status": "REPRODUCIBLE_CLEAN_TREE" if not dirty else "DIRTY_TREE_FORMAL_ACCEPTANCE_FORBIDDEN",
             "strategy_config_hash": stable_hash_json(engine_config),
             "full_config_hash": stable_hash_json(run_config.to_dict()),
+            "input_evidence_manifest_hash": file_sha256(prior_path),
+            "research_gate_audit_hash": file_sha256(ranked_dir / "research_gate_audit.csv.gz"),
+            "first_fit_selection_audit_hash": file_sha256(first_dir / "candidate_selection_audit.csv"),
+            "ranked_selection_audit_hash": file_sha256(ranked_dir / "candidate_selection_audit.csv"),
+            "first_fit_trades_hash": file_sha256(first_trades),
+            "ranked_trades_hash": file_sha256(ranked_trades),
             "label_candidate_count": len(labels),
             "label_windows": list(WINDOWS),
             "start": args.start,
             "end": args.end,
-            "manifest_hash_source": str(prior_path),
+            "manifest_hash_source": prior_path.relative_to(Path.cwd()).as_posix() if prior_path.is_relative_to(Path.cwd()) else prior_path.name,
         }
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1131,6 +1140,16 @@ def git_output(args: list[str]) -> str:
         return subprocess.check_output(["git", *args], cwd=Path.cwd(), text=True, encoding="utf-8").strip()
     except Exception:
         return ""
+
+
+def file_sha256(path: Path | None) -> str:
+    if path is None or not path.exists():
+        return ""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def write_selection_to_pnl_decomposition(path: Path, first_trades: dict[str, dict[str, str]], ranked_trades: dict[str, dict[str, str]]) -> None:
@@ -1194,14 +1213,15 @@ def write_final_report(path: Path, labels: list[dict], random_rows: list[dict], 
         "- Alpha weights, thresholds, MA, ATR, R:R, exit and position parameters were not changed.",
         "- Forward labels use D close signal, D+1 raw open entry reference, and market-calendar holding horizons.",
         "- Incomplete horizons are censored and excluded from return/IC calculations.",
-        "- Counterfactual distributions are stateful replays over full-engine hard-pass evidence, not parameter optimization runs.",
+        "- Fixed-20d simplified replay is NOT COMPARABLE TO EXECUTION BACKTEST.",
+        "- Simplified replay uses fixed 20d label exit and fixed notional sizing; it is not an execution-faithful portfolio engine.",
         "",
         "| Item | Value |",
         "| --- | ---: |",
         f"| candidate_labels | {len(labels)} |",
         f"| complete_20d_labels | {complete_20d} |",
-        f"| random_full_portfolio_runs | {len(random_rows)} |",
-        f"| random_median_total_return | {percentile(random_total_returns, 0.50):.6f} |",
+        f"| random_fixed_20d_simplified_replay_runs | {len(random_rows)} |",
+        f"| random_fixed_20d_simplified_median_total_return | {percentile(random_total_returns, 0.50):.6f} |",
         f"| tie_break_runs | {len(tie_rows)} |",
         f"| tie_break_unique_selected_sets | {unique_tie_sets} |",
     ]
