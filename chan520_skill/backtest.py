@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import math
 import random
 import hashlib
@@ -1139,7 +1140,7 @@ def portfolio_backtest_symbols(
     sector_heat_path = output_dir / f"sector_heat_{stem}_{start.isoformat()}_{end.isoformat()}.csv"
     candidate_funnel_daily_path = output_dir / "candidate_funnel_daily.csv"
     candidate_funnel_summary_path = output_dir / "candidate_funnel_summary.md"
-    research_gate_audit_path = output_dir / "research_gate_audit.csv"
+    research_gate_audit_path = output_dir / "research_gate_audit.csv.gz"
     candidate_selection_audit_path = output_dir / "candidate_selection_audit.csv"
     pending_orders_path = output_dir / "pending_orders.csv"
     signal_snapshots_path = output_dir / "signal_snapshots.csv"
@@ -1162,7 +1163,7 @@ def portfolio_backtest_symbols(
     if is_v5_strategy_mode(config.strategy_mode):
         _write_candidate_funnel_daily(candidate_funnel_daily_path, funnel_by_date)
         _write_candidate_funnel_summary(candidate_funnel_summary_path, funnel_by_date)
-        _write_dict_rows(research_gate_audit_path, _research_gate_rows(candidate_signals_by_date))
+        _write_dict_rows_gzip(research_gate_audit_path, _research_gate_rows(candidate_signals_by_date))
         _write_dict_rows(candidate_selection_audit_path, selection_audit_rows)
         _write_dict_rows(pending_orders_path, pending_order_rows)
         _write_dict_rows(signal_snapshots_path, signal_snapshot_rows)
@@ -1652,6 +1653,18 @@ def _write_dict_rows(path: Path, rows: list[dict[str, str | int | float]]) -> No
         return
     fields = list(rows[0].keys())
     with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _write_dict_rows_gzip(path: Path, rows: list[dict[str, str | int | float]]) -> None:
+    if not rows:
+        path.write_bytes(b"")
+        return
+    fields = list(rows[0])
+    with gzip.open(path, "wt", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         for row in rows:
