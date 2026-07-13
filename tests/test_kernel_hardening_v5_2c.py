@@ -216,3 +216,37 @@ def test_external_mutation_does_not_change_prepared_context_or_hash(monkeypatch)
     assert context.config.initial_cash == 100000
     assert context.risk_config.max_sector_pct == 1.0
     assert stored == recomputed_before == recomputed_after
+
+
+def test_portfolio_wrapper_none_max_positions_preserves_unlimited_semantics(monkeypatch, tmp_path) -> None:
+    symbols = list(DISCRIMINATING_SYMBOLS)
+    histories = _install_fakes(monkeypatch, symbols)
+    config = BacktestConfig(initial_cash=100000, strategy_mode="strategy_v5_alpha_ranked", require_industry=False)
+    risk = RiskConfig(max_sector_pct=1.0, cash_reserve_pct=0.0)
+    sector_map = {code: "tech" for code in symbols}
+    eligible = _eligible(symbols)
+
+    omitted_dir = tmp_path / "omitted"
+    none_dir = tmp_path / "none"
+    unlimited_dir = tmp_path / "unlimited"
+    for output_dir, kwargs in (
+        (omitted_dir, {}),
+        (none_dir, {"max_positions": None}),
+        (unlimited_dir, {"max_positions": len(symbols)}),
+    ):
+        bt.portfolio_backtest_symbols(
+            list(symbols),
+            START,
+            END,
+            output_dir,
+            config=config,
+            risk_config=risk,
+            sector_map=sector_map,
+            index_rows=make_index_rows(),
+            history_loader=_loader(histories),
+            eligible_by_date=eligible,
+            **kwargs,
+        )
+
+    assert _read_outputs(omitted_dir, START, END) == _read_outputs(unlimited_dir, START, END)
+    assert _read_outputs(none_dir, START, END) == _read_outputs(unlimited_dir, START, END)

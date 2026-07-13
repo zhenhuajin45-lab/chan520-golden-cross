@@ -54,6 +54,7 @@ V5_STRATEGY_MODES = {
     "strategy_v5_alpha_ranked",
     "strategy_v5_alpha_first_fit_frozen",
 }
+AUDIT_SCHEMA_VERSION = "2"
 DEFAULT_MAX_POSITIONS = 5
 KERNEL_INSTRUMENTATION_COUNTERS = {
     "history_load_count": 0,
@@ -1392,8 +1393,6 @@ def execute_prepared_context(
         raise NotImplementedError("V5.2C kernel currently supports current_exit only")
     if not run_config.pyramiding:
         raise NotImplementedError("V5.2C kernel currently supports current pyramiding only")
-    if is_v5_strategy_mode(context.config.strategy_mode) and context.config.signal_adjust != "none":
-        raise NotImplementedError("Prepared context kernel currently supports unadjusted signal series only")
     if not context.all_dates:
         raise ValueError("PreparedBacktestContext has no trading dates")
 
@@ -2199,7 +2198,7 @@ def portfolio_backtest_symbols(
     run_config = KernelRunConfig(
         selection_policy=selection_policy_for(config),
         selection_seed=config.selection_seed,
-        max_positions=DEFAULT_MAX_POSITIONS if max_positions is None else max_positions,
+        max_positions=len(context.symbols) if max_positions is None else max_positions,
         capture_level=CaptureLevel.FULL,
     )
     result = execute_prepared_context(context, run_config, CsvArtifactSink(output_dir))

@@ -32,6 +32,31 @@ def _loader(histories: dict[str, list]):
     return loader
 
 
+def _adjusted_loader(histories: dict[str, list]):
+    def loader(code: str, _end, lookback_days: int = 1000, adjust: str = "none"):
+        rows = list(histories[code])
+        if adjust != "none":
+            rows = [
+                row.__class__(
+                    row.date,
+                    row.open * 0.8,
+                    row.close * 0.8,
+                    row.high * 0.8,
+                    row.low * 0.8,
+                    row.volume,
+                    row.amount,
+                    row.amplitude,
+                    row.pct_chg,
+                    row.change * 0.8,
+                    row.turnover,
+                )
+                for row in rows
+            ]
+        return StockMeta(code, code, 1), rows
+
+    return loader
+
+
 def _read_outputs(path: Path, start, end) -> dict[str, str]:
     names = [
         "candidate_selection_audit.csv",
@@ -140,3 +165,54 @@ def test_kernel_does_not_call_formal_portfolio_entry(monkeypatch, tmp_path) -> N
         artifact_sink=tmp_path / "kernel_direct",
         max_positions=2,
     )
+
+
+def test_adjusted_signal_formal_wrapper_matches_prepared_kernel(monkeypatch, tmp_path) -> None:
+    histories = _install_fakes(monkeypatch)
+    config = BacktestConfig(
+        initial_cash=100000,
+        strategy_mode="strategy_v5_alpha_ranked",
+        require_industry=False,
+        signal_adjust="qfq",
+    )
+    risk = RiskConfig(max_sector_pct=1.0, cash_reserve_pct=0.0)
+    eligible = {row.date: set(SYMBOLS) for row in make_rows(SYMBOLS[0]) if START <= row.date <= END}
+    loader = _adjusted_loader(histories)
+    context = prepare_backtest_context(
+        SYMBOLS[:4],
+        START,
+        END,
+        config=config,
+        risk_config=risk,
+        sector_map={code: "tech" for code in SYMBOLS},
+        index_rows=make_index_rows(),
+        history_loader=loader,
+        eligible_by_date=eligible,
+    )
+    assert context.signal_histories["600001"][0].close != context.execution_histories["600001"][0].close
+
+    formal_dir = tmp_path / "formal_adjusted"
+    kernel_dir = tmp_path / "kernel_adjusted"
+    portfolio_backtest_symbols(
+        list(context.symbols),
+        START,
+        END,
+        formal_dir,
+        config=config,
+        risk_config=risk,
+        sector_map={code: "tech" for code in SYMBOLS},
+        index_rows=make_index_rows(),
+        history_loader=loader,
+        eligible_by_date=eligible,
+        max_positions=2,
+    )
+    result = run_portfolio_kernel(
+        context,
+        selection_policy="DETERMINISTIC_RANKED",
+        artifact_sink=kernel_dir,
+        max_positions=2,
+    )
+
+    assert result.fills
+    assert result.fills[0].price > context.signal_histories[result.fills[0].code][0].open
+    assert _read_outputs(kernel_dir, START, END) == _read_outputs(formal_dir, START, END)
