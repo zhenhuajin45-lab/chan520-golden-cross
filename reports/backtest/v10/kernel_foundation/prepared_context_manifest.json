@@ -1,0 +1,19 @@
+{
+  "candidate_config_hash": "63a691afe41b4437750e7872ec178c815dcef18fc58c79e73417e03b756199fc",
+  "candidate_evidence_hash": "d4f2ce781f45d62cb905409f9a82c2689defe290638236b4a2cc65608fae9984",
+  "data_content_hash": "5ce84121838caf08033ba328c0b5449ed701cae22e0bc375a77c362346cc2615",
+  "first_trading_date": "2026-01-01",
+  "last_trading_date": "2026-03-29",
+  "ordered_symbol_hash": "7ced1a5a9a69f4f76eee2dfaa69aebb8df2344d42717f285cd25ec78acaa7a1a",
+  "prepared_context_hash": "6cf7e185d9710850c88ebf2a5f77a13a2c43f29cdbb9d393db8f847f016c35a0",
+  "requested_end": "2026-04-30",
+  "requested_start": "2026-01-01",
+  "symbols": [
+    "600001",
+    "600002",
+    "600003",
+    "600004",
+    "600005",
+    "600006"
+  ]
+}

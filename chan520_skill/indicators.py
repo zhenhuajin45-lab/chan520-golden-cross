@@ -92,12 +92,18 @@ def weekly_bars(rows: list[KLine]) -> list[KLine]:
 
 
 def sma(values: list[float], window: int) -> list[Optional[float]]:
-    out: list[Optional[float]] = []
-    for i in range(len(values)):
-        if i + 1 < window:
-            out.append(None)
-        else:
-            out.append(mean(values[i + 1 - window : i + 1]))
+    out: list[Optional[float]] = [None] * len(values)
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if len(values) < window:
+        return out
+    rolling = 0.0
+    for i, value in enumerate(values):
+        rolling += value
+        if i >= window:
+            rolling -= values[i - window]
+        if i + 1 >= window:
+            out[i] = rolling / window
     return out
 
 
@@ -173,20 +179,28 @@ def atr(rows: list[KLine], window: int) -> list[Optional[float]]:
 def volume_ratio(volumes: list[float], window: int, base: str = "prior_only") -> list[Optional[float]]:
     if base not in {"prior_only", "incl_today"}:
         raise ValueError("base must be 'prior_only' or 'incl_today'")
-    out: list[Optional[float]] = []
+    if window <= 0:
+        raise ValueError("window must be positive")
+    out: list[Optional[float]] = [None] * len(volumes)
+    rolling = 0.0
     for i, value in enumerate(volumes):
+        rolling += value
         if base == "incl_today":
             if i + 1 < window:
-                out.append(None)
                 continue
-            baseline = volumes[i + 1 - window : i + 1]
+            if i >= window:
+                rolling -= volumes[i - window]
+            base_value = rolling / window
         else:
             if i < window:
-                out.append(None)
                 continue
-            baseline = volumes[i - window : i]
-        base_value = mean(baseline)
-        out.append(value / base_value if base_value else None)
+            if i == window:
+                rolling = sum(volumes[:window])
+            else:
+                rolling += volumes[i - 1] - value
+                rolling -= volumes[i - window - 1]
+            base_value = rolling / window
+        out[i] = value / base_value if base_value else None
     return out
 
 
