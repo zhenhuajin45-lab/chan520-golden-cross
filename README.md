@@ -21,7 +21,27 @@ python -m chan520_skill backtest 600288 --start 2026-01-01 --end 2026-07-01 --sp
 python -m chan520_skill backtest --basket "600288,300568,688106,002132,603638,301282,600203,300390" --start 2026-01-01 --end 2026-07-01 --split-date 2026-04-01
 ```
 
-`backtest` 默认使用共享资金账户的纪律组合引擎：真实沪深300 regime、真实 `analyze()` 入选信号、风险预算 1%、首仓 15%、单股 20%、行业 40%、现金保留 20%、四不做、R:R>=2、延迟移动止损和金字塔加仓。当前板块门控默认关闭，仅保留行业 cap。
+`backtest` 默认使用 V4 共享资金账户引擎：D 日收盘生成信号，D+1 开盘只使用 D 日已知状态成交；默认信号和成交均使用不复权价格，避免端点前复权引入历史信息。引擎支持注入单独审计过的信号序列，但成交、现金、佣金和整手始终使用不复权价格。默认风险预算 1%、首仓 15% 加一次 5%、单股 20%、行业 40%、现金保留 20%、四不做、保守目标位和延迟移动止损。当前板块门控默认关闭，仅保留行业 cap。
+
+历史全市场回测必须传入时点股票池快照，禁止用当前股票列表替代历史股票池：
+
+```powershell
+python -m chan520_skill backtest --universe-snapshot data/universe_2024-01-01.csv --start 2024-01-01 --end 2026-07-01
+```
+
+## v5 Alpha 全市场研究框架
+
+v5 将 520 金叉降级为趋势确认，新增市场状态、动态股票池、趋势回踩入场、Alpha 评分、ATR 风控、组合引擎和板块热度轻加分。GM 真实数据只用于构建本地数据底座；后续反复回测直接读取 SQLite。
+
+```powershell
+# 1. 用 GM 缓存构建本地 SQLite 数据库（数据库文件不提交 Git）
+python scripts/gm_alpha_store.py build --cache-dir reports/backtest/v6/all --store data/gm_alpha/chan520_alpha.sqlite --start 2016-01-01 --end 2026-07-09 --universe all --sector-source industry --rebuild
+
+# 2. 从本地 SQLite 跑 2026 全市场回测
+python scripts/gm_alpha_store.py run --store data/gm_alpha/chan520_alpha.sqlite --start 2026-01-01 --end 2026-07-09 --output-dir reports/backtest/v6/store_all_2026 --lookback-days 900
+```
+
+本地库包含 `daily_bars`、`instrument_status`、`sector_map`、`dynamic_universe`、`index_bars` 等表。`data/gm_alpha/*.sqlite*` 已在 `.gitignore` 中排除；GitHub 只提交代码、脚本、测试和轻量回测报告。
 
 部署给其他机器或通过 GitHub 分发时，见 [DEPLOY.md](DEPLOY.md)。
 
@@ -65,3 +85,4 @@ https://qt.gtimg.cn/q=sh600288
 
 完整实战版规则见 [docs/practical_520_strategy.md](docs/practical_520_strategy.md)。
 回测、市场状态、行业层、风险纪律、架构和测试说明见 [docs/backtest.md](docs/backtest.md)、[docs/regime.md](docs/regime.md)、[docs/sector.md](docs/sector.md)、[docs/risk.md](docs/risk.md)、[docs/architecture.md](docs/architecture.md)、[docs/testing.md](docs/testing.md)。
+V4 固定研究篮子回测、敏感性实验和解释见 [reports/backtest/v4/README.md](reports/backtest/v4/README.md)。

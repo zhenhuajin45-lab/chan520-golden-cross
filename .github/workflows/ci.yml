@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        pythonhashseed: ["0", "1", "520", "2026", "42"]
+    env:
+      PYTHONHASHSEED: ${{ matrix.pythonhashseed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest
+      - name: Compile
+        run: python -m compileall chan520_skill scripts tests
+      - name: Diff check
+        shell: bash
+        run: |
+          if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+            git diff --check HEAD^2~1..HEAD^2
+          else
+            git diff --check HEAD~1..HEAD
+          fi
+      - name: Pytest
+        run: pytest -q

@@ -12,7 +12,7 @@
 | range 总仓位 | 50% | `RiskConfig.regime_exposure` |
 | down 总仓位 | 30% | `RiskConfig.regime_exposure` |
 | 最低现金 | 20% | `RiskConfig.cash_reserve_pct` |
-| 金字塔分档 | 5% / 15% / 30% | `RiskConfig.pyramid_steps` |
+| 金字塔分档 | 首仓15% + 一次加仓5% | `RiskConfig.first_tranche_pct` / `pyramid_increment_pcts` |
 | ATR 移动止损 | 2 * ATR14 | `RiskConfig.atr_k` |
 | 移动止损激活 | 盈利 4% 后 | `RiskConfig.trail_activation` |
 | 结构目标 ATR | 3 * ATR14 | `RiskConfig.target_atr_k` |
@@ -37,7 +37,7 @@ shares = floor(equity * risk_per_trade / (entry - stop) / lot) * lot
 - 回踩 5/10/20 日线附近止跌并放量收回。
 - 下跌不补仓，止损下方不加仓。
 
-`pyramid_steps=(0.05,0.15,0.30)` 作为后续加仓增量资金约束，`pyramid_stage` 随加仓递进。
+默认 `first_tranche_pct=0.15`，`pyramid_increment_pcts=(0.05,)`。加仓不是乘数，也不是摊低成本；首仓和加仓后的累计市值仍受单股20%和整仓风险预算约束。报告记录每笔成交费用、累计建仓次数和加仓后的总止损风险。
 
 ## 四不做
 

@@ -227,7 +227,15 @@ def slope_deg_optional(values: list[Optional[float]], window: int) -> list[Optio
         if any(value is None for value in segment):
             out.append(None)
             continue
-        out.append(slope_deg([float(value) for value in segment if value is not None], window)[-1])
+        raw = [float(value) for value in segment if value is not None]
+        base = raw[0]
+        if base == 0:
+            out.append(None)
+            continue
+        # Price-unit slopes make a 100-yuan stock look mechanically steeper
+        # than a 10-yuan stock.  Calculate the angle from normalized change.
+        normalized = [value / base * 100 for value in raw]
+        out.append(slope_deg(normalized, window)[-1])
     return out
 
 

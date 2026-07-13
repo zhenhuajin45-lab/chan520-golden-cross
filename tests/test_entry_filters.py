@@ -15,22 +15,22 @@ def point() -> IndicatorPoint:
 
 
 def test_weak_signal_rejected_in_standard_tier() -> None:
-    decision = apply_four_no_entry("观察（轻仓试探）", row(), point(), "600000", 10, 9, 13, EntryFilterConfig())
+    decision = apply_four_no_entry("observe", row(), point(), "600000", 10, 9, 13, EntryFilterConfig())
     assert not decision.ok
-    assert any("标准入选" in reason for reason in decision.reasons)
+    assert any("standard_tier_requires_entry_verdict" in reason for reason in decision.reasons)
 
 
 def test_rr_filter_rejects_low_payoff() -> None:
-    decision = apply_four_no_entry("入选", row(), point(), "600000", 10, 9, 11, EntryFilterConfig(min_rr=2))
+    decision = apply_four_no_entry("entry", row(), point(), "600000", 10, 9, 11, EntryFilterConfig(min_rr=2))
     assert not decision.ok
-    assert any("盈亏比不足" in reason for reason in decision.reasons)
+    assert any("rr_too_low" in reason for reason in decision.reasons)
 
 
 def test_acute_move_and_stop_distance_reject() -> None:
-    decision = apply_four_no_entry("入选", row(pct=8, amplitude=13), point(), "600000", 10, 8, 15, EntryFilterConfig())
+    decision = apply_four_no_entry("entry", row(pct=8, amplitude=13), point(), "600000", 10, 8, 15, EntryFilterConfig())
     assert not decision.ok
-    assert any("急涨急跌" in reason for reason in decision.reasons)
-    assert any("止损距离过大" in reason for reason in decision.reasons)
+    assert any("acute_move" in reason for reason in decision.reasons)
+    assert any("stop_distance_too_wide" in reason for reason in decision.reasons)
 
 
 def test_breakeven_win_rate() -> None:

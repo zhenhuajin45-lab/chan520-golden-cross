@@ -1,0 +1,7 @@
+﻿horizon,total_candidates,complete_count,censored_candidate_count,coverage,quality_counts
+1d,581,580,1,0.998279,missing_entry_trading_day:1|ok:580
+3d,581,579,2,0.996558,missing_entry_trading_day:1|missing_horizon_bar:1|ok:579
+5d,581,575,6,0.989673,insufficient_market_calendar:4|missing_entry_trading_day:1|missing_horizon_bar:1|ok:575
+7d,581,562,19,0.967298,insufficient_market_calendar:16|missing_entry_trading_day:1|missing_horizon_bar:2|ok:562
+10d,581,545,36,0.938038,insufficient_market_calendar:33|missing_entry_trading_day:1|missing_horizon_bar:2|ok:545
+20d,581,487,94,0.838210,insufficient_market_calendar:91|missing_entry_trading_day:1|missing_stock_bars:2|ok:487

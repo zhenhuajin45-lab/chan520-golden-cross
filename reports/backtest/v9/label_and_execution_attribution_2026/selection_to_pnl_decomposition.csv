@@ -1,0 +1,2 @@
+﻿selection,position_sizing,exit,selection_effect,sizing_effect,capacity_effect,entry_gap_effect,slippage_cost_effect,exit_effect,pyramiding_effect,note
+first_fit_vs_ranked,current_risk_sizing,current_exit,-20449.202899,0.000000,-2,0.000000,0.000000,0.000000,0.000000,V5.2B fixed-parameter attribution; no sizing or exit parameter changes.
