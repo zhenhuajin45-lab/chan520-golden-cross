@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from chan520_skill.backtest import rank_candidate_signals_by_policy
+from chan520_skill.backtest import SelectionPolicy, rank_candidate_signals_by_policy
 from scripts.selection_attribution import build_labels, label_window
 
 from .v5_1_helpers import make_candidate
@@ -81,8 +81,8 @@ def test_random_within_ties_preserves_bucket_order_and_is_seeded() -> None:
         make_candidate("600003", ranking=80, entry=70, rs=10),
     ]
 
-    first = rank_candidate_signals_by_policy(candidates, day=day, policy="RANDOM_WITHIN_TIES", seed=7)
-    second = rank_candidate_signals_by_policy(candidates, day=day, policy="RANDOM_WITHIN_TIES", seed=7)
+    first = rank_candidate_signals_by_policy(candidates, day=day, policy=SelectionPolicy.RANDOM_WITHIN_TIES, seed=7)
+    second = rank_candidate_signals_by_policy(candidates, day=day, policy=SelectionPolicy.RANDOM_WITHIN_TIES, seed=7)
 
     assert [item.code for item in first] == [item.code for item in second]
     assert first[0].code == "600001"

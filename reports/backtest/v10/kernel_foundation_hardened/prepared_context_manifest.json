@@ -1,0 +1,21 @@
+{
+  "candidate_config_hash": "a3dfbba6052ac81ef58a3aa83dcf8f4a956bb258dfabaf6de94c6695f37d8c89",
+  "eligible_universe_hash": "0b72f7119d6e98d1309d90f0dd75f599f5ed2aa82b73c9b1accde9a42fb51463",
+  "execution_bars_hash": "2fa501e5e3001984fc17fc14fa6d26c1abe9b2a3fa3e51a86ea4ac89b01453e7",
+  "first_trading_date": "2026-01-05",
+  "full_candidate_evidence_hash": "b0e5082f0121589bdae813674e6e344a0aed56e5fb2f68cfeae64449b0424583",
+  "index_rows_hash": "7d2952c4280997df088b94b0cac6b057d35b19201ca4ea18ae1483ceec774a90",
+  "last_trading_date": "2026-07-09",
+  "ordered_symbol_hash": "652ebc7a396f855514e3cdcec1c5b8b83bd5c486b0866e715a368df3f5585240",
+  "prepared_context_hash": "6d168820d7b3c700a021fe30c9e0c0d5c98c5f7349d656b7b9f1bb4930c2bb19",
+  "regime_hash": "68cd2110eec9a5f0c6644bb196bf08b30767251e143f773415ce8a66f214bca8",
+  "requested_end": "2026-07-09",
+  "requested_start": "2026-01-01",
+  "sector_exclusion_hash": "8acadcb5a4abc960a54fb26e10de7b2b4b7b84f500d46bfcda55b8388337e176",
+  "sector_heat_hash": "2b9e809e22b3139fe759af3b96171a54fbf95eea728a284baa2227fb96f9d95e",
+  "sector_map_hash": "3662d9de0dd2d4faa803d5ff0e247d88f6bcdfbc88c3292353c21be009ef843e",
+  "signal_bars_hash": "2fa501e5e3001984fc17fc14fa6d26c1abe9b2a3fa3e51a86ea4ac89b01453e7",
+  "sqlite_sha256": "3f4fe7f4c4aefd2a6e6abca98ce9b9a4a081da5c2a62eba4e75feae8ffb7f943",
+  "store": "data\\gm_alpha\\chan520_alpha.sqlite",
+  "symbol_count": 5247
+}

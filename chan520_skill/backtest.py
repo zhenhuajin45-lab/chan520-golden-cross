@@ -5,6 +5,7 @@ import gzip
 import math
 import random
 import hashlib
+import json
 from dataclasses import asdict, dataclass, replace
 from datetime import date
 from enum import Enum
@@ -62,6 +63,11 @@ KERNEL_INSTRUMENTATION_COUNTERS = {
     "candidate_analysis_count": 0,
     "sector_state_build_count": 0,
     "kernel_execution_count": 0,
+    "audit_row_count": 0,
+    "snapshot_row_count": 0,
+    "position_link_row_count": 0,
+    "bootstrap_iteration_count": 0,
+    "candidate_lookup_count": 0,
 }
 
 
@@ -298,6 +304,10 @@ class PreparedBacktestContext:
     sector_heat_by_date: MappingProxyType
     sector_heat_exclusions: tuple[dict[str, str | int], ...]
     candidate_signals_by_date: MappingProxyType
+    hard_pass_candidates_by_date: MappingProxyType
+    first_fit_candidates_by_date: MappingProxyType
+    ranked_base_candidates_by_date: MappingProxyType
+    candidate_funnel_by_date: MappingProxyType
     verdicts_by_date: MappingProxyType
     sector_states_by_date: MappingProxyType
     config: BacktestConfig
@@ -309,7 +319,16 @@ class PreparedBacktestContext:
     data_hash: str
     candidate_config_hash: str
     data_content_hash: str
+    execution_bars_hash: str
+    signal_bars_hash: str
+    index_rows_hash: str
+    eligible_universe_hash: str
+    sector_map_hash: str
+    regime_hash: str
+    sector_heat_hash: str
+    sector_exclusion_hash: str
     ordered_symbol_hash: str
+    full_candidate_evidence_hash: str
     candidate_evidence_hash: str
     prepared_context_hash: str
 
@@ -320,28 +339,53 @@ class CaptureLevel(str, Enum):
     FULL = "FULL"
 
 
+class SelectionPolicy(str, Enum):
+    FIRST_FIT_FROZEN = "FIRST_FIT_FROZEN"
+    DETERMINISTIC_RANKED = "DETERMINISTIC_RANKED"
+    RANDOM = "RANDOM"
+    RANDOM_WITHIN_TIES = "RANDOM_WITHIN_TIES"
+
+
+class MetricComputationMode(str, Enum):
+    CORE = "CORE"
+    FULL_RESEARCH = "FULL_RESEARCH"
+
+
+def parse_selection_policy(value: str | SelectionPolicy) -> SelectionPolicy:
+    if isinstance(value, SelectionPolicy):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("selection_policy must be a SelectionPolicy or string parser-boundary value")
+    normalized = value.upper()
+    try:
+        return SelectionPolicy(normalized)
+    except ValueError as exc:
+        raise ValueError("unsupported selection_policy") from exc
+
+
 @dataclass(frozen=True)
 class KernelRunConfig:
-    selection_policy: str
+    selection_policy: SelectionPolicy
     selection_seed: int
     max_positions: int
     sizing_policy: str = "current_risk_sizing"
     exit_policy: str = "current_exit"
     pyramiding: bool = True
     capture_level: CaptureLevel = CaptureLevel.FULL
+    metric_mode: MetricComputationMode = MetricComputationMode.FULL_RESEARCH
+    progress: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.selection_policy, SelectionPolicy):
+            raise ValueError("KernelRunConfig.selection_policy must be SelectionPolicy")
+        if not isinstance(self.capture_level, CaptureLevel):
+            raise ValueError("KernelRunConfig.capture_level must be CaptureLevel")
+        if not isinstance(self.metric_mode, MetricComputationMode):
+            raise ValueError("KernelRunConfig.metric_mode must be MetricComputationMode")
         if self.max_positions is None:
             raise ValueError("KernelRunConfig.max_positions must not be None")
         if self.max_positions <= 0:
             raise ValueError("KernelRunConfig.max_positions must be positive")
-        if self.selection_policy.upper() not in {
-            "FIRST_FIT_FROZEN",
-            "DETERMINISTIC_RANKED",
-            "RANDOM",
-            "RANDOM_WITHIN_TIES",
-        }:
-            raise ValueError("unsupported selection_policy")
 
 
 @dataclass
@@ -358,6 +402,10 @@ class KernelResult:
     fills_hash: str
     trades_hash: str
     kernel_run_hash: str
+    fills_economic_hash: str = ""
+    fills_full_evidence_hash: str = ""
+    trades_economic_hash: str = ""
+    trades_full_evidence_hash: str = ""
     trades_path: Path | None = None
     metrics_path: Path | None = None
     artifacts: MappingProxyType | None = None
@@ -401,7 +449,7 @@ class CsvArtifactSink:
     ) -> tuple[Path | None, Path | None, MappingProxyType]:
         config = replace(
             context.config,
-            selection_policy=run_config.selection_policy,
+            selection_policy=run_config.selection_policy.value,
             selection_seed=run_config.selection_seed,
         )
         risk_config = context.risk_config
@@ -504,50 +552,162 @@ def _dataclass_payload(value: Any) -> Any:
     return asdict(value) if hasattr(value, "__dataclass_fields__") else value
 
 
-def _hash_rows(histories: dict[str, tuple[KLine, ...]]) -> str:
-    return stable_hash_json(
-        {
-            code: [
+def _hash_update_json(digest: Any, value: Any) -> None:
+    digest.update(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8"))
+    digest.update(b"\n")
+
+
+def _hash_rows(histories: MappingProxyType | dict[str, tuple[KLine, ...]]) -> str:
+    digest = hashlib.sha256()
+    for code in sorted(histories):
+        digest.update(str(code).encode("utf-8"))
+        digest.update(b"\0")
+        for row in histories[code]:
+            digest.update(row.date.isoformat().encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.open)).encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.close)).encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.high)).encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.low)).encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.volume)).encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.amount)).encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.amplitude)).encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.pct_chg)).encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.change)).encode("ascii"))
+            digest.update(b"|")
+            digest.update(repr(float(row.turnover)).encode("ascii"))
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _hash_index_rows(rows: tuple[KLine, ...] | list[KLine]) -> str:
+    return _hash_rows({"__index__": tuple(rows)})
+
+
+def _hash_eligible_universe(eligible_by_date: MappingProxyType | dict[date, set[str] | frozenset[str]]) -> str:
+    digest = hashlib.sha256()
+    for day in sorted(eligible_by_date):
+        _hash_update_json(digest, (day.isoformat(), sorted(eligible_by_date[day])))
+    return digest.hexdigest()
+
+
+def _hash_sector_map(sector_map: MappingProxyType | dict[str, str]) -> str:
+    digest = hashlib.sha256()
+    for code in sorted(sector_map):
+        _hash_update_json(digest, (code, sector_map[code]))
+    return digest.hexdigest()
+
+
+def _hash_regime(regime_by_date: MappingProxyType | dict[date, RegimeState]) -> str:
+    digest = hashlib.sha256()
+    for day in sorted(regime_by_date):
+        regime = regime_by_date[day]
+        _hash_update_json(digest, (day.isoformat(), regime.symbol, regime.regime, regime.regime_ok, regime.detail))
+    return digest.hexdigest()
+
+
+def _hash_sector_heat(sector_heat_by_date: MappingProxyType | dict[date, dict[str, SectorAlpha]]) -> str:
+    digest = hashlib.sha256()
+    for day in sorted(sector_heat_by_date):
+        sectors = sector_heat_by_date[day]
+        for sector in sorted(sectors):
+            item = sectors[sector]
+            _hash_update_json(
+                digest,
                 (
-                    row.date.isoformat(),
-                    row.open,
-                    row.close,
-                    row.high,
-                    row.low,
-                    row.volume,
-                    row.amount,
-                    row.pct_chg,
-                )
-                for row in rows
-            ]
-            for code, rows in histories.items()
-        }
-    )
+                    day.isoformat(),
+                    sector,
+                    item.heat_score,
+                    item.member_count,
+                    item.breadth_score,
+                    item.relative_strength_score,
+                    item.amount_score,
+                    item.momentum_score,
+                ),
+            )
+    return digest.hexdigest()
 
 
-def _hash_candidate_evidence(candidate_signals_by_date: dict[str, dict[date, CandidateSignal]]) -> str:
-    return stable_hash_json(
-        [
-            {
-                "candidate_id": signal.candidate_id,
-                "code": signal.code,
-                "date": signal.date.isoformat(),
-                "hard_pass": signal.hard_pass,
-                "ranking_score": round(signal.ranking_score, 6),
-                "entry_score": round(signal.entry_score, 6),
-                "reason_codes": signal.reason_codes,
-            }
-            for code in sorted(candidate_signals_by_date)
-            for _day, signal in sorted(candidate_signals_by_date[code].items())
-        ]
-    )
+def _hash_sector_exclusions(exclusions: tuple[MappingProxyType, ...] | tuple[dict[str, str | int], ...] | list[dict[str, str | int]]) -> str:
+    digest = hashlib.sha256()
+    for row in sorted((dict(item) for item in exclusions), key=lambda item: stable_hash_json(item)):
+        _hash_update_json(digest, row)
+    return digest.hexdigest()
+
+
+def _hash_update_fields(digest: Any, fields: tuple[Any, ...]) -> None:
+    for field in fields:
+        if isinstance(field, float):
+            payload = repr(float(field))
+        elif isinstance(field, (tuple, list)):
+            payload = "\x1f".join(str(item) for item in field)
+        elif isinstance(field, date):
+            payload = field.isoformat()
+        else:
+            payload = str(field)
+        digest.update(payload.encode("utf-8"))
+        digest.update(b"|")
+    digest.update(b"\n")
+
+
+def _hash_candidate_evidence(candidate_signals_by_date: MappingProxyType | dict[str, dict[date, CandidateSignal]]) -> str:
+    digest = hashlib.sha256()
+    for code in sorted(candidate_signals_by_date):
+        for day in sorted(candidate_signals_by_date[code]):
+            signal = candidate_signals_by_date[code][day]
+            _hash_update_fields(
+                digest,
+                (
+                    signal.candidate_id,
+                    signal.code,
+                    signal.date,
+                    signal.industry,
+                    signal.market_regime,
+                    signal.eligible,
+                    signal.market_ok,
+                    signal.alpha_pass,
+                    signal.entry_pass,
+                    signal.regime_pass,
+                    signal.sector_data_status,
+                    signal.four_no_pass,
+                    signal.stop_valid,
+                    signal.rr_pass,
+                    signal.sizing_feasible,
+                    signal.hard_pass,
+                    round(signal.alpha_total, 6),
+                    round(signal.trend_score, 6),
+                    round(signal.relative_strength_score, 6),
+                    round(signal.volume_quality_score, 6),
+                    round(signal.risk_score, 6),
+                    round(signal.sector_bonus, 6),
+                    round(signal.sector_heat_score, 6),
+                    round(signal.entry_score, 6),
+                    round(signal.ranking_score, 6),
+                    round(signal.signal_close, 6),
+                    round(signal.planned_stop, 6),
+                    round(signal.planned_target, 6),
+                    round(signal.ex_ante_rr, 6),
+                    round(signal.initial_risk_cash, 6),
+                    signal.position_neutral_shares,
+                    signal.reason_codes,
+                ),
+            )
+    return digest.hexdigest()
 
 
 def _hash_kernel_run(context: PreparedBacktestContext, run_config: KernelRunConfig) -> str:
     return stable_hash_json(
         {
             "prepared_context_hash": context.prepared_context_hash,
-            "selection_policy": run_config.selection_policy,
+            "selection_policy": run_config.selection_policy.value,
             "selection_seed": run_config.selection_seed,
             "max_positions": run_config.max_positions,
             "sizing_policy": run_config.sizing_policy,
@@ -577,35 +737,36 @@ def rank_candidate_signals(candidates: list[CandidateSignal]) -> list[CandidateS
     )
 
 
-def selection_policy_for(config: BacktestConfig) -> str:
+def selection_policy_for(config: BacktestConfig) -> SelectionPolicy:
     if config.selection_policy:
-        return config.selection_policy
+        return parse_selection_policy(config.selection_policy)
     if is_ranked_v5_strategy_mode(config.strategy_mode):
-        return "DETERMINISTIC_RANKED"
+        return SelectionPolicy.DETERMINISTIC_RANKED
     if config.strategy_mode == "strategy_v5_alpha_first_fit_frozen":
-        return "FIRST_FIT_FROZEN"
-    return "FIRST_FIT_FROZEN"
+        return SelectionPolicy.FIRST_FIT_FROZEN
+    return SelectionPolicy.FIRST_FIT_FROZEN
 
 
 def rank_candidate_signals_by_policy(
     candidates: list[CandidateSignal],
     *,
     day: date,
-    policy: str,
+    policy: SelectionPolicy,
     seed: int = 0,
 ) -> list[CandidateSignal]:
-    policy = policy.upper()
-    if policy == "DETERMINISTIC_RANKED":
+    if not isinstance(policy, SelectionPolicy):
+        raise ValueError("policy must be SelectionPolicy")
+    if policy == SelectionPolicy.DETERMINISTIC_RANKED:
         return rank_candidate_signals(candidates)
-    if policy == "RANDOM":
+    if policy == SelectionPolicy.RANDOM:
         out = sorted(candidates, key=lambda item: item.code)
-        _daily_rng(seed, day, policy).shuffle(out)
+        _daily_rng(seed, day, policy.value).shuffle(out)
         return out
-    if policy == "RANDOM_WITHIN_TIES":
+    if policy == SelectionPolicy.RANDOM_WITHIN_TIES:
         ranked = rank_candidate_signals(candidates)
         out: list[CandidateSignal] = []
         pos = 0
-        rng = _daily_rng(seed, day, policy)
+        rng = _daily_rng(seed, day, policy.value)
         while pos < len(ranked):
             end = pos
             key = _ranking_tie_key(ranked[pos])
@@ -616,9 +777,9 @@ def rank_candidate_signals_by_policy(
             out.extend(bucket)
             pos = end + 1
         return out
-    if policy == "FIRST_FIT_FROZEN":
+    if policy == SelectionPolicy.FIRST_FIT_FROZEN:
         return candidates
-    raise ValueError("selection_policy must be FIRST_FIT_FROZEN, DETERMINISTIC_RANKED, RANDOM, or RANDOM_WITHIN_TIES")
+    raise ValueError("unsupported selection_policy")
 
 
 def _ranking_tie_key(signal: CandidateSignal) -> tuple[float, float, float]:
@@ -790,6 +951,72 @@ def backtest_symbols(
     return portfolio_backtest_symbols(symbols, start, end, output_dir, config=config, sector_map=sector_map)
 
 
+def _compose_prepared_context_hash(
+    *,
+    run_code_commit: str,
+    source_hash: str,
+    candidate_config_hash: str,
+    execution_bars_hash: str,
+    signal_bars_hash: str,
+    index_rows_hash: str,
+    eligible_universe_hash: str,
+    sector_map_hash: str,
+    regime_hash: str,
+    sector_heat_hash: str,
+    sector_exclusion_hash: str,
+    ordered_symbol_hash: str,
+    full_candidate_evidence_hash: str,
+    requested_start: date,
+    requested_end: date,
+    first_trading_date: date | None,
+    last_trading_date: date | None,
+) -> str:
+    return stable_hash_json(
+        {
+            "run_code_commit": run_code_commit,
+            "source_tree_hash": source_hash,
+            "candidate_config_hash": candidate_config_hash,
+            "execution_bars_hash": execution_bars_hash,
+            "signal_bars_hash": signal_bars_hash,
+            "index_rows_hash": index_rows_hash,
+            "eligible_universe_hash": eligible_universe_hash,
+            "sector_map_hash": sector_map_hash,
+            "regime_hash": regime_hash,
+            "sector_heat_hash": sector_heat_hash,
+            "sector_exclusion_hash": sector_exclusion_hash,
+            "ordered_symbol_hash": ordered_symbol_hash,
+            "full_candidate_evidence_hash": full_candidate_evidence_hash,
+            "requested_start": requested_start.isoformat(),
+            "requested_end": requested_end.isoformat(),
+            "first_trading_date": first_trading_date.isoformat() if first_trading_date else "",
+            "last_trading_date": last_trading_date.isoformat() if last_trading_date else "",
+        }
+    )
+
+
+def recompute_prepared_context_hash(context: PreparedBacktestContext) -> str:
+    execution_bars_hash = _hash_rows(context.execution_histories)
+    signal_bars_hash = execution_bars_hash if context.config.signal_adjust == "none" else _hash_rows(context.signal_histories)
+    return _compose_prepared_context_hash(
+        run_code_commit=git_commit(Path.cwd()),
+        source_hash=source_tree_hash(Path.cwd()),
+        candidate_config_hash=context.candidate_config_hash,
+        execution_bars_hash=execution_bars_hash,
+        signal_bars_hash=signal_bars_hash,
+        index_rows_hash=_hash_index_rows(context.index_rows),
+        eligible_universe_hash=_hash_eligible_universe(context.eligible_by_date),
+        sector_map_hash=_hash_sector_map(context.sector_map),
+        regime_hash=_hash_regime(context.regime_by_date),
+        sector_heat_hash=_hash_sector_heat(context.sector_heat_by_date),
+        sector_exclusion_hash=_hash_sector_exclusions(context.sector_heat_exclusions),
+        ordered_symbol_hash=stable_hash_json(list(context.symbols)),
+        full_candidate_evidence_hash=_hash_candidate_evidence(context.candidate_signals_by_date),
+        requested_start=context.requested_start,
+        requested_end=context.requested_end,
+        first_trading_date=context.first_trading_date,
+        last_trading_date=context.last_trading_date,
+    )
+
 def prepare_backtest_context(
     symbols: list[str],
     start: date,
@@ -805,7 +1032,11 @@ def prepare_backtest_context(
     config = config or BacktestConfig()
     risk_config = risk_config or RiskConfig()
     entry_config = entry_config or EntryFilterConfig()
+    config = replace(config)
+    risk_config = replace(risk_config)
+    entry_config = replace(entry_config)
     sector_map = sector_map or DEFAULT_SECTOR_MAP
+    sector_map = dict(sector_map)
     if config.signal_adjust not in {"none", "qfq", "hfq"}:
         raise ValueError("signal_adjust must be one of: none, qfq, hfq")
     if config.strategy_mode not in {"strategy_v1_baseline", "strategy_v2_modular"} | V5_STRATEGY_MODES:
@@ -957,6 +1188,27 @@ def prepare_backtest_context(
         for day in all_dates
     }
     print("precompute sectors complete", flush=True)
+    hard_pass_candidates_by_date: dict[date, tuple[CandidateSignal, ...]] = {}
+    first_fit_candidates_by_date: dict[date, tuple[CandidateSignal, ...]] = {}
+    ranked_base_candidates_by_date: dict[date, tuple[CandidateSignal, ...]] = {}
+    candidate_funnel_by_date: dict[date, dict[str, int]] = {}
+    for day in all_dates:
+        first_fit_daily = tuple(
+            signal
+            for code in signal_histories
+            for signal in [candidate_signals_by_date.get(code, {}).get(day)]
+            if signal is not None and signal.hard_pass
+        )
+        first_fit_candidates_by_date[day] = first_fit_daily
+        hard_pass_candidates_by_date[day] = first_fit_daily
+        ranked_base_candidates_by_date[day] = tuple(rank_candidate_signals(list(first_fit_daily)))
+        if is_v5_strategy_mode(config.strategy_mode):
+            candidate_funnel_by_date[day] = _candidate_funnel_for_day(
+                day,
+                signal_histories,
+                candidate_signals_by_date,
+                eligible_by_date.get(day, set(signal_histories)),
+            )
     candidate_config_hash = stable_hash_json(
         {
             "backtest_config": _dataclass_payload(config),
@@ -965,24 +1217,45 @@ def prepare_backtest_context(
             "strategy_logic_id": "strategy_v5_alpha" if is_v5_strategy_mode(config.strategy_mode) else config.strategy_mode,
         }
     )
-    data_content_hash = _hash_rows(execution_histories)
+    execution_bars_hash = _hash_rows(execution_histories)
+    signal_bars_hash = execution_bars_hash if config.signal_adjust == "none" else _hash_rows(signal_histories)
+    index_rows_hash = _hash_index_rows(tuple(index_rows))
+    eligible_universe_hash = _hash_eligible_universe(eligible_by_date)
+    sector_map_hash = _hash_sector_map(dict(sector_map))
+    regime_hash = _hash_regime(regime_by_date)
+    sector_heat_hash = _hash_sector_heat(sector_heat_by_date)
+    sector_exclusion_hash = _hash_sector_exclusions(sector_heat_exclusions)
+    data_content_hash = stable_hash_json(
+        {
+            "execution_bars_hash": execution_bars_hash,
+            "signal_bars_hash": signal_bars_hash,
+            "index_rows_hash": index_rows_hash,
+        }
+    )
+
     ordered_symbol_hash = stable_hash_json(list(signal_histories))
-    candidate_evidence_hash = _hash_candidate_evidence(candidate_signals_by_date)
+    full_candidate_evidence_hash = _hash_candidate_evidence(candidate_signals_by_date)
+    candidate_evidence_hash = full_candidate_evidence_hash
     config_hash = candidate_config_hash
     data_hash = data_content_hash
-    prepared_context_hash = stable_hash_json(
-        {
-            "run_code_commit": git_commit(Path.cwd()),
-            "source_tree_hash": source_tree_hash(Path.cwd()),
-            "candidate_config_hash": candidate_config_hash,
-            "data_content_hash": data_content_hash,
-            "ordered_symbol_hash": ordered_symbol_hash,
-            "candidate_evidence_hash": candidate_evidence_hash,
-            "requested_start": start.isoformat(),
-            "requested_end": end.isoformat(),
-            "first_trading_date": all_dates[0].isoformat() if all_dates else "",
-            "last_trading_date": all_dates[-1].isoformat() if all_dates else "",
-        }
+    prepared_context_hash = _compose_prepared_context_hash(
+        run_code_commit=git_commit(Path.cwd()),
+        source_hash=source_tree_hash(Path.cwd()),
+        candidate_config_hash=candidate_config_hash,
+        execution_bars_hash=execution_bars_hash,
+        signal_bars_hash=signal_bars_hash,
+        index_rows_hash=index_rows_hash,
+        eligible_universe_hash=eligible_universe_hash,
+        sector_map_hash=sector_map_hash,
+        regime_hash=regime_hash,
+        sector_heat_hash=sector_heat_hash,
+        sector_exclusion_hash=sector_exclusion_hash,
+        ordered_symbol_hash=ordered_symbol_hash,
+        full_candidate_evidence_hash=full_candidate_evidence_hash,
+        requested_start=start,
+        requested_end=end,
+        first_trading_date=all_dates[0] if all_dates else None,
+        last_trading_date=all_dates[-1] if all_dates else None,
     )
     return PreparedBacktestContext(
         requested_start=start,
@@ -1004,18 +1277,31 @@ def prepare_backtest_context(
         sector_heat_by_date=_freeze_daily_nested_mapping(sector_heat_by_date),
         sector_heat_exclusions=tuple(MappingProxyType(dict(row)) for row in sector_heat_exclusions),
         candidate_signals_by_date=_freeze_nested_mapping(candidate_signals_by_date),
+        hard_pass_candidates_by_date=_freeze_date_map(hard_pass_candidates_by_date),
+        first_fit_candidates_by_date=_freeze_date_map(first_fit_candidates_by_date),
+        ranked_base_candidates_by_date=_freeze_date_map(ranked_base_candidates_by_date),
+        candidate_funnel_by_date=_freeze_daily_nested_mapping(candidate_funnel_by_date),
         verdicts_by_date=_freeze_nested_mapping(verdicts_by_date),
         sector_states_by_date=_freeze_daily_nested_mapping(sector_states_by_date),
         config=config,
         risk_config=risk_config,
         entry_config=entry_config,
-        sector_map=MappingProxyType(sector_map),
+        sector_map=MappingProxyType(dict(sector_map)),
         index_rows=tuple(index_rows),
         config_hash=config_hash,
         data_hash=data_hash,
         candidate_config_hash=candidate_config_hash,
         data_content_hash=data_content_hash,
+        execution_bars_hash=execution_bars_hash,
+        signal_bars_hash=signal_bars_hash,
+        index_rows_hash=index_rows_hash,
+        eligible_universe_hash=eligible_universe_hash,
+        sector_map_hash=sector_map_hash,
+        regime_hash=regime_hash,
+        sector_heat_hash=sector_heat_hash,
+        sector_exclusion_hash=sector_exclusion_hash,
         ordered_symbol_hash=ordered_symbol_hash,
+        full_candidate_evidence_hash=full_candidate_evidence_hash,
         candidate_evidence_hash=candidate_evidence_hash,
         prepared_context_hash=prepared_context_hash,
     )
@@ -1024,7 +1310,7 @@ def prepare_backtest_context(
 def run_portfolio_kernel(
     context: PreparedBacktestContext,
     *,
-    selection_policy: str,
+    selection_policy: str | SelectionPolicy,
     selection_seed: int = 0,
     sizing_policy: str = "current_risk_sizing",
     exit_policy: str = "current_exit",
@@ -1032,15 +1318,19 @@ def run_portfolio_kernel(
     artifact_sink: ArtifactSink | Path | None = None,
     max_positions: int | None = None,
     capture_level: CaptureLevel = CaptureLevel.FULL,
+    metric_mode: MetricComputationMode | None = None,
+    progress: bool = False,
 ) -> KernelResult:
     run_config = KernelRunConfig(
-        selection_policy=selection_policy.upper(),
+        selection_policy=parse_selection_policy(selection_policy),
         selection_seed=selection_seed,
         max_positions=DEFAULT_MAX_POSITIONS if max_positions is None else max_positions,
         sizing_policy=sizing_policy,
         exit_policy=exit_policy,
         pyramiding=pyramiding,
         capture_level=capture_level,
+        metric_mode=metric_mode or (MetricComputationMode.CORE if capture_level == CaptureLevel.SUMMARY else MetricComputationMode.FULL_RESEARCH),
+        progress=progress,
     )
     if artifact_sink is None:
         sink: ArtifactSink = NullArtifactSink()
@@ -1049,6 +1339,40 @@ def run_portfolio_kernel(
     else:
         sink = artifact_sink
     return execute_prepared_context(context, run_config, sink)
+
+
+def _fills_economic_hash(fills: list[Fill]) -> str:
+    return stable_hash_json(
+        [
+            {
+                "date": fill.date.isoformat(),
+                "code": fill.code,
+                "side": fill.side,
+                "price": round(fill.price, 6),
+                "shares": fill.shares,
+                "fee": round(fill.fee, 6),
+            }
+            for fill in fills
+        ]
+    )
+
+
+def _trades_economic_hash(trades: list[Trade]) -> str:
+    return stable_hash_json(
+        [
+            {
+                "code": trade.code,
+                "entry_date": trade.entry_date.isoformat(),
+                "exit_date": trade.exit_date.isoformat(),
+                "entry_price": round(trade.entry_price, 6),
+                "exit_price": round(trade.exit_price, 6),
+                "shares": trade.shares,
+                "net_pnl": round(trade.net_pnl, 6),
+                "exit_reason": trade.exit_reason,
+            }
+            for trade in trades
+        ]
+    )
 
 
 def _rows_cache_key(rows: list[KLine]) -> tuple[int, date | None, date | None, int, int]:
@@ -1077,7 +1401,7 @@ def execute_prepared_context(
     artifact_sink = artifact_sink or NullArtifactSink()
     config = replace(
         context.config,
-        selection_policy=run_config.selection_policy,
+        selection_policy=run_config.selection_policy.value,
         selection_seed=run_config.selection_seed,
     )
     risk_config = context.risk_config
@@ -1091,6 +1415,9 @@ def execute_prepared_context(
     rows_by_date = context.rows_by_date
     verdicts_by_date = context.verdicts_by_date
     candidate_signals_by_date = context.candidate_signals_by_date
+    first_fit_candidates_by_date = context.first_fit_candidates_by_date
+    ranked_base_candidates_by_date = context.ranked_base_candidates_by_date
+    candidate_funnel_by_date = context.candidate_funnel_by_date
     eligible_by_date = context.eligible_by_date
     regime_by_date = context.regime_by_date
     sector_states_by_date = context.sector_states_by_date
@@ -1126,11 +1453,15 @@ def execute_prepared_context(
     signal_snapshot_rows: list[dict[str, str | int | float]] = []
     pending_order_rows: list[dict[str, str | int | float]] = []
     position_fill_link_rows: list[dict[str, str | int | float]] = []
+    selected_candidate_ids_list: list[str] = []
     funnel_by_date: dict[date, dict[str, int]] = {}
+    collect_full_audit = not (
+        run_config.capture_level == CaptureLevel.SUMMARY and run_config.metric_mode == MetricComputationMode.CORE
+    )
 
     previous_close_equity = config.initial_cash
     for day_idx, day in enumerate(all_dates, 1):
-        if day_idx <= 3 or day_idx % 20 == 0:
+        if run_config.progress and (day_idx <= 3 or day_idx % 20 == 0):
             print(
                 f"portfolio start day {day_idx}/{len(all_dates)} {day.isoformat()} "
                 f"positions={len(positions)} pending={len(pending)}",
@@ -1198,10 +1529,11 @@ def execute_prepared_context(
                 )
                 initial_risk_cash = pos.initial_risk_cash or max(pos.entry_price - pos.planned_stop, 0) * pos.shares
                 total_risk_cash = pos.total_committed_risk_cash or initial_risk_cash
-                _attach_trade_id_to_position_links(position_fill_link_rows, pos.position_id, trade_id)
-                position_fill_link_rows.append(
-                    _position_fill_link_row(pos, trade_id, exit_fill_id, "final_exit", pos.shares, fill, sell_cost, 0.0, order)
-                )
+                if collect_full_audit:
+                    _attach_trade_id_to_position_links(position_fill_link_rows, pos.position_id, trade_id)
+                    position_fill_link_rows.append(
+                        _position_fill_link_row(pos, trade_id, exit_fill_id, "final_exit", pos.shares, fill, sell_cost, 0.0, order)
+                    )
                 all_fill_ids = "|".join([*pos.entry_fill_ids, *pos.add_fill_ids, exit_fill_id])
                 trades.append(
                     Trade(
@@ -1329,9 +1661,10 @@ def execute_prepared_context(
                     )
                 )
                 if pos is not None:
-                    position_fill_link_rows.append(
-                        _position_fill_link_row(pos, "", fill_id, "pyramid_add", shares, fill, buy_cost, added_risk_cash, order)
-                    )
+                    if collect_full_audit:
+                        position_fill_link_rows.append(
+                            _position_fill_link_row(pos, "", fill_id, "pyramid_add", shares, fill, buy_cost, added_risk_cash, order)
+                        )
                     new_total = pos.shares + shares
                     pos.entry_price = (pos.entry_price * pos.shares + fill * shares) / new_total
                     pos.shares = new_total
@@ -1381,19 +1714,20 @@ def execute_prepared_context(
                         maximum_open_risk_cash=added_risk_cash,
                         entry_fill_ids=(fill_id,),
                     )
-                    position_fill_link_rows.append(
-                        _position_fill_link_row(
-                            positions[order.code],
-                            "",
-                            fill_id,
-                            "initial_entry",
-                            shares,
-                            fill,
-                            buy_cost,
-                            added_risk_cash,
-                            order,
+                    if collect_full_audit:
+                        position_fill_link_rows.append(
+                            _position_fill_link_row(
+                                positions[order.code],
+                                "",
+                                fill_id,
+                                "initial_entry",
+                                shares,
+                                fill,
+                                buy_cost,
+                                added_risk_cash,
+                                order,
+                            )
                         )
-                    )
                     discipline["entries"] += 1
                     if order.signal_date:
                         funnel_by_date.setdefault(order.signal_date, {})["filled"] = (
@@ -1446,7 +1780,8 @@ def execute_prepared_context(
                     initial_risk_cash=pos.initial_risk_cash,
                 )
                 pending.append(order)
-                pending_order_rows.append(_pending_order_audit_row(day, order))
+                if collect_full_audit:
+                    pending_order_rows.append(_pending_order_audit_row(day, order))
                 continue
             if row.close >= pos.target:
                 order = PendingOrder(
@@ -1468,7 +1803,8 @@ def execute_prepared_context(
                     initial_risk_cash=pos.initial_risk_cash,
                 )
                 pending.append(order)
-                pending_order_rows.append(_pending_order_audit_row(day, order))
+                if collect_full_audit:
+                    pending_order_rows.append(_pending_order_audit_row(day, order))
                 continue
             signal_row = _row_on_date(signal_histories[pos.code], day)
             if signal_row and _add_signal(pos, signal_row, signal_histories[pos.code], day, point) and not any(
@@ -1517,34 +1853,34 @@ def execute_prepared_context(
                                 initial_risk_cash=max(row.close - add_stop, 0) * shares,
                         )
                         pending.append(order)
-                        pending_order_rows.append(_pending_order_audit_row(day, order))
+                        if collect_full_audit:
+                            pending_order_rows.append(_pending_order_audit_row(day, order))
                         planned_value = row.close * shares
                         planned_cash -= planned_value
                         planned_gross += planned_value
                         planned_sector_values[pos.industry] = planned_sector_values.get(pos.industry, 0.0) + planned_value
 
         if is_v5_strategy_mode(config.strategy_mode):
-            funnel_by_date[day] = _candidate_funnel_for_day(
-                day,
-                signal_histories,
-                candidate_signals_by_date,
-                eligible_by_date.get(day, set(signal_histories)),
-            )
+            funnel_by_date[day] = dict(candidate_funnel_by_date.get(day, {}))
         entry_items = _daily_entry_items(
             day,
             signal_histories,
             candidate_signals_by_date,
             positions,
             config,
+            policy=run_config.selection_policy,
+            selection_seed=run_config.selection_seed,
+            first_fit_candidates_by_date=first_fit_candidates_by_date,
+            ranked_base_candidates_by_date=ranked_base_candidates_by_date,
         )
         for rank, code, rows, candidate_signal in entry_items:
             if code in positions or risk_state.halted_next_session or risk_state.stopped_for_drawdown:
-                if candidate_signal is not None:
+                if candidate_signal is not None and collect_full_audit:
                     selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.RISK_OR_POSITION.value, None))
                 continue
             if max_positions is not None and len(positions) + sum(1 for order in pending if order.side == "buy") >= max_positions:
-                if run_config.selection_policy != "FIRST_FIT_FROZEN":
-                    if candidate_signal is not None:
+                if run_config.selection_policy != SelectionPolicy.FIRST_FIT_FROZEN:
+                    if candidate_signal is not None and collect_full_audit:
                         selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.CAPACITY.value, None))
                         funnel_by_date.setdefault(day, {})["capacity_rejected"] = funnel_by_date.setdefault(day, {}).get("capacity_rejected", 0) + 1
                     continue
@@ -1561,7 +1897,7 @@ def execute_prepared_context(
             industry = industry_of(code, sector_map)
             if industry.startswith("UNMAPPED") and config.require_industry:
                 discipline["industry_unmapped"] += 1
-                if candidate_signal is not None:
+                if candidate_signal is not None and collect_full_audit:
                     selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.INDUSTRY_UNMAPPED.value, None))
                 continue
             sector_state = sector_states.get(industry, SectorState(industry, day, "unknown", False, 0.0, "missing"))
@@ -1571,17 +1907,17 @@ def execute_prepared_context(
             discipline["standard_signals"] += 1
             if not regime.regime_ok:
                 discipline["regime_rejected"] += 1
-                if candidate_signal is not None:
+                if candidate_signal is not None and collect_full_audit:
                     selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.REGIME_REJECTED.value, None))
                 continue
             if not sector_ok:
                 discipline["sector_rejected"] += 1
-                if candidate_signal is not None:
+                if candidate_signal is not None and collect_full_audit:
                     selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.SECTOR_REJECTED.value, None))
                 continue
             signal_row = _row_on_date(rows, day)
             if signal_row is None:
-                if candidate_signal is not None:
+                if candidate_signal is not None and collect_full_audit:
                     selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.MISSING_SIGNAL_ROW.value, None))
                 continue
             stop = _to_execution_price(_initial_stop(signal_row, point, risk_config), signal_row, row)
@@ -1591,7 +1927,7 @@ def execute_prepared_context(
             decision = apply_four_no_entry(verdict, row, point, code, row.close, stop, target, entry_config)
             if not decision.ok:
                 discipline["rejected_four_no"] += 1
-                if candidate_signal is not None:
+                if candidate_signal is not None and collect_full_audit:
                     selection_audit_rows.append(
                         _candidate_audit_row(candidate_signal, rank, False, "|".join(decision.reasons), None)
                     )
@@ -1615,7 +1951,7 @@ def execute_prepared_context(
             )
             if shares <= 0:
                 discipline["rejected_caps"] += 1
-                if candidate_signal is not None:
+                if candidate_signal is not None and collect_full_audit:
                     selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, False, ReasonCode.POSITION_CAP.value, None))
                 continue
             candidate_id = candidate_signal.candidate_id if candidate_signal is not None else stable_id("cand", day, code)
@@ -1641,13 +1977,16 @@ def execute_prepared_context(
                     initial_risk_cash=max(row.close - stop, 0) * shares,
             )
             pending.append(order)
-            pending_order_rows.append(_pending_order_audit_row(day, order))
+            if collect_full_audit:
+                pending_order_rows.append(_pending_order_audit_row(day, order))
             funnel_by_date.setdefault(day, {})["pending"] = funnel_by_date.setdefault(day, {}).get("pending", 0) + 1
             planned_value = row.close * shares
             if candidate_signal is not None:
                 order_for_audit = order
-                selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, True, "", order_for_audit))
-                signal_snapshot_rows.append(_candidate_audit_row(candidate_signal, rank, True, "", order_for_audit))
+                selected_candidate_ids_list.append(candidate_signal.candidate_id)
+                if collect_full_audit:
+                    selection_audit_rows.append(_candidate_audit_row(candidate_signal, rank, True, "", order_for_audit))
+                    signal_snapshot_rows.append(_candidate_audit_row(candidate_signal, rank, True, "", order_for_audit))
                 funnel_by_date.setdefault(day, {})["selected"] = funnel_by_date.setdefault(day, {}).get("selected", 0) + 1
             planned_cash -= planned_value
             planned_gross += planned_value
@@ -1663,7 +2002,7 @@ def execute_prepared_context(
         equity_curve.append((day, equity))
         risk_state = update_account_risk(risk_state, equity, previous_close_equity, day.isocalendar()[:2], risk_config)
         previous_close_equity = equity
-        if day_idx == len(all_dates) or day_idx % 20 == 0:
+        if run_config.progress and (day_idx == len(all_dates) or day_idx % 20 == 0):
             print(
                 f"portfolio days {day_idx}/{len(all_dates)} positions={len(positions)} "
                 f"pending={len(pending)} trades={len(trades)}",
@@ -1719,10 +2058,11 @@ def execute_prepared_context(
             cash += fill * pos.shares - sell_cost
             initial_risk_cash = pos.initial_risk_cash or max(pos.entry_price - pos.planned_stop, 0) * pos.shares
             total_risk_cash = pos.total_committed_risk_cash or initial_risk_cash
-            _attach_trade_id_to_position_links(position_fill_link_rows, pos.position_id, trade_id)
-            position_fill_link_rows.append(
-                _position_fill_link_row(pos, trade_id, exit_fill_id, "final_exit", pos.shares, fill, sell_cost, 0.0)
-            )
+            if collect_full_audit:
+                _attach_trade_id_to_position_links(position_fill_link_rows, pos.position_id, trade_id)
+                position_fill_link_rows.append(
+                    _position_fill_link_row(pos, trade_id, exit_fill_id, "final_exit", pos.shares, fill, sell_cost, 0.0)
+                )
             all_fill_ids = "|".join([*pos.entry_fill_ids, *pos.add_fill_ids, exit_fill_id])
             trades.append(
                 Trade(
@@ -1776,15 +2116,29 @@ def execute_prepared_context(
         if equity_curve:
             equity_curve[-1] = (last_day, cash)
 
-    metrics = metrics_from_trades(trades, equity_curve, config.initial_cash, 0, split_date=config.split_date)
-    annual_stats = annual_stats_from_trades(trades, equity_curve, config.initial_cash)
+    metrics = metrics_from_trades(
+        trades,
+        equity_curve,
+        config.initial_cash,
+        0,
+        split_date=config.split_date,
+        metric_mode=run_config.metric_mode,
+    )
+    annual_stats = [] if run_config.metric_mode == MetricComputationMode.CORE else annual_stats_from_trades(trades, equity_curve, config.initial_cash)
     _add_discipline_metrics(metrics, discipline)
     metrics["fill_count"] = float(len(fills))
-    selected_candidate_ids = tuple(
+    selected_candidate_ids = tuple(selected_candidate_ids_list) or tuple(
         str(row.get("candidate_id", ""))
         for row in selection_audit_rows
         if int(row.get("selected", 0)) == 1 and row.get("candidate_id")
     )
+    fills_full_hash = stable_hash_json([asdict(fill) for fill in fills])
+    trades_full_hash = stable_hash_json([asdict(trade) for trade in trades])
+    fills_economic_hash = _fills_economic_hash(fills)
+    trades_economic_hash = _trades_economic_hash(trades)
+    KERNEL_INSTRUMENTATION_COUNTERS["audit_row_count"] += len(selection_audit_rows) + len(pending_order_rows)
+    KERNEL_INSTRUMENTATION_COUNTERS["snapshot_row_count"] += len(signal_snapshot_rows)
+    KERNEL_INSTRUMENTATION_COUNTERS["position_link_row_count"] += len(position_fill_link_rows)
     result = KernelResult(
         metrics=metrics,
         selected_candidate_ids=selected_candidate_ids,
@@ -1795,9 +2149,13 @@ def execute_prepared_context(
         funnel=MappingProxyType({day: MappingProxyType(dict(values)) for day, values in funnel_by_date.items()}),
         discipline=MappingProxyType(dict(discipline)),
         selected_set_hash=stable_hash_json(sorted(selected_candidate_ids)),
-        fills_hash=stable_hash_json([asdict(fill) for fill in fills]),
-        trades_hash=stable_hash_json([asdict(trade) for trade in trades]),
+        fills_hash=fills_full_hash,
+        trades_hash=trades_full_hash,
         kernel_run_hash=_hash_kernel_run(context, run_config),
+        fills_economic_hash=fills_economic_hash,
+        fills_full_evidence_hash=fills_full_hash,
+        trades_economic_hash=trades_economic_hash,
+        trades_full_evidence_hash=trades_full_hash,
         selection_audit_rows=tuple(dict(row) for row in selection_audit_rows),
         signal_snapshot_rows=tuple(dict(row) for row in signal_snapshot_rows),
         position_fill_link_rows=tuple(dict(row) for row in position_fill_link_rows),
@@ -1885,6 +2243,7 @@ def metrics_from_trades(
     initial_cash: float = 100000.0,
     exposure_days: int = 0,
     split_date: date | None = None,
+    metric_mode: MetricComputationMode = MetricComputationMode.FULL_RESEARCH,
 ) -> dict[str, float]:
     if not equity_curve and trades:
         equity = initial_cash
@@ -1924,25 +2283,34 @@ def metrics_from_trades(
         "avg_holding_days": mean([trade.holding_days for trade in trades]) if trades else 0.0,
         "exposure": exposure_days / len(equity_curve) if equity_curve else 0.0,
     }
+    if metric_mode == MetricComputationMode.CORE:
+        metrics["turnover"] = sum(abs(trade.entry_price * trade.shares) + abs(trade.exit_price * trade.shares) for trade in trades) / initial_cash if initial_cash else 0.0
+        return metrics
+    KERNEL_INSTRUMENTATION_COUNTERS["bootstrap_iteration_count"] += 500
     lo, hi = _bootstrap_mean_ci([trade.net_pnl for trade in trades])
     metrics["expectancy_ci95_low"] = lo
     metrics["expectancy_ci95_high"] = hi
     metrics["ordinary_trade_expectancy_ci95_low"] = lo
     metrics["ordinary_trade_expectancy_ci95_high"] = hi
+    KERNEL_INSTRUMENTATION_COUNTERS["bootstrap_iteration_count"] += 2000
     cluster_lo, cluster_hi = _cluster_expectancy_ci(trades, iterations=2000)
     metrics["cluster_trade_expectancy_ci95_low"] = cluster_lo
     metrics["cluster_trade_expectancy_ci95_high"] = cluster_hi
     metrics["cluster_expectancy_ci95_low"] = cluster_lo
     metrics["cluster_expectancy_ci95_high"] = cluster_hi
+    KERNEL_INSTRUMENTATION_COUNTERS["bootstrap_iteration_count"] += 2000
     weekly_lo, weekly_hi = _weekly_total_pnl_ci(trades, iterations=2000)
     metrics["weekly_total_pnl_ci95_low"] = weekly_lo
     metrics["weekly_total_pnl_ci95_high"] = weekly_hi
+    KERNEL_INSTRUMENTATION_COUNTERS["bootstrap_iteration_count"] += 500
     sharpe_lo, sharpe_hi = _moving_block_sharpe_ci(returns)
     metrics["moving_block_sharpe_ci95_low"] = sharpe_lo
     metrics["moving_block_sharpe_ci95_high"] = sharpe_hi
+    KERNEL_INSTRUMENTATION_COUNTERS["bootstrap_iteration_count"] += 500
     cagr_lo, cagr_hi = _moving_block_cagr_ci(returns)
     metrics["moving_block_cagr_ci95_low"] = cagr_lo
     metrics["moving_block_cagr_ci95_high"] = cagr_hi
+    KERNEL_INSTRUMENTATION_COUNTERS["bootstrap_iteration_count"] += 500
     dd_lo, dd_hi = _max_drawdown_bootstrap_ci(returns)
     metrics["max_drawdown_bootstrap_ci95_low"] = dd_lo
     metrics["max_drawdown_bootstrap_ci95_high"] = dd_hi
@@ -2101,25 +2469,26 @@ def _daily_entry_items(
     candidate_signals_by_date: dict[str, dict[date, CandidateSignal]],
     positions: dict[str, Position],
     config: BacktestConfig,
+    *,
+    policy: SelectionPolicy | None = None,
+    selection_seed: int = 0,
+    first_fit_candidates_by_date: MappingProxyType | None = None,
+    ranked_base_candidates_by_date: MappingProxyType | None = None,
 ) -> list[tuple[int, str, list[KLine], CandidateSignal | None]]:
-    policy = selection_policy_for(config)
-    if is_v5_strategy_mode(config.strategy_mode) and policy != "FIRST_FIT_FROZEN":
-        candidates = [
-            signal
-            for code, signals in candidate_signals_by_date.items()
-            if code not in positions
-            for signal in [signals.get(day)]
-            if signal is not None and signal.hard_pass
-        ]
-        ranked = rank_candidate_signals_by_policy(
-            candidates,
-            day=day,
-            policy=policy,
-            seed=config.selection_seed,
-        )
+    policy = policy or selection_policy_for(config)
+    if is_v5_strategy_mode(config.strategy_mode):
+        if policy == SelectionPolicy.FIRST_FIT_FROZEN:
+            candidates = list((first_fit_candidates_by_date or {}).get(day, ()))
+        elif policy == SelectionPolicy.DETERMINISTIC_RANKED:
+            candidates = list((ranked_base_candidates_by_date or {}).get(day, ()))
+        else:
+            candidates = list((ranked_base_candidates_by_date or {}).get(day, ()))
+            candidates = rank_candidate_signals_by_policy(candidates, day=day, policy=policy, seed=selection_seed)
+        candidates = [signal for signal in candidates if signal.code not in positions]
+        KERNEL_INSTRUMENTATION_COUNTERS["candidate_lookup_count"] += len(candidates)
         return [
             (rank, signal.code, signal_histories[signal.code], signal)
-            for rank, signal in enumerate(ranked, 1)
+            for rank, signal in enumerate(candidates, 1)
         ]
     return [
         (rank, code, rows, candidate_signals_by_date.get(code, {}).get(day))

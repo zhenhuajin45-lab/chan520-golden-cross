@@ -1,0 +1,29 @@
+{
+  "artifact_bytes": 0,
+  "bootstrap_iteration_count": 0,
+  "candidate_lookup_count": 57178,
+  "context_hash_after": "6d168820d7b3c700a021fe30c9e0c0d5c98c5f7349d656b7b9f1bb4930c2bb19",
+  "context_hash_before": "6d168820d7b3c700a021fe30c9e0c0d5c98c5f7349d656b7b9f1bb4930c2bb19",
+  "counters_after_100_seed": {
+    "audit_row_count": 0,
+    "bootstrap_iteration_count": 0,
+    "candidate_analysis_count": 0,
+    "candidate_lookup_count": 57178,
+    "history_load_count": 0,
+    "indicator_build_count": 0,
+    "kernel_execution_count": 100,
+    "position_link_row_count": 0,
+    "regime_build_count": 0,
+    "sector_heat_build_count": 0,
+    "sector_state_build_count": 0,
+    "snapshot_row_count": 0
+  },
+  "kernel_p50_seconds": 1.517104600001403,
+  "kernel_p95_seconds": 2.000649199999316,
+  "memory_backend": "tracemalloc_lower_bound_psutil_missing",
+  "peak_process_rss_mb": 4944.25438785553,
+  "peak_tracemalloc_mb": 4944.25438785553,
+  "prepare_seconds": 2625.005502600001,
+  "random_core_summary_seed_runs": 100,
+  "working_set_peak_mb": 4944.25438785553
+}
