@@ -8,6 +8,7 @@ import shutil
 import statistics
 import sys
 import time
+from types import SimpleNamespace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,10 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
-import psutil
+try:  # psutil is optional; CI intentionally installs only pytest.
+    import psutil  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - exercised in minimal CI images.
+    psutil = None
 
 from chan520_skill.backtest import (
     BacktestConfig,
@@ -68,6 +72,37 @@ CSV_FIELDS = (
 )
 
 
+class _ProcessProbe:
+    def __init__(self, process: Any | None, backend: str) -> None:
+        self._process = process
+        self.backend = backend
+
+    def memory_info(self) -> Any:
+        if self._process is not None:
+            return self._process.memory_info()
+        rss = _resource_rss_bytes()
+        return SimpleNamespace(rss=rss, peak_wset=rss)
+
+
+def _process_probe() -> _ProcessProbe:
+    if psutil is not None:
+        return _ProcessProbe(psutil.Process(), f"psutil {psutil.__version__}")
+    return _ProcessProbe(None, "resource-fallback")
+
+
+def _resource_rss_bytes() -> int:
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # Linux reports ru_maxrss in KiB; macOS reports bytes. GitHub Linux CI
+        # and this research runner both use the Linux convention.
+        value = int(getattr(usage, "ru_maxrss", 0))
+        return max(value, 0) * 1024
+    except Exception:
+        return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run execution-faithful V5.2C Monte Carlo evidence")
     parser.add_argument("--store", default="data/gm_alpha/chan520_alpha.sqlite")
@@ -91,7 +126,7 @@ def main() -> int:
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
 
-    process = psutil.Process()
+    process = _process_probe()
     started = time.perf_counter()
     store = Path(args.store)
     sqlite_sha = sha256_file(store)
@@ -184,7 +219,7 @@ def main() -> int:
         "total_seconds": total_seconds,
         "peak_process_rss_mb": rss,
         "working_set_peak_mb": peak_wset,
-        "memory_backend": f"psutil {psutil.__version__}",
+        "memory_backend": process.backend,
         "prepared_context_hash": context.prepared_context_hash,
         "random_distribution_sha256": sha256_file(out / "random_distribution.csv") if (out / "random_distribution.csv").exists() else "",
         "tie_distribution_sha256": sha256_file(out / "tie_distribution.csv") if (out / "tie_distribution.csv").exists() else "",
@@ -353,7 +388,7 @@ def _run_policy_distribution(
     csv_path: Path,
     checkpoint_path: Path,
     checkpoint_every: int,
-    process: psutil.Process,
+    process: Any,
 ) -> list[dict[str, Any]]:
     rows = [row for row in existing if row.get("policy") == policy.value and int(row.get("seed", -1)) < seeds]
     done = {int(row["seed"]) for row in rows}
