@@ -1,7 +1,7 @@
 {
-  "completed_random": 500,
+  "completed_random": 1000,
   "completed_tie": 500,
   "last_policy": "RANDOM_WITHIN_TIES",
-  "rss_mb": 6255.6328125,
-  "timestamp_epoch": 1783945285.2084727
+  "rss_mb": 0.0,
+  "timestamp_epoch": 1783988612.7827604
 }

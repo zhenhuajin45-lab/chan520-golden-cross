@@ -8,7 +8,6 @@ import shutil
 import statistics
 import sys
 import time
-from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -29,7 +28,7 @@ from chan520_skill.backtest import (
     prepare_backtest_context,
     run_portfolio_kernel,
 )
-from chan520_skill.evidence_manifest import sha256_file, stable_hash_json
+from chan520_skill.evidence_manifest import git_commit, git_dirty, sha256_file, source_tree_hash, stable_hash_json
 from chan520_skill.models import StockMeta
 from chan520_skill.portfolio_engine import PortfolioEngineConfig
 from chan520_skill.risk import RiskConfig
@@ -81,9 +80,13 @@ def main() -> int:
     parser.add_argument("--tie-seeds", type=int, default=500)
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--finalize-existing", action="store_true")
     args = parser.parse_args()
 
     out = Path(args.output_dir)
+    if args.finalize_existing:
+        finalize_existing_evidence(out, args.random_seeds, args.tie_seeds)
+        return 0
     if args.force and out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -120,8 +123,18 @@ def main() -> int:
         flush=True,
     )
 
-    random_rows = _load_rows(out / "random_distribution.csv")
-    tie_rows = _load_rows(out / "tie_distribution.csv")
+    random_rows = _load_and_validate_rows(
+        out / "random_distribution.csv",
+        SelectionPolicy.RANDOM,
+        args.random_seeds,
+        context.prepared_context_hash,
+    )
+    tie_rows = _load_and_validate_rows(
+        out / "tie_distribution.csv",
+        SelectionPolicy.RANDOM_WITHIN_TIES,
+        args.tie_seeds,
+        context.prepared_context_hash,
+    )
     random_rows = _run_policy_distribution(
         context=context,
         policy=SelectionPolicy.RANDOM,
@@ -150,6 +163,8 @@ def main() -> int:
     total_seconds = time.perf_counter() - started
     rss = process.memory_info().rss / 1024 / 1024
     peak_wset = getattr(process.memory_info(), "peak_wset", process.memory_info().rss) / 1024 / 1024
+    random_integrity = distribution_integrity(random_rows, SelectionPolicy.RANDOM, args.random_seeds, context.prepared_context_hash)
+    tie_integrity = distribution_integrity(tie_rows, SelectionPolicy.RANDOM_WITHIN_TIES, args.tie_seeds, context.prepared_context_hash)
     manifest = {
         "stage": "V5.2C Phase 4 execution-faithful Monte Carlo",
         "strategy_mode": "strategy_v5_alpha_ranked",
@@ -171,6 +186,19 @@ def main() -> int:
         "working_set_peak_mb": peak_wset,
         "memory_backend": f"psutil {psutil.__version__}",
         "prepared_context_hash": context.prepared_context_hash,
+        "random_distribution_sha256": sha256_file(out / "random_distribution.csv") if (out / "random_distribution.csv").exists() else "",
+        "tie_distribution_sha256": sha256_file(out / "tie_distribution.csv") if (out / "tie_distribution.csv").exists() else "",
+        "random_seed_min": random_integrity["seed_min"],
+        "random_seed_max": random_integrity["seed_max"],
+        "tie_seed_min": tie_integrity["seed_min"],
+        "tie_seed_max": tie_integrity["seed_max"],
+        "run_code_commit": git_commit(Path.cwd()),
+        "source_tree_hash": source_tree_hash(Path.cwd()),
+        "git_dirty": git_dirty(Path.cwd()),
+        "distribution_integrity": {
+            "random": random_integrity,
+            "tie": tie_integrity,
+        },
         "candidate_config_hash": context.candidate_config_hash,
         "ordered_symbol_hash": context.ordered_symbol_hash,
         "eligible_universe_hash": context.eligible_universe_hash,
@@ -182,11 +210,68 @@ def main() -> int:
         "tie_summary": tie_summary,
     }
     _write_json_atomic(out / "monte_carlo_manifest.json", manifest)
+    _write_checkpoint(
+        out / "checkpoint_manifest.json",
+        _checkpoint_counts(out, process.memory_info().rss / 1024 / 1024),
+    )
     _write_summary_md(out / "random_summary.md", "RANDOM", random_summary, ranked, first_fit)
     _write_summary_md(out / "tie_summary.md", "RANDOM_WITHIN_TIES", tie_summary, ranked, first_fit)
     _write_conditional_report(out / "conditional_randomization_report.md", manifest)
     print(f"monte carlo complete out={out}", flush=True)
     return 0
+
+
+def finalize_existing_evidence(out: Path, random_seeds: int, tie_seeds: int) -> None:
+    manifest_path = out / "monte_carlo_manifest.json"
+    if not manifest_path.exists():
+        raise SystemExit(f"Missing manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    prepared_context_hash = manifest["prepared_context_hash"]
+    ranked = manifest["baseline_ranked"]
+    first_fit = manifest["baseline_first_fit_counterfactual"]
+    random_rows = _load_and_validate_rows(
+        out / "random_distribution.csv",
+        SelectionPolicy.RANDOM,
+        random_seeds,
+        prepared_context_hash,
+    )
+    tie_rows = _load_and_validate_rows(
+        out / "tie_distribution.csv",
+        SelectionPolicy.RANDOM_WITHIN_TIES,
+        tie_seeds,
+        prepared_context_hash,
+    )
+    _write_csv_atomic(out / "random_distribution.csv", random_rows)
+    _write_csv_atomic(out / "tie_distribution.csv", tie_rows)
+    random_summary = _distribution_summary(random_rows, ranked, first_fit)
+    tie_summary = _distribution_summary(tie_rows, ranked, first_fit)
+    random_integrity = distribution_integrity(random_rows, SelectionPolicy.RANDOM, random_seeds, prepared_context_hash)
+    tie_integrity = distribution_integrity(tie_rows, SelectionPolicy.RANDOM_WITHIN_TIES, tie_seeds, prepared_context_hash)
+    manifest.update(
+        {
+            "random_summary": random_summary,
+            "tie_summary": tie_summary,
+            "random_distribution_sha256": sha256_file(out / "random_distribution.csv"),
+            "tie_distribution_sha256": sha256_file(out / "tie_distribution.csv"),
+            "random_seed_min": random_integrity["seed_min"],
+            "random_seed_max": random_integrity["seed_max"],
+            "tie_seed_min": tie_integrity["seed_min"],
+            "tie_seed_max": tie_integrity["seed_max"],
+            "run_code_commit": git_commit(Path.cwd()),
+            "source_tree_hash": source_tree_hash(Path.cwd()),
+            "git_dirty": git_dirty(Path.cwd()),
+            "distribution_integrity": {
+                "random": random_integrity,
+                "tie": tie_integrity,
+            },
+        }
+    )
+    _write_json_atomic(manifest_path, manifest)
+    _write_checkpoint(out / "checkpoint_manifest.json", _checkpoint_counts(out, 0.0))
+    _write_summary_md(out / "random_summary.md", "RANDOM", random_summary, ranked, first_fit)
+    _write_summary_md(out / "tie_summary.md", "RANDOM_WITHIN_TIES", tie_summary, ranked, first_fit)
+    _write_conditional_report(out / "conditional_randomization_report.md", manifest)
+    print(f"finalized existing Monte Carlo evidence out={out}", flush=True)
 
 
 def _loader(data):
@@ -284,16 +369,20 @@ def _run_policy_distribution(
             _write_csv_atomic(csv_path, rows)
             _write_checkpoint(
                 checkpoint_path,
-                {
-                    "last_policy": policy.value,
-                    "completed_random": _completed_count(csv_path),
-                    "completed_tie": _completed_count(checkpoint_path.parent / "tie_distribution.csv"),
-                    "rss_mb": process.memory_info().rss / 1024 / 1024,
-                    "timestamp_epoch": time.time(),
-                },
+                {"last_policy": policy.value, **_checkpoint_counts(checkpoint_path.parent, process.memory_info().rss / 1024 / 1024)},
             )
             print(f"{policy.value} checkpoint {count}/{seeds}", flush=True)
     return rows
+
+
+def _load_and_validate_rows(path: Path, policy: SelectionPolicy, seeds: int, prepared_context_hash: str) -> list[dict[str, Any]]:
+    rows = _load_rows(path)
+    if not rows:
+        return []
+    deduped, integrity = validate_distribution_rows(rows, policy, seeds, prepared_context_hash)
+    if integrity["context_mismatch_count"] or integrity["out_of_range_seed_count"] or integrity["policy_mismatch_count"]:
+        raise SystemExit(f"Invalid existing distribution {path}: {integrity}")
+    return deduped
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -310,6 +399,64 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
             else:
                 row[key] = _finite_float(row.get(key, 0.0))
     return rows
+
+
+def validate_distribution_rows(
+    rows: list[dict[str, Any]],
+    policy: SelectionPolicy,
+    seeds: int,
+    prepared_context_hash: str,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    by_seed: dict[int, dict[str, Any]] = {}
+    duplicate_seed_count = 0
+    out_of_range_seed_count = 0
+    context_mismatch_count = 0
+    policy_mismatch_count = 0
+    for row in rows:
+        seed = int(row.get("seed", -1))
+        if row.get("policy") != policy.value:
+            policy_mismatch_count += 1
+            continue
+        if seed < 0 or seed >= seeds:
+            out_of_range_seed_count += 1
+            continue
+        if row.get("prepared_context_hash") != prepared_context_hash:
+            context_mismatch_count += 1
+            continue
+        if seed in by_seed:
+            duplicate_seed_count += 1
+            if stable_hash_json(row) != stable_hash_json(by_seed[seed]):
+                raise SystemExit(f"Duplicate seed has conflicting payload policy={policy.value} seed={seed}")
+            continue
+        by_seed[seed] = row
+    deduped = [by_seed[seed] for seed in sorted(by_seed)]
+    missing_seed_count = seeds - len(by_seed)
+    integrity = {
+        "missing_seed_count": missing_seed_count,
+        "duplicate_seed_count": duplicate_seed_count,
+        "out_of_range_seed_count": out_of_range_seed_count,
+        "context_mismatch_count": context_mismatch_count,
+        "policy_mismatch_count": policy_mismatch_count,
+    }
+    return deduped, integrity
+
+
+def distribution_integrity(
+    rows: list[dict[str, Any]],
+    policy: SelectionPolicy,
+    seeds: int,
+    prepared_context_hash: str,
+) -> dict[str, int | str]:
+    deduped, integrity = validate_distribution_rows(rows, policy, seeds, prepared_context_hash)
+    seed_values = [int(row["seed"]) for row in deduped]
+    return {
+        **integrity,
+        "policy": policy.value,
+        "expected_seed_count": seeds,
+        "row_count": len(deduped),
+        "seed_min": min(seed_values) if seed_values else -1,
+        "seed_max": max(seed_values) if seed_values else -1,
+    }
 
 
 def _write_csv_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -340,6 +487,15 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 def _completed_count(path: Path) -> int:
     return len(_load_rows(path)) if path.exists() else 0
+
+
+def _checkpoint_counts(out: Path, rss_mb: float) -> dict[str, Any]:
+    return {
+        "completed_random": _completed_count(out / "random_distribution.csv"),
+        "completed_tie": _completed_count(out / "tie_distribution.csv"),
+        "rss_mb": rss_mb,
+        "timestamp_epoch": time.time(),
+    }
 
 
 def _distribution_summary(rows: list[dict[str, Any]], ranked: dict[str, Any], first_fit: dict[str, Any]) -> dict[str, Any]:
@@ -396,7 +552,7 @@ def _percentile_of_value(values: list[float], value: float) -> float:
 def _p_ge(values: list[float], value: float) -> float:
     if not values:
         return 0.0
-    return sum(1 for item in values if item >= value) / len(values)
+    return (sum(1 for item in values if item >= value) + 1) / (len(values) + 1)
 
 
 def _baseline_payload(row: dict[str, Any]) -> dict[str, Any]:

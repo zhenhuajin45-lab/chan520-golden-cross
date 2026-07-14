@@ -12,10 +12,10 @@
 | avg selected overlap with ranked | 0.418752 |
 | ranked total_return | 0.001747 |
 | ranked percentile | 0.076000 |
-| ranked one-sided p(random >= ranked) | 0.924000 |
+| ranked one-sided p(random >= ranked) | 0.924076 |
 | first-fit total_return | 0.206239 |
 | first-fit percentile | 0.737000 |
-| first-fit one-sided p(random >= first-fit) | 0.263000 |
+| first-fit one-sided p(random >= first-fit) | 0.263736 |
 
 | Distribution | min | p05 | median | mean | p95 | max | std |
 |---|---:|---:|---:|---:|---:|---:|---:|

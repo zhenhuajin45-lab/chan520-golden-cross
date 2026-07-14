@@ -18,7 +18,7 @@ This evidence tests whether ranked selection adds value after the 2026 hard-pass
 ## Ranked vs Random
 
 - Ranked total_return percentile against RANDOM: `0.076000`
-- One-sided p(random >= ranked): `0.924000`
+- One-sided p(random >= ranked): `0.924076`
 - RANDOM median total_return: `0.134514`
 
 ## Tie-Bucket Sensitivity
