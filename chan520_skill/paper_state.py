@@ -215,6 +215,138 @@ class MissingPositionMark(RuntimeError):
     """Raised when close reconciliation lacks a D close mark for an active position."""
 
 
+@dataclass(frozen=True)
+class CanonicalPosition:
+    position_id: str
+    code: str
+    shares: int
+    average_price: float = 0.0
+    entry_price: float = 0.0
+    stop: float = 0.0
+    target: float = 0.0
+    highest_high: float = 0.0
+    pyramid_stage: int = 0
+    entry_costs: float = 0.0
+    risk_cash: float = 0.0
+    entry_date: str = ""
+    last_fill_id: str = ""
+    last_fill_side: str = ""
+
+    @classmethod
+    def from_payload(cls, key: str, payload: Any) -> "CanonicalPosition":
+        if isinstance(payload, cls):
+            return payload
+        if not isinstance(payload, dict):
+            return cls(position_id=str(key), code=str(key), shares=int(float(payload or 0)))
+        return cls(
+            position_id=str(payload.get("position_id") or key),
+            code=str(payload.get("code") or key),
+            shares=int(float(payload.get("shares", 0) or 0)),
+            average_price=float(payload.get("average_price", 0.0) or 0.0),
+            entry_price=float(payload.get("entry_price", payload.get("average_price", 0.0)) or 0.0),
+            stop=float(payload.get("stop", 0.0) or 0.0),
+            target=float(payload.get("target", 0.0) or 0.0),
+            highest_high=float(payload.get("highest_high", 0.0) or 0.0),
+            pyramid_stage=int(float(payload.get("pyramid_stage", 0) or 0)),
+            entry_costs=float(payload.get("entry_costs", 0.0) or 0.0),
+            risk_cash=float(payload.get("risk_cash", payload.get("initial_risk_cash", 0.0)) or 0.0),
+            entry_date=str(payload.get("entry_date", "") or ""),
+            last_fill_id=str(payload.get("last_fill_id", "") or ""),
+            last_fill_side=str(payload.get("last_fill_side", "") or ""),
+        )
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CanonicalPendingOrder:
+    pending_order_id: str
+    order_intent_id: str = ""
+    candidate_id: str = ""
+    decision_date: str = ""
+    code: str = ""
+    side: str = ""
+    reason: str = ""
+    shares: int = 0
+    requested_shares: int = 0
+    signal_close: float = 0.0
+    planned_stop: float = 0.0
+    planned_target: float = 0.0
+    rr: float = 0.0
+    initial_risk_cash: float = 0.0
+
+    @classmethod
+    def from_payload(cls, key: str, payload: Any) -> "CanonicalPendingOrder":
+        if isinstance(payload, cls):
+            return payload
+        if not isinstance(payload, dict):
+            return cls(pending_order_id=str(key), side=str(payload or ""))
+        return cls(
+            pending_order_id=str(payload.get("pending_order_id") or key),
+            order_intent_id=str(payload.get("order_intent_id", "") or ""),
+            candidate_id=str(payload.get("candidate_id", "") or ""),
+            decision_date=str(payload.get("decision_date", "") or ""),
+            code=str(payload.get("code", "") or ""),
+            side=str(payload.get("side", "") or ""),
+            reason=str(payload.get("reason", "") or ""),
+            shares=int(float(payload.get("shares", 0) or 0)),
+            requested_shares=int(float(payload.get("requested_shares", payload.get("shares", 0)) or 0)),
+            signal_close=float(payload.get("signal_close", 0.0) or 0.0),
+            planned_stop=float(payload.get("planned_stop", payload.get("stop", 0.0)) or 0.0),
+            planned_target=float(payload.get("planned_target", payload.get("target", 0.0)) or 0.0),
+            rr=float(payload.get("rr", 0.0) or 0.0),
+            initial_risk_cash=float(payload.get("initial_risk_cash", 0.0) or 0.0),
+        )
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CanonicalRiskState:
+    peak_equity: float = 0.0
+    daily_loss: float = 0.0
+    weekly_loss: float = 0.0
+    active_week: str = ""
+    active_week_size_multiplier: float = 1.0
+    halted_next_session: bool = False
+    stopped_for_drawdown: bool = False
+    previous_close_equity: float = 0.0
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "CanonicalRiskState":
+        source = dict(payload) if isinstance(payload, dict) else {}
+        known = {
+            "peak_equity",
+            "daily_loss",
+            "weekly_loss",
+            "active_week",
+            "active_week_size_multiplier",
+            "halted_next_session",
+            "stopped_for_drawdown",
+            "previous_close_equity",
+        }
+        return cls(
+            peak_equity=float(source.get("peak_equity", 0.0) or 0.0),
+            daily_loss=float(source.get("daily_loss", 0.0) or 0.0),
+            weekly_loss=float(source.get("weekly_loss", 0.0) or 0.0),
+            active_week=str(source.get("active_week", "") or ""),
+            active_week_size_multiplier=float(source.get("active_week_size_multiplier", 1.0) or 1.0),
+            halted_next_session=bool(source.get("halted_next_session", False)),
+            stopped_for_drawdown=bool(source.get("stopped_for_drawdown", False)),
+            previous_close_equity=float(source.get("previous_close_equity", 0.0) or 0.0),
+            extras={str(key): value for key, value in source.items() if key not in known},
+        )
+
+    def as_payload(self) -> dict[str, Any]:
+        payload = asdict(self)
+        extras = payload.pop("extras")
+        payload.update(extras)
+        return payload
+
+
 def process_session_open(
     state: PortfolioState,
     session_input: SessionInput,
@@ -1265,9 +1397,9 @@ class PaperStateStore:
                 state_before_hash,
                 state_after_hash,
                 float(state.cash),
-                _json(state.positions),
-                _json(state.pending_orders),
-                _json(state.risk_state),
+                _json(_canonical_positions_payload(state.positions)),
+                _json(_canonical_pending_orders_payload(state.pending_orders)),
+                _json(CanonicalRiskState.from_payload(state.risk_state).as_payload()),
                 float(state.previous_close_equity),
                 state.strategy_commit,
                 state.full_config_hash,
@@ -1351,8 +1483,25 @@ def state_payload(state: PortfolioState) -> dict[str, Any]:
     payload = asdict(state)
     if state.last_session_date:
         payload["last_session_date"] = state.last_session_date.isoformat()
+    payload["positions"] = _canonical_positions_payload(state.positions)
+    payload["pending_orders"] = _canonical_pending_orders_payload(state.pending_orders)
+    payload["risk_state"] = CanonicalRiskState.from_payload(state.risk_state).as_payload()
     payload.pop("last_processed_date", None)
     return payload
+
+
+def _canonical_positions_payload(positions: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(key): CanonicalPosition.from_payload(str(key), value).as_payload()
+        for key, value in sorted(positions.items(), key=lambda item: str(item[0]))
+    }
+
+
+def _canonical_pending_orders_payload(pending_orders: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(key): CanonicalPendingOrder.from_payload(str(key), value).as_payload()
+        for key, value in sorted(pending_orders.items(), key=lambda item: str(item[0]))
+    }
 
 
 def _identity_normalize(value: Any) -> Any:

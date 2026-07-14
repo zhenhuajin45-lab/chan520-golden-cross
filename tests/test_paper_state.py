@@ -18,6 +18,7 @@ from chan520_skill.paper_state import (
     build_paper_session_identity,
     process_session_close,
     process_session_open,
+    state_payload,
 )
 
 
@@ -576,3 +577,43 @@ def test_history_rewrite_rejected(tmp_path):
             store.persist_session_result("run1", day, "open", before, result)
     finally:
         store.close()
+
+
+def test_canonical_state_payload_normalizes_positions_pending_and_risk():
+    state = portfolio_state()
+    state.positions = {
+        "600288": 100,
+        "pos2": {
+            "position_id": "pos2",
+            "code": "000001",
+            "shares": "200",
+            "average_price": "10.5",
+            "entry_date": "2026-01-05",
+        },
+    }
+    state.pending_orders = {
+        "pend1": "buy",
+        "pend2": {
+            "pending_order_id": "pend2",
+            "order_intent_id": "intent2",
+            "code": "000001",
+            "side": "sell",
+            "shares": "200",
+        },
+    }
+    state.risk_state = {
+        "peak_equity": "100000",
+        "halted_next_session": False,
+        "history_chain_hash": "kept-as-extra",
+    }
+
+    payload = state_payload(state)
+
+    assert payload["positions"]["600288"]["position_id"] == "600288"
+    assert payload["positions"]["600288"]["shares"] == 100
+    assert payload["positions"]["pos2"]["average_price"] == 10.5
+    assert payload["pending_orders"]["pend1"]["pending_order_id"] == "pend1"
+    assert payload["pending_orders"]["pend1"]["side"] == "buy"
+    assert payload["pending_orders"]["pend2"]["shares"] == 200
+    assert payload["risk_state"]["peak_equity"] == 100000.0
+    assert payload["risk_state"]["history_chain_hash"] == "kept-as-extra"
