@@ -29,6 +29,7 @@ data/paper/*.sqlite-shm
 # Local scratch files
 tmp/
 *.log
+config/local_*.json
 
 # OS/editor
 .DS_Store
