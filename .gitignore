@@ -22,6 +22,9 @@ reports/backtest/**/*.pkl
 data/gm_alpha/*.sqlite*
 data/gm_alpha/*.sqlite-wal
 data/gm_alpha/*.sqlite-shm
+data/paper/*.sqlite*
+data/paper/*.sqlite-wal
+data/paper/*.sqlite-shm
 
 # Local scratch files
 tmp/
