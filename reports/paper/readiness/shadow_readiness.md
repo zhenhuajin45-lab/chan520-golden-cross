@@ -25,6 +25,7 @@
     "ledger_events": 15,
     "order_intents": 8,
     "paper_runs": 1,
+    "paper_session_attempts": 0,
     "paper_sessions": 10,
     "pending_orders": 8,
     "portfolio_state_snapshots": 10,

@@ -23,20 +23,24 @@ from chan520_skill.backtest import (
     AUDIT_SCHEMA_VERSION,
     BacktestConfig,
     CaptureLevel,
+    KernelRunConfig,
     MetricComputationMode,
     SelectionPolicy,
     prepare_backtest_context,
     run_portfolio_kernel,
 )
-from chan520_skill.evidence_manifest import git_commit, sha256_file, source_tree_hash, stable_hash_json
+from chan520_skill.evidence_manifest import git_commit, sha256_file, stable_hash_json
 from chan520_skill.models import StockMeta
 from chan520_skill.paper_state import (
     DATA_POLICY_VERSION,
     PAPER_STATE_VERSION,
     IdempotencyConflict,
+    PaperRunIdentity,
     PaperStateStore,
     PortfolioState,
     SessionInput,
+    TerminationPolicy,
+    build_paper_run_identity,
     process_session_close,
     process_session_open,
 )
@@ -56,7 +60,7 @@ READINESS_DIR = Path("reports/paper/readiness")
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run chan520 shadow paper state machine")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("init", "replay", "report"):
+    for name in ("init", "create-store", "create-run", "replay", "report"):
         add_common(sub.add_parser(name))
     for name in ("open", "close", "reconcile"):
         cmd = sub.add_parser(name)
@@ -64,8 +68,11 @@ def main() -> int:
         cmd.add_argument("--date", required=True)
     args = parser.parse_args()
 
-    if args.cmd == "init":
-        init_store(args)
+    if args.cmd in {"init", "create-store"}:
+        create_store(args)
+        return 0
+    if args.cmd == "create-run":
+        create_run(args)
         return 0
     if args.cmd == "replay":
         return replay(args)
@@ -92,29 +99,49 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-config-hash", default="")
 
 
-def init_store(args: argparse.Namespace) -> None:
+def create_store(args: argparse.Namespace) -> None:
     path = Path(args.paper_store)
     if args.force and path.exists():
         path.unlink()
     if args.dry_run:
-        print(f"dry-run init would initialize {path}", flush=True)
+        print(f"dry-run create-store would initialize schema at {path}", flush=True)
         return
     store = PaperStateStore(path)
+    try:
+        store.create_schema()
+    finally:
+        store.close()
+    print(f"paper store schema initialized {path}", flush=True)
+
+
+def create_run(args: argparse.Namespace) -> None:
+    paper_path = Path(args.paper_store)
+    if args.force and paper_path.exists():
+        paper_path.unlink()
+    gm_store = Path(args.store)
+    sqlite_sha = sha256_file(gm_store)
+    if sqlite_sha != EXPECTED_SQLITE_SHA256:
+        raise SystemExit(f"SQLite hash mismatch: {sqlite_sha}")
+    start = date.fromisoformat(args.start)
+    end = date.fromisoformat(args.end)
+    data = load_store_data(gm_store, start, end, args.lookback_days, args.max_symbols)
+    context = prepare_context(data, start, end)
+    identity = build_ranked_identity(context)
+    verify_expected_identity(args, identity)
+    if args.dry_run:
+        print(json.dumps(identity.as_payload(), ensure_ascii=False, sort_keys=True), flush=True)
+        return
+    store = PaperStateStore(paper_path)
     try:
         store.init_run(
             run_id=args.run_id,
             cohort_id=args.cohort_id,
-            strategy_commit=git_commit(Path.cwd()),
-            full_config_hash=ranked_full_config_hash(),
-            prepared_context_hash="",
-            source_tree_hash=source_tree_hash(Path.cwd()),
-            data_policy_version=DATA_POLICY_VERSION,
-            audit_schema_version=AUDIT_SCHEMA_VERSION,
+            identity=identity,
             initial_cash=100000.0,
         )
     finally:
         store.close()
-    print(f"paper store initialized {path}", flush=True)
+    print(f"paper run initialized {paper_path} run_id={args.run_id}", flush=True)
 
 
 def replay(args: argparse.Namespace) -> int:
@@ -145,20 +172,15 @@ def replay(args: argparse.Namespace) -> int:
     )
     store = PaperStateStore(paper_path)
     try:
-        full_config_hash = ranked_full_config_hash()
-        verify_expected_identity(args, strategy_commit, full_config_hash)
+        identity = build_ranked_identity(context, strategy_commit=strategy_commit)
+        verify_expected_identity(args, identity)
         if args.dry_run:
             print(f"dry-run replay prepared dates={len(context.all_dates)} store={paper_path}", flush=True)
             return 0
         store.init_run(
             run_id=args.run_id,
             cohort_id=args.cohort_id,
-            strategy_commit=strategy_commit,
-            full_config_hash=full_config_hash,
-            prepared_context_hash=context.prepared_context_hash,
-            source_tree_hash=source_tree_hash(Path.cwd()),
-            data_policy_version=DATA_POLICY_VERSION,
-            audit_schema_version=AUDIT_SCHEMA_VERSION,
+            identity=identity,
             initial_cash=100000.0,
         )
         payloads = build_day_payloads(result)
@@ -168,19 +190,20 @@ def replay(args: argparse.Namespace) -> int:
             state_version=PAPER_STATE_VERSION,
             cash=100000.0,
             previous_close_equity=100000.0,
-            strategy_commit=strategy_commit,
-            full_config_hash=full_config_hash,
-            prepared_context_hash=context.prepared_context_hash,
-            source_tree_hash=source_tree_hash(Path.cwd()),
-            data_policy_version=DATA_POLICY_VERSION,
-            audit_schema_version=AUDIT_SCHEMA_VERSION,
+            **identity.as_payload(),
         )
         for session_date in context.all_dates:
             gate = validate_daily_data_gate(data, context, session_date, status_by_date)
             gate_results[session_date.isoformat()] = gate
             store.record_data_gate(args.run_id, session_date, "PASS" if gate["passed"] else "FAIL_CLOSED", gate)
             if not gate["passed"]:
-                store.record_session(args.run_id, session_date, "close", "FAILED", {"reason": "FAIL_CLOSED", **gate})
+                store.record_failed_session_attempt(
+                    args.run_id,
+                    session_date,
+                    "close",
+                    error_code="FAIL_CLOSED",
+                    details={"reason": "FAIL_CLOSED", **gate},
+                )
                 continue
             day_payload = payloads[session_date]
             open_input = build_session_input(session_date, day_payload, gate, phase="open", context=context)
@@ -292,18 +315,16 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         max_positions=5,
         progress=False,
     )
-    full_config_hash = ranked_full_config_hash()
     strategy_commit = git_commit(Path.cwd())
-    verify_expected_identity(args, strategy_commit, full_config_hash)
+    identity = build_ranked_identity(context, strategy_commit=strategy_commit)
+    verify_expected_identity(args, identity)
     if args.dry_run:
         print(f"dry-run {args.cmd} would process {session_date}", flush=True)
         return
     store.init_run(
         run_id=args.run_id,
         cohort_id=args.cohort_id,
-        strategy_commit=strategy_commit,
-        full_config_hash=full_config_hash,
-        audit_schema_version=AUDIT_SCHEMA_VERSION,
+        identity=identity,
         initial_cash=100000.0,
     )
     state = store.load_latest_state(args.run_id) or PortfolioState(
@@ -311,15 +332,19 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         state_version=PAPER_STATE_VERSION,
         cash=100000.0,
         previous_close_equity=100000.0,
-        strategy_commit=strategy_commit,
-        full_config_hash=full_config_hash,
-        audit_schema_version=AUDIT_SCHEMA_VERSION,
+        **identity.as_payload(),
     )
     payload = build_day_payloads(result)[session_date]
     gate = validate_daily_data_gate(data, context, session_date, status_by_date)
     store.record_data_gate(args.run_id, session_date, "PASS" if gate["passed"] else "FAIL_CLOSED", gate)
     if not gate["passed"]:
-        store.record_session(args.run_id, session_date, args.cmd, "FAILED", gate)
+        store.record_failed_session_attempt(
+            args.run_id,
+            session_date,
+            args.cmd,
+            error_code="FAIL_CLOSED",
+            details=gate,
+        )
         return
     if args.cmd == "open":
         before = deepcopy(state)
@@ -380,6 +405,11 @@ def build_session_input(session_date: date, payload: dict[str, Any], gate: dict[
         execution_rows = {"pending_rows": payload.get("pending_rows", [])}
         candidates = list(payload.get("candidate_rows", []))
     regime = context.regime_by_date.get(session_date) if hasattr(context, "regime_by_date") else None
+    equity_payload = dict(payload.get("equity_payload", {}))
+    marks_by_code = close_marks_by_code(context, session_date) if phase == "close" else {}
+    if marks_by_code:
+        equity_payload["marks"] = marks_by_code
+    reported_equity = float(equity_payload["equity"]) if "equity" in equity_payload else None
     return SessionInput(
         session_date=session_date,
         execution_rows=execution_rows,
@@ -388,30 +418,55 @@ def build_session_input(session_date: date, payload: dict[str, Any], gate: dict[
         eligible_symbols=set(context.eligible_by_date.get(session_date, set())) if hasattr(context, "eligible_by_date") else set(),
         candidates=candidates,
         data_snapshot_hash=str(gate.get("daily_data_snapshot_hash", gate.get("snapshot_hash", ""))),
-        equity_payload=dict(payload.get("equity_payload", {})),
+        equity_payload=equity_payload,
+        marks_by_code=marks_by_code,
+        reported_equity=reported_equity,
     )
 
 
-def verify_expected_identity(args: argparse.Namespace, strategy_commit: str, full_config_hash: str) -> None:
-    if args.expected_strategy_commit and args.expected_strategy_commit != strategy_commit:
+def close_marks_by_code(context, session_date: date) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for code, rows_by_day in getattr(context, "rows_by_date", {}).items():
+        row = rows_by_day.get(session_date)
+        if row is not None:
+            out[str(code)] = float(row.close)
+    return out
+
+
+def verify_expected_identity(args: argparse.Namespace, identity: PaperRunIdentity) -> None:
+    if args.expected_strategy_commit and args.expected_strategy_commit != identity.strategy_commit:
         raise SystemExit(
-            f"strategy commit mismatch expected={args.expected_strategy_commit} actual={strategy_commit}"
+            f"strategy commit mismatch expected={args.expected_strategy_commit} actual={identity.strategy_commit}"
         )
-    if args.expected_config_hash and args.expected_config_hash != full_config_hash:
-        raise SystemExit(f"config hash mismatch expected={args.expected_config_hash} actual={full_config_hash}")
+    if args.expected_config_hash and args.expected_config_hash != identity.full_config_hash:
+        raise SystemExit(f"config hash mismatch expected={args.expected_config_hash} actual={identity.full_config_hash}")
 
 
-def ranked_full_config_hash() -> str:
-    return stable_hash_json(
-        {
-            "strategy_mode": "strategy_v5_alpha_ranked",
-            "selection_policy": SelectionPolicy.DETERMINISTIC_RANKED.value,
-            "risk_sizing": "current_risk_sizing",
-            "exit": "current_exit",
-            "pyramiding": True,
-            "initial_cash": 100000.0,
-        }
+def build_ranked_identity(context, *, strategy_commit: str | None = None) -> PaperRunIdentity:
+    return build_paper_run_identity(
+        context,
+        ranked_identity_configs(context),
+        cwd=Path.cwd(),
+        strategy_commit=strategy_commit,
+        data_policy_version=DATA_POLICY_VERSION,
+        audit_schema_version=AUDIT_SCHEMA_VERSION,
     )
+
+
+def ranked_identity_configs(context) -> dict[str, Any]:
+    return {
+        "backtest": context.config,
+        "risk": context.risk_config,
+        "entry_filter": context.entry_config,
+        "kernel_run": KernelRunConfig(
+            selection_policy=SelectionPolicy.DETERMINISTIC_RANKED,
+            selection_seed=0,
+            max_positions=5,
+            capture_level=CaptureLevel.FULL,
+            metric_mode=MetricComputationMode.CORE,
+        ),
+        "termination_policy": TerminationPolicy.CONTINUE,
+    }
 
 
 def prepare_context(data, start: date, end: date):
@@ -832,7 +887,8 @@ def write_schema_report(path: Path) -> None:
         f"- paper_state_version: `{PAPER_STATE_VERSION}`",
         f"- audit_schema_version: `{AUDIT_SCHEMA_VERSION}`",
         "- storage: SQLite",
-        "- write contract: transaction-scoped writes with primary keys for session phase, candidate, order, fill, position link, trade, equity, reconciliation, and data snapshots.",
+        "- identity contract: non-empty strategy commit, source tree hash, full config hash, prepared context hash, data policy, audit schema, and trading calendar hash.",
+        "- write contract: transaction-scoped writes with primary keys for committed session phase, candidate, order, fill, position link, trade, equity, reconciliation, and data snapshots.",
         "",
         "| Table | Purpose |",
         "|---|---|",
@@ -840,6 +896,7 @@ def write_schema_report(path: Path) -> None:
     for table, purpose in (
         ("paper_runs", "cohort and config identity"),
         ("paper_sessions", "open/close/reconcile phase status, state hashes, and idempotency"),
+        ("paper_session_attempts", "failed gate attempts that do not occupy committed phase keys"),
         ("portfolio_state_snapshots", "authoritative portfolio state after each committed phase"),
         ("ledger_events", "phase-scoped event stream"),
         ("candidate_snapshots", "ranked candidate evidence"),

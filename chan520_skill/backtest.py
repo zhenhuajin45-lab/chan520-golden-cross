@@ -1482,6 +1482,7 @@ def execute_prepared_context(
             paper_state,
             SessionInput(
                 session_date=day,
+                prior_close_equity=previous_close_equity,
                 equity_payload={"cash": cash, "equity": previous_close_equity, "exposure": 0.0},
             ),
             {"mode": "batch_kernel"},
@@ -2029,6 +2030,12 @@ def execute_prepared_context(
             SessionInput(
                 session_date=day,
                 candidates=[dict(item) if isinstance(item, dict) else {"candidate": str(item)} for item in entry_items],
+                marks_by_code={
+                    code: rows_by_date[code][day].close
+                    for code in positions
+                    if day in rows_by_date.get(code, {})
+                },
+                reported_equity=equity,
                 equity_payload={"cash": cash, "equity": equity, "exposure": 0.0},
             ),
             entry_items,
