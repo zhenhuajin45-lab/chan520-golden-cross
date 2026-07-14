@@ -30,6 +30,7 @@ from chan520_skill.backtest import (
     run_portfolio_kernel,
 )
 from chan520_skill.evidence_manifest import git_commit, sha256_file, stable_hash_json
+from chan520_skill.incremental_guard import DataAccessGuard
 from chan520_skill.models import StockMeta
 from chan520_skill.paper_state import (
     DATA_POLICY_VERSION,
@@ -41,6 +42,7 @@ from chan520_skill.paper_state import (
     SessionInput,
     TerminationPolicy,
     build_paper_run_identity,
+    build_paper_session_identity,
     process_session_close,
     process_session_open,
 )
@@ -97,6 +99,15 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--expected-strategy-commit", default="")
     parser.add_argument("--expected-config-hash", default="")
+    parser.add_argument(
+        "--incremental-prefix",
+        action="store_true",
+        help=(
+            "For single-day open/close, prepare only data <= --date and "
+            "enforce the future-data guard. This is a guarded transition "
+            "path and does not mark shadow readiness true."
+        ),
+    )
 
 
 def create_store(args: argparse.Namespace) -> None:
@@ -206,7 +217,15 @@ def replay(args: argparse.Namespace) -> int:
                 )
                 continue
             day_payload = payloads[session_date]
-            open_input = build_session_input(session_date, day_payload, gate, phase="open", context=context)
+            open_identity = build_prefix_session_identity(context, session_date, gate, state)
+            open_input = build_session_input(
+                session_date,
+                day_payload,
+                gate,
+                phase="open",
+                context=context,
+                session_identity=open_identity,
+            )
             before_open = deepcopy(state)
             open_result = process_session_open(state, open_input, {"phase": "open"}, None)
             if not isinstance(open_result, object) or not hasattr(open_result, "state"):
@@ -302,9 +321,15 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         raise SystemExit(f"SQLite hash mismatch: {sqlite_sha}")
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
-    data = load_store_data(gm_store, start, end, args.lookback_days, args.max_symbols)
-    status_by_date = load_status_snapshots(gm_store, start, end)
-    context = prepare_context(data, start, end)
+    context_end = single_session_context_end(args, session_date)
+    data = load_store_data(gm_store, start, context_end, args.lookback_days, args.max_symbols)
+    status_by_date = load_status_snapshots(gm_store, start, context_end)
+    guard = DataAccessGuard(session_date) if getattr(args, "incremental_prefix", False) else None
+    if guard is not None:
+        assert_raw_incremental_data_not_future(data, status_by_date, guard)
+    context = prepare_context(data, start, context_end)
+    if guard is not None:
+        assert_prepared_context_not_future(context, guard)
     if session_date not in context.all_dates:
         raise SystemExit(f"{session_date} is not in prepared trading calendar")
     result = run_portfolio_kernel(
@@ -348,7 +373,15 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         return
     if args.cmd == "open":
         before = deepcopy(state)
-        session_input = build_session_input(session_date, payload, gate, phase="open", context=context)
+        session_identity = build_prefix_session_identity(context, session_date, gate, state)
+        session_input = build_session_input(
+            session_date,
+            payload,
+            gate,
+            phase="open",
+            context=context,
+            session_identity=session_identity,
+        )
         result_open = process_session_open(state, session_input, {"phase": "open"}, None)
         if not hasattr(result_open, "state"):
             raise RuntimeError("open state machine did not return SessionResult")
@@ -363,6 +396,38 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         store.persist_session_result(args.run_id, session_date, "close", before, result_close)
         return
     raise SystemExit(f"unsupported phase: {args.cmd}")
+
+
+def single_session_context_end(args: argparse.Namespace, session_date: date) -> date:
+    configured_end = date.fromisoformat(args.end)
+    if not getattr(args, "incremental_prefix", False):
+        return configured_end
+    if configured_end < session_date:
+        raise SystemExit(f"--end {configured_end} is before --date {session_date}")
+    return session_date
+
+
+def assert_incremental_data_not_future(data, context, status_by_date, guard: DataAccessGuard) -> None:
+    assert_raw_incremental_data_not_future(data, status_by_date, guard)
+    assert_prepared_context_not_future(context, guard)
+
+
+def assert_raw_incremental_data_not_future(data, status_by_date, guard: DataAccessGuard) -> None:
+    for code, rows in getattr(data, "rows_by_code", {}).items():
+        for row in rows:
+            guard.assert_not_future(getattr(row, "date", None), source="daily_bars", code=str(code))
+    guard.assert_rows_not_future(getattr(data, "index_rows", ()), source="index_bars")
+    for day in getattr(data, "eligible_by_date", {}):
+        guard.assert_not_future(day, source="dynamic_universe")
+    for day, rows in (status_by_date or {}).items():
+        guard.assert_not_future(day, source="instrument_status")
+        for row in rows.values():
+            guard.assert_not_future(row.get("trade_date"), source="instrument_status", code=str(row.get("code", "")))
+
+
+def assert_prepared_context_not_future(context, guard: DataAccessGuard) -> None:
+    for day in getattr(context, "all_dates", ()):
+        guard.assert_not_future(day, source="prepared_calendar")
 
 
 def reconcile_single_phase(args: argparse.Namespace, store: PaperStateStore, session_date: date) -> None:
@@ -393,7 +458,15 @@ def reconcile_single_phase(args: argparse.Namespace, store: PaperStateStore, ses
     store.record_reconciliation(args.run_id, session_date, "account_lifecycle", "PASS" if details["passed"] else "FAIL", details)
 
 
-def build_session_input(session_date: date, payload: dict[str, Any], gate: dict[str, Any], *, phase: str, context) -> SessionInput:
+def build_session_input(
+    session_date: date,
+    payload: dict[str, Any],
+    gate: dict[str, Any],
+    *,
+    phase: str,
+    context,
+    session_identity=None,
+) -> SessionInput:
     if phase == "open":
         execution_rows = {
             "fill_rows": payload.get("fill_rows", []),
@@ -421,6 +494,17 @@ def build_session_input(session_date: date, payload: dict[str, Any], gate: dict[
         equity_payload=equity_payload,
         marks_by_code=marks_by_code,
         reported_equity=reported_equity,
+        session_identity=session_identity,
+    )
+
+
+def build_prefix_session_identity(context, session_date: date, gate: dict[str, Any], state: PortfolioState):
+    return build_paper_session_identity(
+        session_date=session_date,
+        prefix_context_hash=str(getattr(context, "prepared_context_hash", "") or ""),
+        calendar_prefix_hash=stable_hash_json([day.isoformat() for day in getattr(context, "all_dates", ())]),
+        daily_data_snapshot_hash=str(gate.get("daily_data_snapshot_hash", gate.get("snapshot_hash", ""))),
+        prior_history_chain_hash=str(state.history_chain_hash or ""),
     )
 
 
@@ -887,7 +971,8 @@ def write_schema_report(path: Path) -> None:
         f"- paper_state_version: `{PAPER_STATE_VERSION}`",
         f"- audit_schema_version: `{AUDIT_SCHEMA_VERSION}`",
         "- storage: SQLite",
-        "- identity contract: non-empty strategy commit, source tree hash, full config hash, prepared context hash, data policy, audit schema, and trading calendar hash.",
+        "- run identity contract: non-empty strategy commit, source tree hash, full config hash, data policy, audit schema, cohort start date, universe policy hash, and calendar provider version.",
+        "- session identity contract: each trading date records prefix context hash, calendar prefix hash, daily data snapshot hash, and append-only history chain hash.",
         "- write contract: transaction-scoped writes with primary keys for committed session phase, candidate, order, fill, position link, trade, equity, reconciliation, and data snapshots.",
         "",
         "| Table | Purpose |",
