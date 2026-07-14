@@ -7,6 +7,7 @@ import pytest
 
 from chan520_skill.paper_state import (
     ContextIdentityMismatch,
+    HistoryRewriteDetected,
     IdempotencyConflict,
     MissingPositionMark,
     PaperRunIdentity,
@@ -14,6 +15,7 @@ from chan520_skill.paper_state import (
     PhaseOrderViolation,
     PortfolioState,
     SessionInput,
+    build_paper_session_identity,
     process_session_close,
     process_session_open,
 )
@@ -24,19 +26,21 @@ def identity(
     strategy_commit: str = "abc123",
     source_tree_hash: str = "source-hash",
     full_config_hash: str = "cfg",
-    prepared_context_hash: str = "ctx",
     data_policy_version: str = "policy",
     audit_schema_version: str = "2",
-    trading_calendar_hash: str = "cal",
+    cohort_start_date: str = "2026-01-05",
+    universe_policy_hash: str = "universe-policy",
+    calendar_provider_version: str = "calendar-provider",
 ) -> PaperRunIdentity:
     return PaperRunIdentity(
         strategy_commit=strategy_commit,
         source_tree_hash=source_tree_hash,
         full_config_hash=full_config_hash,
-        prepared_context_hash=prepared_context_hash,
         data_policy_version=data_policy_version,
         audit_schema_version=audit_schema_version,
-        trading_calendar_hash=trading_calendar_hash,
+        cohort_start_date=cohort_start_date,
+        universe_policy_hash=universe_policy_hash,
+        calendar_provider_version=calendar_provider_version,
     )
 
 
@@ -48,6 +52,16 @@ def portfolio_state(run_id: str = "run1", run_identity: PaperRunIdentity | None 
         cash=100000.0,
         previous_close_equity=100000.0,
         **run_identity.as_payload(),
+    )
+
+
+def session_identity(day: date, prior: str = "", prefix: str = "prefix", snapshot: str = "daily"):
+    return build_paper_session_identity(
+        session_date=day,
+        prefix_context_hash=f"{prefix}-{day.isoformat()}",
+        calendar_prefix_hash=f"calendar-{day.isoformat()}",
+        daily_data_snapshot_hash=f"{snapshot}-{day.isoformat()}",
+        prior_history_chain_hash=prior,
     )
 
 
@@ -261,10 +275,10 @@ def test_context_identity_mismatch_rejected(tmp_path):
         store.init_run(
             run_id="run1",
             cohort_id="cohort1",
-            identity=identity(prepared_context_hash="ctx-a"),
+            identity=identity(full_config_hash="cfg-a"),
             initial_cash=100000.0,
         )
-        state = portfolio_state(run_identity=identity(prepared_context_hash="ctx-b"))
+        state = portfolio_state(run_identity=identity(full_config_hash="cfg-b"))
         day = date(2026, 1, 5)
         result = process_session_open(state, SessionInput(session_date=day))
         with pytest.raises(ContextIdentityMismatch):
@@ -308,14 +322,14 @@ def test_create_run_then_close_identity_matches(tmp_path):
         store.close()
 
 
-def test_blank_context_identity_rejected(tmp_path):
+def test_blank_run_identity_rejected(tmp_path):
     store = PaperStateStore(tmp_path / "paper.sqlite")
     try:
         with pytest.raises(ContextIdentityMismatch):
             store.init_run(
                 run_id="run1",
                 cohort_id="cohort1",
-                identity=identity(prepared_context_hash=""),
+                identity=identity(universe_policy_hash=""),
                 initial_cash=100000.0,
             )
     finally:
@@ -454,5 +468,111 @@ def test_failed_gate_second_attempt_commits(tmp_path):
             "select count(*) from paper_session_attempts where resolved_at is null"
         ).fetchone()[0]
         assert unresolved == 0
+    finally:
+        store.close()
+
+
+def test_incremental_prefix_run_identity_stable_across_days(tmp_path):
+    store = PaperStateStore(tmp_path / "paper.sqlite")
+    run_identity = identity()
+    try:
+        store.init_run(run_id="run1", cohort_id="cohort1", identity=run_identity, initial_cash=100000.0)
+        store.init_run(run_id="run1", cohort_id="cohort1", identity=run_identity, initial_cash=100000.0)
+        assert store.count("paper_runs") == 1
+    finally:
+        store.close()
+
+
+def test_incremental_prefix_session_identity_changes():
+    day1 = date(2026, 1, 5)
+    day2 = date(2026, 1, 6)
+    sid1 = session_identity(day1)
+    sid2 = session_identity(day2, prior=sid1.history_chain_hash)
+
+    assert sid1.prefix_context_hash != sid2.prefix_context_hash
+    assert sid1.calendar_prefix_hash != sid2.calendar_prefix_hash
+    assert sid1.daily_data_snapshot_hash != sid2.daily_data_snapshot_hash
+    assert sid1.history_chain_hash != sid2.history_chain_hash
+
+
+def test_day2_open_does_not_conflict_with_day1_run(tmp_path):
+    store = PaperStateStore(tmp_path / "paper.sqlite")
+    run_identity = identity()
+    try:
+        store.init_run(run_id="run1", cohort_id="cohort1", identity=run_identity, initial_cash=100000.0)
+        state = store.load_latest_state("run1")
+        assert state is not None
+
+        day1 = date(2026, 1, 5)
+        sid1 = session_identity(day1)
+        before_open1 = deepcopy(state)
+        open1 = process_session_open(
+            state,
+            SessionInput(session_date=day1, prior_close_equity=100000.0, session_identity=sid1),
+        )
+        store.persist_session_result("run1", day1, "open", before_open1, open1)
+        before_close1 = deepcopy(state)
+        close1 = process_session_close(state, SessionInput(session_date=day1, reported_equity=100000.0))
+        store.persist_session_result("run1", day1, "close", before_close1, close1)
+
+        day2 = date(2026, 1, 6)
+        sid2 = session_identity(day2, prior=state.history_chain_hash)
+        before_open2 = deepcopy(state)
+        open2 = process_session_open(
+            state,
+            SessionInput(session_date=day2, prior_close_equity=100000.0, session_identity=sid2),
+        )
+        store.persist_session_result("run1", day2, "open", before_open2, open2)
+
+        assert store.count("paper_runs") == 1
+        assert store.count("portfolio_state_snapshots") == 3
+        assert store.load_latest_state("run1").history_chain_hash == sid2.history_chain_hash
+    finally:
+        store.close()
+
+
+def test_config_change_rejected(tmp_path):
+    store = PaperStateStore(tmp_path / "paper.sqlite")
+    try:
+        store.init_run(run_id="run1", cohort_id="cohort1", identity=identity(full_config_hash="cfg-a"), initial_cash=100000.0)
+        with pytest.raises(IdempotencyConflict):
+            store.init_run(
+                run_id="run1",
+                cohort_id="cohort1",
+                identity=identity(full_config_hash="cfg-b"),
+                initial_cash=100000.0,
+            )
+    finally:
+        store.close()
+
+
+def test_history_chain_extension_passes(tmp_path):
+    store = PaperStateStore(tmp_path / "paper.sqlite")
+    try:
+        store.init_run(run_id="run1", cohort_id="cohort1", identity=identity(), initial_cash=100000.0)
+        state = store.load_latest_state("run1")
+        assert state is not None
+        day = date(2026, 1, 5)
+        sid = session_identity(day, prior=state.history_chain_hash)
+        before = deepcopy(state)
+        result = process_session_open(state, SessionInput(session_date=day, session_identity=sid))
+        store.persist_session_result("run1", day, "open", before, result)
+        assert store.load_latest_state("run1").history_chain_hash == sid.history_chain_hash
+    finally:
+        store.close()
+
+
+def test_history_rewrite_rejected(tmp_path):
+    store = PaperStateStore(tmp_path / "paper.sqlite")
+    try:
+        store.init_run(run_id="run1", cohort_id="cohort1", identity=identity(), initial_cash=100000.0)
+        state = store.load_latest_state("run1")
+        assert state is not None
+        day = date(2026, 1, 5)
+        rewritten = session_identity(day, prior="not-the-persisted-prior")
+        before = deepcopy(state)
+        result = process_session_open(state, SessionInput(session_date=day, session_identity=rewritten))
+        with pytest.raises(HistoryRewriteDetected):
+            store.persist_session_result("run1", day, "open", before, result)
     finally:
         store.close()

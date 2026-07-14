@@ -13,6 +13,7 @@ from .evidence_manifest import git_commit, source_tree_hash, stable_hash_json
 
 PAPER_STATE_VERSION = "2"
 DATA_POLICY_VERSION = "v5.2d-phase2"
+CALENDAR_PROVIDER_VERSION = "gm_sqlite_trading_calendar_v1"
 TERMINAL_PHASE_STATUSES = {"COMMITTED", "FAILED"}
 
 
@@ -28,6 +29,10 @@ class ContextIdentityMismatch(RuntimeError):
     """Raised when a run is continued with a different prepared context/config identity."""
 
 
+class HistoryRewriteDetected(RuntimeError):
+    """Raised when an incremental prefix no longer extends the persisted data history chain."""
+
+
 class TerminationPolicy(str, Enum):
     CONTINUE = "CONTINUE"
     TERMINATE_AND_LIQUIDATE = "TERMINATE_AND_LIQUIDATE"
@@ -39,10 +44,11 @@ class PaperRunIdentity:
     strategy_commit: str
     source_tree_hash: str
     full_config_hash: str
-    prepared_context_hash: str
     data_policy_version: str
     audit_schema_version: str
-    trading_calendar_hash: str
+    cohort_start_date: str
+    universe_policy_hash: str
+    calendar_provider_version: str
 
     def validate_complete(self) -> None:
         missing = [key for key, value in asdict(self).items() if not str(value or "").strip()]
@@ -64,16 +70,77 @@ def build_paper_run_identity(
     audit_schema_version: str,
 ) -> PaperRunIdentity:
     full_config = _identity_normalize(configs)
-    all_dates = getattr(context, "all_dates", ())
     return PaperRunIdentity(
         strategy_commit=strategy_commit or git_commit(cwd or Path.cwd()),
         source_tree_hash=source_tree_hash(cwd or Path.cwd()),
         full_config_hash=stable_hash_json(full_config),
-        prepared_context_hash=str(getattr(context, "prepared_context_hash", "") or ""),
         data_policy_version=data_policy_version,
         audit_schema_version=audit_schema_version,
-        trading_calendar_hash=stable_hash_json([_date_value(day) for day in all_dates]),
+        cohort_start_date=_date_value(getattr(context, "requested_start", "")),
+        universe_policy_hash=stable_hash_json(
+            {
+                "policy": "gm_alpha_dynamic_universe_asof_v1",
+                "strategy_mode": str(getattr(getattr(context, "config", None), "strategy_mode", "")),
+                "require_industry": bool(getattr(getattr(context, "config", None), "require_industry", False)),
+            }
+        ),
+        calendar_provider_version=CALENDAR_PROVIDER_VERSION,
     )
+
+
+@dataclass(frozen=True)
+class PaperSessionIdentity:
+    session_date: date
+    prefix_context_hash: str
+    calendar_prefix_hash: str
+    daily_data_snapshot_hash: str
+    prior_history_chain_hash: str
+    history_chain_hash: str
+
+    def validate_complete(self) -> None:
+        payload = asdict(self)
+        missing = [key for key, value in payload.items() if key != "prior_history_chain_hash" and not str(value or "").strip()]
+        if missing:
+            raise HistoryRewriteDetected(f"incomplete paper session identity: {','.join(missing)}")
+
+    def as_payload(self) -> dict[str, str]:
+        self.validate_complete()
+        return {
+            "session_date": self.session_date.isoformat(),
+            "prefix_context_hash": self.prefix_context_hash,
+            "calendar_prefix_hash": self.calendar_prefix_hash,
+            "daily_data_snapshot_hash": self.daily_data_snapshot_hash,
+            "prior_history_chain_hash": self.prior_history_chain_hash,
+            "history_chain_hash": self.history_chain_hash,
+        }
+
+
+def build_paper_session_identity(
+    *,
+    session_date: date,
+    prefix_context_hash: str,
+    calendar_prefix_hash: str,
+    daily_data_snapshot_hash: str,
+    prior_history_chain_hash: str = "",
+) -> PaperSessionIdentity:
+    history_chain_hash = stable_hash_json(
+        {
+            "prior_history_chain_hash": prior_history_chain_hash,
+            "session_date": session_date.isoformat(),
+            "prefix_context_hash": prefix_context_hash,
+            "daily_data_snapshot_hash": daily_data_snapshot_hash,
+        }
+    )
+    identity = PaperSessionIdentity(
+        session_date=session_date,
+        prefix_context_hash=prefix_context_hash,
+        calendar_prefix_hash=calendar_prefix_hash,
+        daily_data_snapshot_hash=daily_data_snapshot_hash,
+        prior_history_chain_hash=prior_history_chain_hash,
+        history_chain_hash=history_chain_hash,
+    )
+    identity.validate_complete()
+    return identity
 
 
 @dataclass(frozen=True)
@@ -91,6 +158,7 @@ class SessionInput:
     prior_close_equity: float | None = None
     marks_by_code: dict[str, float] = field(default_factory=dict)
     reported_equity: float | None = None
+    session_identity: PaperSessionIdentity | None = None
 
 
 @dataclass
@@ -106,6 +174,14 @@ class PortfolioState:
     previous_close_equity: float = 0.0
     strategy_commit: str = ""
     full_config_hash: str = ""
+    cohort_start_date: str = ""
+    universe_policy_hash: str = ""
+    calendar_provider_version: str = ""
+    session_context_hash: str = ""
+    calendar_prefix_hash: str = ""
+    daily_data_snapshot_hash: str = ""
+    history_chain_hash: str = ""
+    # Legacy migration fields. They are no longer part of stable run identity.
     prepared_context_hash: str = ""
     source_tree_hash: str = ""
     data_policy_version: str = DATA_POLICY_VERSION
@@ -149,6 +225,7 @@ def process_session_open(
         raise TypeError("process_session_open requires SessionInput")
     _ = config
     _ensure_risk_state(state)
+    _apply_session_identity(state, session_input)
     fills = _rows(session_input.execution_rows, "fill_rows")
     trades = _rows(session_input.execution_rows, "trade_rows")
     links = _rows(session_input.execution_rows, "position_link_rows")
@@ -200,6 +277,7 @@ def process_session_close(
         raise TypeError("process_session_close requires SessionInput")
     _ = candidates, market_data, config
     _ensure_risk_state(state)
+    _apply_session_identity(state, session_input)
     candidate_rows = list(session_input.candidates or session_input.signal_rows)
     pending_rows = _rows(session_input.execution_rows, "pending_rows")
     order_intents: list[dict[str, Any]] = []
@@ -274,6 +352,9 @@ class PaperStateStore:
                 source_tree_hash text not null default '',
                 data_policy_version text not null default '',
                 trading_calendar_hash text not null default '',
+                cohort_start_date text not null default '',
+                universe_policy_hash text not null default '',
+                calendar_provider_version text not null default '',
                 audit_schema_version text not null,
                 initial_cash real not null,
                 payload_hash text not null,
@@ -322,6 +403,13 @@ class PaperStateStore:
                 source_tree_hash text not null default '',
                 data_policy_version text not null default '',
                 trading_calendar_hash text not null default '',
+                cohort_start_date text not null default '',
+                universe_policy_hash text not null default '',
+                calendar_provider_version text not null default '',
+                session_context_hash text not null default '',
+                calendar_prefix_hash text not null default '',
+                daily_data_snapshot_hash text not null default '',
+                history_chain_hash text not null default '',
                 payload_hash text not null,
                 created_at text not null default current_timestamp,
                 primary key(run_id, session_date, phase)
@@ -441,6 +529,9 @@ class PaperStateStore:
                 "source_tree_hash": "text not null default ''",
                 "data_policy_version": "text not null default ''",
                 "trading_calendar_hash": "text not null default ''",
+                "cohort_start_date": "text not null default ''",
+                "universe_policy_hash": "text not null default ''",
+                "calendar_provider_version": "text not null default ''",
             },
         )
         self.conn.execute(
@@ -458,6 +549,13 @@ class PaperStateStore:
                 "source_tree_hash": "text not null default ''",
                 "data_policy_version": "text not null default ''",
                 "trading_calendar_hash": "text not null default ''",
+                "cohort_start_date": "text not null default ''",
+                "universe_policy_hash": "text not null default ''",
+                "calendar_provider_version": "text not null default ''",
+                "session_context_hash": "text not null default ''",
+                "calendar_prefix_hash": "text not null default ''",
+                "daily_data_snapshot_hash": "text not null default ''",
+                "history_chain_hash": "text not null default ''",
             },
         )
 
@@ -483,6 +581,9 @@ class PaperStateStore:
         data_policy_version: str = DATA_POLICY_VERSION,
         audit_schema_version: str = "",
         trading_calendar_hash: str = "",
+        cohort_start_date: str = "",
+        universe_policy_hash: str = "",
+        calendar_provider_version: str = CALENDAR_PROVIDER_VERSION,
         initial_cash: float,
     ) -> None:
         if identity is None:
@@ -490,10 +591,11 @@ class PaperStateStore:
                 strategy_commit=strategy_commit,
                 source_tree_hash=source_tree_hash,
                 full_config_hash=full_config_hash,
-                prepared_context_hash=prepared_context_hash,
                 data_policy_version=data_policy_version,
                 audit_schema_version=audit_schema_version,
-                trading_calendar_hash=trading_calendar_hash,
+                cohort_start_date=cohort_start_date,
+                universe_policy_hash=universe_policy_hash,
+                calendar_provider_version=calendar_provider_version,
             )
         identity_payload = identity.as_payload()
         payload = {
@@ -513,18 +615,22 @@ class PaperStateStore:
                 """
                 insert into paper_runs(
                     run_id, cohort_id, strategy_commit, full_config_hash, prepared_context_hash, source_tree_hash,
-                    data_policy_version, trading_calendar_hash, audit_schema_version, initial_cash, payload_hash
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    data_policy_version, trading_calendar_hash, cohort_start_date, universe_policy_hash,
+                    calendar_provider_version, audit_schema_version, initial_cash, payload_hash
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
                     cohort_id,
                     identity.strategy_commit,
                     identity.full_config_hash,
-                    identity.prepared_context_hash,
+                    prepared_context_hash,
                     identity.source_tree_hash,
                     identity.data_policy_version,
-                    identity.trading_calendar_hash,
+                    trading_calendar_hash,
+                    identity.cohort_start_date,
+                    identity.universe_policy_hash,
+                    identity.calendar_provider_version,
                     identity.audit_schema_version,
                     initial_cash,
                     payload_hash,
@@ -552,16 +658,20 @@ class PaperStateStore:
                 previous_close_equity=float(run["initial_cash"]),
                 strategy_commit=str(run["strategy_commit"]),
                 full_config_hash=str(run["full_config_hash"]),
-                prepared_context_hash=str(run["prepared_context_hash"]),
                 source_tree_hash=str(run["source_tree_hash"]),
                 data_policy_version=str(run["data_policy_version"] or DATA_POLICY_VERSION),
-                trading_calendar_hash=str(run["trading_calendar_hash"]),
                 audit_schema_version=str(run["audit_schema_version"]),
+                cohort_start_date=str(run["cohort_start_date"]),
+                universe_policy_hash=str(run["universe_policy_hash"]),
+                calendar_provider_version=str(run["calendar_provider_version"]),
             )
         prepared_context_hash = str(row["prepared_context_hash"] or (run["prepared_context_hash"] if run else ""))
         source_hash = str(row["source_tree_hash"] or (run["source_tree_hash"] if run else ""))
         data_policy = str(row["data_policy_version"] or (run["data_policy_version"] if run else DATA_POLICY_VERSION))
         trading_calendar_hash = str(row["trading_calendar_hash"] or (run["trading_calendar_hash"] if run else ""))
+        cohort_start_date = str(row["cohort_start_date"] or (run["cohort_start_date"] if run else ""))
+        universe_policy_hash = str(row["universe_policy_hash"] or (run["universe_policy_hash"] if run else ""))
+        calendar_provider_version = str(row["calendar_provider_version"] or (run["calendar_provider_version"] if run else ""))
         return PortfolioState(
             run_id=run_id,
             state_version=str(row["state_version"]),
@@ -574,6 +684,13 @@ class PaperStateStore:
             previous_close_equity=float(row["previous_close_equity"]),
             strategy_commit=str(row["strategy_commit"] or (run["strategy_commit"] if run else "")),
             full_config_hash=str(row["full_config_hash"] or (run["full_config_hash"] if run else "")),
+            cohort_start_date=cohort_start_date,
+            universe_policy_hash=universe_policy_hash,
+            calendar_provider_version=calendar_provider_version,
+            session_context_hash=str(row["session_context_hash"] or ""),
+            calendar_prefix_hash=str(row["calendar_prefix_hash"] or ""),
+            daily_data_snapshot_hash=str(row["daily_data_snapshot_hash"] or ""),
+            history_chain_hash=str(row["history_chain_hash"] or ""),
             prepared_context_hash=prepared_context_hash,
             source_tree_hash=source_hash,
             data_policy_version=data_policy,
@@ -673,6 +790,7 @@ class PaperStateStore:
                 self.conn.rollback()
                 return
             self._validate_session_transition(run_id, session_date, phase, state_before)
+            self._validate_history_chain(session_date, state_before, result.state)
             self.conn.execute(
                 """
                 insert into paper_sessions(
@@ -864,16 +982,50 @@ class PaperStateStore:
             "strategy_commit": (str(run["strategy_commit"] or ""), state.strategy_commit),
             "source_tree_hash": (str(run["source_tree_hash"] or ""), state.source_tree_hash),
             "full_config_hash": (str(run["full_config_hash"] or ""), state.full_config_hash),
-            "prepared_context_hash": (str(run["prepared_context_hash"] or ""), state.prepared_context_hash),
             "data_policy_version": (str(run["data_policy_version"] or ""), state.data_policy_version),
             "audit_schema_version": (str(run["audit_schema_version"] or ""), state.audit_schema_version),
-            "trading_calendar_hash": (str(run["trading_calendar_hash"] or ""), state.trading_calendar_hash),
+            "cohort_start_date": (str(run["cohort_start_date"] or ""), state.cohort_start_date),
+            "universe_policy_hash": (str(run["universe_policy_hash"] or ""), state.universe_policy_hash),
+            "calendar_provider_version": (str(run["calendar_provider_version"] or ""), state.calendar_provider_version),
         }
         for name, (run_value, state_value) in comparisons.items():
             if not run_value or not str(state_value or "") or run_value != str(state_value):
                 raise ContextIdentityMismatch(
                     f"{name} mismatch run={run_value!r} state={str(state_value or '')!r}"
                 )
+
+    def _validate_history_chain(self, session_date: date, state_before: PortfolioState, state_after: PortfolioState) -> None:
+        if not state_after.history_chain_hash:
+            return
+        if (
+            state_before.last_session_date == session_date
+            and state_before.history_chain_hash
+            and state_before.history_chain_hash == state_after.history_chain_hash
+        ):
+            for name in ("session_context_hash", "calendar_prefix_hash", "daily_data_snapshot_hash"):
+                if str(getattr(state_before, name, "") or "") != str(getattr(state_after, name, "") or ""):
+                    raise HistoryRewriteDetected(f"{name} changed inside already-open session")
+            return
+        missing = [
+            name
+            for name in ("session_context_hash", "calendar_prefix_hash", "daily_data_snapshot_hash")
+            if not str(getattr(state_after, name, "") or "")
+        ]
+        if missing:
+            raise HistoryRewriteDetected(f"missing session identity fields: {','.join(missing)}")
+        expected = stable_hash_json(
+            {
+                "prior_history_chain_hash": str(state_before.history_chain_hash or ""),
+                "session_date": session_date.isoformat(),
+                "prefix_context_hash": state_after.session_context_hash,
+                "daily_data_snapshot_hash": state_after.daily_data_snapshot_hash,
+            }
+        )
+        if expected != state_after.history_chain_hash:
+            raise HistoryRewriteDetected(
+                "history chain mismatch "
+                f"expected={expected} actual={state_after.history_chain_hash}"
+            )
 
     def orphan_count(self, run_id: str) -> int:
         return sum(self.orphan_breakdown(run_id).values())
@@ -1101,8 +1253,9 @@ class PaperStateStore:
                 run_id, session_date, phase, state_version, state_before_hash, state_after_hash, cash,
                 positions_json, pending_orders_json, risk_state_json, previous_close_equity, strategy_commit,
                 full_config_hash, prepared_context_hash, source_tree_hash, data_policy_version, trading_calendar_hash,
-                payload_hash
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cohort_start_date, universe_policy_hash, calendar_provider_version, session_context_hash,
+                calendar_prefix_hash, daily_data_snapshot_hash, history_chain_hash, payload_hash
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -1122,6 +1275,13 @@ class PaperStateStore:
                 state.source_tree_hash,
                 state.data_policy_version,
                 state.trading_calendar_hash,
+                state.cohort_start_date,
+                state.universe_policy_hash,
+                state.calendar_provider_version,
+                state.session_context_hash,
+                state.calendar_prefix_hash,
+                state.daily_data_snapshot_hash,
+                state.history_chain_hash,
                 payload_hash,
             ),
         )
@@ -1230,6 +1390,27 @@ def _ensure_risk_state(state: PortfolioState) -> None:
     }
     for key, value in defaults.items():
         state.risk_state.setdefault(key, value)
+
+
+def _apply_session_identity(state: PortfolioState, session_input: SessionInput) -> None:
+    identity = session_input.session_identity
+    if identity is None:
+        return
+    identity.validate_complete()
+    if identity.session_date != session_input.session_date:
+        raise HistoryRewriteDetected(
+            f"session identity date mismatch input={session_input.session_date} identity={identity.session_date}"
+        )
+    state.session_context_hash = identity.prefix_context_hash
+    state.calendar_prefix_hash = identity.calendar_prefix_hash
+    state.daily_data_snapshot_hash = identity.daily_data_snapshot_hash
+    state.history_chain_hash = identity.history_chain_hash
+    state.prepared_context_hash = identity.prefix_context_hash
+    state.trading_calendar_hash = identity.calendar_prefix_hash
+    state.risk_state["session_context_hash"] = identity.prefix_context_hash
+    state.risk_state["calendar_prefix_hash"] = identity.calendar_prefix_hash
+    state.risk_state["daily_data_snapshot_hash"] = identity.daily_data_snapshot_hash
+    state.risk_state["history_chain_hash"] = identity.history_chain_hash
 
 
 def _fill_pending_order_id(row: dict[str, Any]) -> str:
