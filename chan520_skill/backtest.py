@@ -1463,7 +1463,7 @@ def execute_prepared_context(
     paper_state = PortfolioState(
         run_id="batch_kernel",
         state_version=PAPER_STATE_VERSION,
-        last_processed_date=None,
+        last_session_date=None,
         cash=config.initial_cash,
         previous_close_equity=previous_close_equity,
         strategy_commit="batch",
