@@ -30,6 +30,7 @@ from chan520_skill.backtest import (
     run_portfolio_kernel,
 )
 from chan520_skill.evidence_manifest import git_commit, sha256_file, stable_hash_json
+from chan520_skill.incremental_guard import DataAccessGuard
 from chan520_skill.models import StockMeta
 from chan520_skill.paper_state import (
     DATA_POLICY_VERSION,
@@ -97,6 +98,15 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--expected-strategy-commit", default="")
     parser.add_argument("--expected-config-hash", default="")
+    parser.add_argument(
+        "--incremental-prefix",
+        action="store_true",
+        help=(
+            "For single-day open/close, prepare only data <= --date and "
+            "enforce the future-data guard. This is a guarded transition "
+            "path and does not mark shadow readiness true."
+        ),
+    )
 
 
 def create_store(args: argparse.Namespace) -> None:
@@ -302,9 +312,13 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         raise SystemExit(f"SQLite hash mismatch: {sqlite_sha}")
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
-    data = load_store_data(gm_store, start, end, args.lookback_days, args.max_symbols)
-    status_by_date = load_status_snapshots(gm_store, start, end)
-    context = prepare_context(data, start, end)
+    context_end = single_session_context_end(args, session_date)
+    data = load_store_data(gm_store, start, context_end, args.lookback_days, args.max_symbols)
+    status_by_date = load_status_snapshots(gm_store, start, context_end)
+    context = prepare_context(data, start, context_end)
+    if getattr(args, "incremental_prefix", False):
+        guard = DataAccessGuard(session_date)
+        assert_incremental_data_not_future(data, context, status_by_date, guard)
     if session_date not in context.all_dates:
         raise SystemExit(f"{session_date} is not in prepared trading calendar")
     result = run_portfolio_kernel(
@@ -363,6 +377,31 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         store.persist_session_result(args.run_id, session_date, "close", before, result_close)
         return
     raise SystemExit(f"unsupported phase: {args.cmd}")
+
+
+def single_session_context_end(args: argparse.Namespace, session_date: date) -> date:
+    configured_end = date.fromisoformat(args.end)
+    if not getattr(args, "incremental_prefix", False):
+        return configured_end
+    if configured_end < session_date:
+        raise SystemExit(f"--end {configured_end} is before --date {session_date}")
+    return session_date
+
+
+def assert_incremental_data_not_future(data, context, status_by_date, guard: DataAccessGuard) -> None:
+    for code, rows in getattr(data, "rows_by_code", {}).items():
+        guard.assert_rows_not_future(rows, source="daily_bars", code_attr="code")
+        for row in rows:
+            guard.assert_not_future(getattr(row, "date", None), source="daily_bars", code=str(code))
+    guard.assert_rows_not_future(getattr(data, "index_rows", ()), source="index_bars")
+    for day in getattr(data, "eligible_by_date", {}):
+        guard.assert_not_future(day, source="dynamic_universe")
+    for day in getattr(context, "all_dates", ()):
+        guard.assert_not_future(day, source="prepared_calendar")
+    for day, rows in (status_by_date or {}).items():
+        guard.assert_not_future(day, source="instrument_status")
+        for row in rows.values():
+            guard.assert_not_future(row.get("trade_date"), source="instrument_status", code=str(row.get("code", "")))
 
 
 def reconcile_single_phase(args: argparse.Namespace, store: PaperStateStore, session_date: date) -> None:
