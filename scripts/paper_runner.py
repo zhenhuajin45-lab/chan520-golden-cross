@@ -28,9 +28,10 @@ from chan520_skill.backtest import (
     prepare_backtest_context,
     run_portfolio_kernel,
 )
-from chan520_skill.evidence_manifest import git_commit, sha256_file, stable_hash_json
+from chan520_skill.evidence_manifest import git_commit, sha256_file, source_tree_hash, stable_hash_json
 from chan520_skill.models import StockMeta
 from chan520_skill.paper_state import (
+    DATA_POLICY_VERSION,
     PAPER_STATE_VERSION,
     IdempotencyConflict,
     PaperStateStore,
@@ -104,7 +105,10 @@ def init_store(args: argparse.Namespace) -> None:
             run_id=args.run_id,
             cohort_id=args.cohort_id,
             strategy_commit=git_commit(Path.cwd()),
-            full_config_hash="init-only",
+            full_config_hash=ranked_full_config_hash(),
+            prepared_context_hash="",
+            source_tree_hash=source_tree_hash(Path.cwd()),
+            data_policy_version=DATA_POLICY_VERSION,
             audit_schema_version=AUDIT_SCHEMA_VERSION,
             initial_cash=100000.0,
         )
@@ -151,6 +155,9 @@ def replay(args: argparse.Namespace) -> int:
             cohort_id=args.cohort_id,
             strategy_commit=strategy_commit,
             full_config_hash=full_config_hash,
+            prepared_context_hash=context.prepared_context_hash,
+            source_tree_hash=source_tree_hash(Path.cwd()),
+            data_policy_version=DATA_POLICY_VERSION,
             audit_schema_version=AUDIT_SCHEMA_VERSION,
             initial_cash=100000.0,
         )
@@ -163,6 +170,9 @@ def replay(args: argparse.Namespace) -> int:
             previous_close_equity=100000.0,
             strategy_commit=strategy_commit,
             full_config_hash=full_config_hash,
+            prepared_context_hash=context.prepared_context_hash,
+            source_tree_hash=source_tree_hash(Path.cwd()),
+            data_policy_version=DATA_POLICY_VERSION,
             audit_schema_version=AUDIT_SCHEMA_VERSION,
         )
         for session_date in context.all_dates:
@@ -210,7 +220,7 @@ def replay(args: argparse.Namespace) -> int:
             "duplicate_pending_order_id_count": store.duplicate_count("pending_orders", "pending_order_id", args.run_id),
             "duplicate_candidate_id_count": store.duplicate_count("candidate_snapshots", "candidate_id", args.run_id),
         }
-        crash = crash_recovery_check(store, args.run_id, context.all_dates[0])
+        crash = transaction_rollback_probe(store, args.run_id, context.all_dates[0])
         data_gate = {
             "valid_date": gate_results[context.all_dates[0].isoformat()],
             "last_date": gate_results[context.all_dates[-1].isoformat()],
@@ -241,7 +251,7 @@ def replay(args: argparse.Namespace) -> int:
             "lifecycle": lifecycle,
             "account": account,
         }
-        write_readiness_reports(readiness, reports, store)
+        write_readiness_reports(readiness, reports, store, args.run_id)
         write_daily_report(report_root / args.cohort_id / end.isoformat(), args, context, result, reports, sqlite_sha)
     finally:
         store.close()
@@ -377,7 +387,7 @@ def build_session_input(session_date: date, payload: dict[str, Any], gate: dict[
         regime=regime,
         eligible_symbols=set(context.eligible_by_date.get(session_date, set())) if hasattr(context, "eligible_by_date") else set(),
         candidates=candidates,
-        data_snapshot_hash=str(gate.get("snapshot_hash", "")),
+        data_snapshot_hash=str(gate.get("daily_data_snapshot_hash", gate.get("snapshot_hash", ""))),
         equity_payload=dict(payload.get("equity_payload", {})),
     )
 
@@ -562,11 +572,25 @@ def validate_daily_data_gate(
             bad_listing_window.append(symbol)
     duplicate_rows = 0
     bar_row_count = 0
+    eligible_bar_rows: list[dict[str, Any]] = []
     for symbol in eligible:
         seen = set()
         for row in data.rows_by_code.get(symbol, []):
             if row.date == session_date:
                 bar_row_count += 1
+                eligible_bar_rows.append(
+                    {
+                        "code": symbol,
+                        "date": row.date.isoformat(),
+                        "open": row.open,
+                        "high": row.high,
+                        "low": row.low,
+                        "close": row.close,
+                        "volume": row.volume,
+                        "amount": row.amount,
+                        "turnover": getattr(row, "turnover", None),
+                    }
+                )
                 if row.date in seen:
                     duplicate_rows += 1
                 seen.add(row.date)
@@ -583,24 +607,32 @@ def validate_daily_data_gate(
         "data_max_date": max((rows[-1].date for rows in data.rows_by_code.values() if rows), default=date.min) >= session_date,
         "duplicate_rows": duplicate_rows == 0,
     }
+    index_basis = {
+        "date": session_date.isoformat(),
+        "open": index_row.open,
+        "close": index_row.close,
+        "high": index_row.high,
+        "low": index_row.low,
+        "volume": index_row.volume,
+        "amount": index_row.amount,
+        "turnover": getattr(index_row, "turnover", None),
+    } if index_row else {}
+    instrument_status_rows = [status_rows[symbol] for symbol in sorted(eligible) if symbol in status_rows]
+    eligible_bars_logical_hash = stable_hash_json(sorted(eligible_bar_rows, key=lambda row: row["code"]))
+    instrument_status_logical_hash = stable_hash_json(instrument_status_rows)
+    index_bar_hash = stable_hash_json(index_basis)
+    dynamic_universe_hash = stable_hash_json(sorted(eligible))
     snapshot_basis = {
         "date": session_date.isoformat(),
-        "index_row": {
-            "open": index_row.open,
-            "close": index_row.close,
-            "high": index_row.high,
-            "low": index_row.low,
-            "volume": index_row.volume,
-            "amount": index_row.amount,
-        }
-        if index_row
-        else {},
-        "eligible_symbols": sorted(eligible),
-        "instrument_status_rows": [status_rows[symbol] for symbol in sorted(eligible) if symbol in status_rows],
+        "eligible_bars_logical_hash": eligible_bars_logical_hash,
+        "instrument_status_logical_hash": instrument_status_logical_hash,
+        "index_bar_hash": index_bar_hash,
+        "dynamic_universe_hash": dynamic_universe_hash,
         "bar_row_count": bar_row_count,
         "data_max_date": max((rows[-1].date.isoformat() for rows in data.rows_by_code.values() if rows), default=""),
         "duplicate_row_count": duplicate_rows,
     }
+    daily_data_snapshot_hash = stable_hash_json(snapshot_basis)
     details = {
         **checks,
         "date": session_date.isoformat(),
@@ -614,7 +646,12 @@ def validate_daily_data_gate(
         "status_row_count": len(status_rows),
         "bar_row_count": bar_row_count,
         "duplicate_row_count": duplicate_rows,
-        "snapshot_hash": stable_hash_json(snapshot_basis),
+        "eligible_bars_logical_hash": eligible_bars_logical_hash,
+        "instrument_status_logical_hash": instrument_status_logical_hash,
+        "index_bar_hash": index_bar_hash,
+        "dynamic_universe_hash": dynamic_universe_hash,
+        "daily_data_snapshot_hash": daily_data_snapshot_hash,
+        "snapshot_hash": daily_data_snapshot_hash,
     }
     details["passed"] = all(checks.values())
     details["status"] = "PASS" if details["passed"] else "FAIL_CLOSED"
@@ -696,7 +733,7 @@ def trades_economic_hash(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def crash_recovery_check(store: PaperStateStore, run_id: str, session_date: date) -> dict[str, Any]:
+def transaction_rollback_probe(store: PaperStateStore, run_id: str, session_date: date) -> dict[str, Any]:
     before = store.count("reconciliation_results")
     try:
         with store.conn:
@@ -726,25 +763,28 @@ def last_paper_equity(store: PaperStateStore, run_id: str) -> float:
     return float(row["equity"]) if row else 100000.0
 
 
-def write_readiness_reports(out: Path, reports: dict[str, Any], store: PaperStateStore) -> None:
+def write_readiness_reports(out: Path, reports: dict[str, Any], store: PaperStateStore, run_id: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    write_parity_report(out / "batch_daystep_parity.md", reports["parity"])
+    write_parity_report(out / "batch_event_persistence_parity.md", reports["parity"])
     write_simple_report(out / "idempotency_report.md", "Idempotency Report", reports["idempotency"])
-    write_simple_report(out / "crash_recovery_report.md", "Crash Recovery Report", reports["crash"])
+    write_simple_report(out / "transaction_rollback_probe.md", "Transaction Rollback Probe", reports["crash"])
     write_simple_report(out / "data_gate_report.md", "Data Gate Report", reports["data_gate"])
     write_schema_report(out / "paper_state_schema.md")
+    synthetic_pending_count = store.synthetic_pending_order_count(run_id)
     readiness = {
-        "batch_daystep_parity": all(
+        "batch_event_persistence_parity": all(
             reports["parity"][key]
             for key in ("selected_pass", "fills_pass", "trades_pass", "daily_equity_pass")
         ),
+        "batch_reported_equity_persistence_parity": reports["account"]["passed"],
+        "transaction_rollback_probe": reports["crash"]["passed"],
         "process_session_open_close_non_noop": True,
         "authoritative_state_restore": store.count("portfolio_state_snapshots") > 0,
         "orphan_count_zero": reports["lifecycle"]["orphan_count"] == 0,
         "duplicate_id_count_zero": reports["lifecycle"]["duplicate_id_count"] == 0,
-        "account_equation": reports["account"]["passed"],
         "idempotency": reports["idempotency"]["passed"],
-        "crash_recovery": reports["crash"]["passed"],
+        "synthetic_pending_order_count": synthetic_pending_count,
+        "synthetic_pending_zero": synthetic_pending_count == 0,
         "d_d1_clock": "UNVERIFIED_IN_PROTOTYPE",
         "fail_closed_data_gate": reports["data_gate"]["future_fail_closed"]["status"] == "FAIL_CLOSED",
         "ci_local": "UNVERIFIED_IN_PROTOTYPE",
@@ -755,13 +795,22 @@ def write_readiness_reports(out: Path, reports: dict[str, Any], store: PaperStat
     readiness["paper_ledger_prototype_readiness"] = all(
         value is True
         for key, value in readiness.items()
-        if key not in {"table_counts", "shadow_readiness", "d_d1_clock", "ci_local", "acceptance_scope"}
+        if key
+        not in {
+            "table_counts",
+            "shadow_readiness",
+            "d_d1_clock",
+            "ci_local",
+            "acceptance_scope",
+            "synthetic_pending_order_count",
+            "synthetic_pending_zero",
+        }
     )
     write_simple_report(out / "shadow_readiness.md", "Paper Ledger Prototype Readiness", readiness)
 
 
 def write_parity_report(path: Path, parity: dict[str, Any]) -> None:
-    lines = ["# Batch Day-Step Parity", "", "| Check | Status |", "|---|---|"]
+    lines = ["# Batch Event Persistence Parity", "", "| Check | Status |", "|---|---|"]
     for key in ("selected_pass", "fills_pass", "trades_pass", "daily_equity_pass"):
         lines.append(f"| `{key}` | {'PASS' if parity[key] else 'FAIL'} |")
     lines.extend(["", "## Hashes", ""])

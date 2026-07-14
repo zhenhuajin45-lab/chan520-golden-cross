@@ -24,7 +24,7 @@ from .data import DataError, eastmoney_history, normalize_code, tencent_history
 from .market_regime import breadth_above_ma60, build_market_regime, to_regime_states
 from .microstructure import is_limit_down, is_limit_up, price_limit
 from .models import IndicatorPoint, KLine, RegimeState, StockMeta
-from .paper_state import PAPER_STATE_VERSION, PortfolioState, process_session_close, process_session_open
+from .paper_state import PAPER_STATE_VERSION, PortfolioState, SessionInput, process_session_close, process_session_open
 from .quality import ensure_data_quality
 from .regime import index_history
 from .risk import (
@@ -1478,7 +1478,15 @@ def execute_prepared_context(
                 flush=True,
             )
         begin_trading_session(risk_state, day.isocalendar()[:2], previous_close_equity)
-        process_session_open(paper_state, day, {"mode": "batch_kernel"}, config)
+        process_session_open(
+            paper_state,
+            SessionInput(
+                session_date=day,
+                equity_payload={"cash": cash, "equity": previous_close_equity, "exposure": 0.0},
+            ),
+            {"mode": "batch_kernel"},
+            config,
+        )
         # Open processing may only use the preceding close.  Today's close is
         # not available until all D+1 orders have been handled.
         # D+1 exits first.
@@ -2016,7 +2024,17 @@ def execute_prepared_context(
         paper_state.previous_close_equity = equity
         paper_state.positions = {code: pos.shares for code, pos in positions.items()}
         paper_state.pending_orders = {order.pending_order_id or "": order.side for order in pending}
-        process_session_close(paper_state, day, entry_items, {"mode": "batch_kernel", "equity": equity}, config)
+        process_session_close(
+            paper_state,
+            SessionInput(
+                session_date=day,
+                candidates=[dict(item) if isinstance(item, dict) else {"candidate": str(item)} for item in entry_items],
+                equity_payload={"cash": cash, "equity": equity, "exposure": 0.0},
+            ),
+            entry_items,
+            {"mode": "batch_kernel", "equity": equity},
+            config,
+        )
         previous_close_equity = equity
         if run_config.progress and (day_idx == len(all_dates) or day_idx % 20 == 0):
             print(

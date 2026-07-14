@@ -2,20 +2,36 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from enum import Enum
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .evidence_manifest import stable_hash_json
 
 
 PAPER_STATE_VERSION = "2"
+DATA_POLICY_VERSION = "v5.2d-phase2"
 TERMINAL_PHASE_STATUSES = {"COMMITTED", "FAILED"}
 
 
 class IdempotencyConflict(RuntimeError):
     """Raised when a stable ledger id is replayed with different economic data."""
+
+
+class PhaseOrderViolation(RuntimeError):
+    """Raised when the shadow paper state machine receives phases out of order."""
+
+
+class ContextIdentityMismatch(RuntimeError):
+    """Raised when a run is continued with a different prepared context/config identity."""
+
+
+class TerminationPolicy(str, Enum):
+    CONTINUE = "CONTINUE"
+    TERMINATE_AND_LIQUIDATE = "TERMINATE_AND_LIQUIDATE"
+    TERMINATE_KEEP_POSITIONS = "TERMINATE_KEEP_POSITIONS"
 
 
 @dataclass(frozen=True)
@@ -46,6 +62,8 @@ class PortfolioState:
     strategy_commit: str = ""
     full_config_hash: str = ""
     prepared_context_hash: str = ""
+    source_tree_hash: str = ""
+    data_policy_version: str = DATA_POLICY_VERSION
     audit_schema_version: str = ""
 
     @property
@@ -73,15 +91,14 @@ class SessionResult:
 
 def process_session_open(
     state: PortfolioState,
-    session_input: SessionInput | date,
+    session_input: SessionInput,
     market_data: dict[str, Any] | None = None,
     config: Any | None = None,
-) -> SessionResult | PortfolioState:
-    if isinstance(session_input, date):
-        state.last_session_date = session_input
-        state.last_completed_phase = "open"
-        return state
+) -> SessionResult:
+    if not isinstance(session_input, SessionInput):
+        raise TypeError("process_session_open requires SessionInput")
     _ = config
+    _ensure_risk_state(state)
     fills = _rows(session_input.execution_rows, "fill_rows")
     trades = _rows(session_input.execution_rows, "trade_rows")
     links = _rows(session_input.execution_rows, "position_link_rows")
@@ -102,11 +119,11 @@ def process_session_open(
             }
         )
     equity = _equity_payload(state, session_input, market_data)
-    state.cash = float(equity.get("cash", state.cash))
-    state.previous_close_equity = float(equity.get("equity", state.previous_close_equity or state.cash))
+    state.previous_close_equity = float(equity.get("derived_equity", state.previous_close_equity or state.cash))
     state.last_session_date = session_input.session_date
     state.last_completed_phase = "open"
     state.risk_state["last_open_data_snapshot_hash"] = session_input.data_snapshot_hash
+    state.risk_state["previous_close_equity"] = state.previous_close_equity
     reconciliation = _reconcile_state(state, equity)
     reconciliation["pending_before"] = len(pending_before)
     reconciliation["pending_after"] = len(state.pending_orders)
@@ -123,16 +140,15 @@ def process_session_open(
 
 def process_session_close(
     state: PortfolioState,
-    session_input: SessionInput | date,
-    candidates: Iterable[Any] | None = None,
+    session_input: SessionInput,
+    candidates: Any | None = None,
     market_data: dict[str, Any] | None = None,
     config: Any | None = None,
-) -> SessionResult | PortfolioState:
-    if isinstance(session_input, date):
-        state.last_session_date = session_input
-        state.last_completed_phase = "close"
-        return state
+) -> SessionResult:
+    if not isinstance(session_input, SessionInput):
+        raise TypeError("process_session_close requires SessionInput")
     _ = candidates, market_data, config
+    _ensure_risk_state(state)
     candidate_rows = list(session_input.candidates or session_input.signal_rows)
     pending_rows = _rows(session_input.execution_rows, "pending_rows")
     order_intents: list[dict[str, Any]] = []
@@ -160,11 +176,11 @@ def process_session_close(
             }
         )
     equity = _equity_payload(state, session_input, None)
-    state.cash = float(equity.get("cash", state.cash))
-    state.previous_close_equity = float(equity.get("equity", state.previous_close_equity or state.cash))
+    state.previous_close_equity = float(equity.get("derived_equity", state.previous_close_equity or state.cash))
     state.last_session_date = session_input.session_date
     state.last_completed_phase = "close"
     state.risk_state["last_close_data_snapshot_hash"] = session_input.data_snapshot_hash
+    state.risk_state["previous_close_equity"] = state.previous_close_equity
     return SessionResult(
         state=state,
         candidates=candidate_rows,
@@ -197,6 +213,9 @@ class PaperStateStore:
                 cohort_id text not null,
                 strategy_commit text not null,
                 full_config_hash text not null,
+                prepared_context_hash text not null default '',
+                source_tree_hash text not null default '',
+                data_policy_version text not null default '',
                 audit_schema_version text not null,
                 initial_cash real not null,
                 payload_hash text not null,
@@ -226,6 +245,11 @@ class PaperStateStore:
                 pending_orders_json text not null,
                 risk_state_json text not null,
                 previous_close_equity real not null,
+                strategy_commit text not null default '',
+                full_config_hash text not null default '',
+                prepared_context_hash text not null default '',
+                source_tree_hash text not null default '',
+                data_policy_version text not null default '',
                 payload_hash text not null,
                 created_at text not null default current_timestamp,
                 primary key(run_id, session_date, phase)
@@ -338,6 +362,33 @@ class PaperStateStore:
             );
             """
         )
+        self._ensure_columns(
+            "paper_runs",
+            {
+                "prepared_context_hash": "text not null default ''",
+                "source_tree_hash": "text not null default ''",
+                "data_policy_version": "text not null default ''",
+            },
+        )
+        self._ensure_columns(
+            "portfolio_state_snapshots",
+            {
+                "strategy_commit": "text not null default ''",
+                "full_config_hash": "text not null default ''",
+                "prepared_context_hash": "text not null default ''",
+                "source_tree_hash": "text not null default ''",
+                "data_policy_version": "text not null default ''",
+            },
+        )
+
+    def _ensure_columns(self, table: str, columns: dict[str, str]) -> None:
+        existing = {
+            str(row["name"])
+            for row in self.conn.execute(f"pragma table_info({table})").fetchall()
+        }
+        for column, ddl in columns.items():
+            if column not in existing:
+                self.conn.execute(f"alter table {table} add column {column} {ddl}")
 
     def init_run(
         self,
@@ -346,6 +397,9 @@ class PaperStateStore:
         cohort_id: str,
         strategy_commit: str,
         full_config_hash: str,
+        prepared_context_hash: str = "",
+        source_tree_hash: str = "",
+        data_policy_version: str = DATA_POLICY_VERSION,
         audit_schema_version: str,
         initial_cash: float,
     ) -> None:
@@ -354,6 +408,9 @@ class PaperStateStore:
             "cohort_id": cohort_id,
             "strategy_commit": strategy_commit,
             "full_config_hash": full_config_hash,
+            "prepared_context_hash": prepared_context_hash,
+            "source_tree_hash": source_tree_hash,
+            "data_policy_version": data_policy_version,
             "audit_schema_version": audit_schema_version,
             "initial_cash": float(initial_cash),
         }
@@ -367,10 +424,22 @@ class PaperStateStore:
             self.conn.execute(
                 """
                 insert into paper_runs(
-                    run_id, cohort_id, strategy_commit, full_config_hash, audit_schema_version, initial_cash, payload_hash
-                ) values (?, ?, ?, ?, ?, ?, ?)
+                    run_id, cohort_id, strategy_commit, full_config_hash, prepared_context_hash, source_tree_hash,
+                    data_policy_version, audit_schema_version, initial_cash, payload_hash
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, cohort_id, strategy_commit, full_config_hash, audit_schema_version, initial_cash, payload_hash),
+                (
+                    run_id,
+                    cohort_id,
+                    strategy_commit,
+                    full_config_hash,
+                    prepared_context_hash,
+                    source_tree_hash,
+                    data_policy_version,
+                    audit_schema_version,
+                    initial_cash,
+                    payload_hash,
+                ),
             )
 
     def load_latest_state(self, run_id: str) -> PortfolioState | None:
@@ -394,8 +463,14 @@ class PaperStateStore:
                 previous_close_equity=float(run["initial_cash"]),
                 strategy_commit=str(run["strategy_commit"]),
                 full_config_hash=str(run["full_config_hash"]),
+                prepared_context_hash=str(run["prepared_context_hash"]),
+                source_tree_hash=str(run["source_tree_hash"]),
+                data_policy_version=str(run["data_policy_version"] or DATA_POLICY_VERSION),
                 audit_schema_version=str(run["audit_schema_version"]),
             )
+        prepared_context_hash = str(row["prepared_context_hash"] or (run["prepared_context_hash"] if run else ""))
+        source_hash = str(row["source_tree_hash"] or (run["source_tree_hash"] if run else ""))
+        data_policy = str(row["data_policy_version"] or (run["data_policy_version"] if run else DATA_POLICY_VERSION))
         return PortfolioState(
             run_id=run_id,
             state_version=str(row["state_version"]),
@@ -406,8 +481,11 @@ class PaperStateStore:
             pending_orders=json.loads(row["pending_orders_json"]),
             risk_state=json.loads(row["risk_state_json"]),
             previous_close_equity=float(row["previous_close_equity"]),
-            strategy_commit=str(run["strategy_commit"]) if run else "",
-            full_config_hash=str(run["full_config_hash"]) if run else "",
+            strategy_commit=str(row["strategy_commit"] or (run["strategy_commit"] if run else "")),
+            full_config_hash=str(row["full_config_hash"] or (run["full_config_hash"] if run else "")),
+            prepared_context_hash=prepared_context_hash,
+            source_tree_hash=source_hash,
+            data_policy_version=data_policy,
             audit_schema_version=str(run["audit_schema_version"]) if run else "",
         )
 
@@ -465,6 +543,7 @@ class PaperStateStore:
                     raise IdempotencyConflict(f"paper_sessions conflict for {run_id} {session_date} {phase}")
                 self.conn.rollback()
                 return
+            self._validate_session_transition(run_id, session_date, phase, state_before)
             self.conn.execute(
                 """
                 insert into paper_sessions(
@@ -569,6 +648,74 @@ class PaperStateStore:
             (run_id,),
         ).fetchone()
         return int(row[0])
+
+    def synthetic_pending_order_count(self, run_id: str) -> int:
+        rows = self.conn.execute(
+            "select payload_json from pending_orders where run_id = ?",
+            (run_id,),
+        ).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if int(float(payload.get("synthetic_from_fill", 0) or 0)) != 0:
+                count += 1
+        return count
+
+    def _validate_session_transition(
+        self,
+        run_id: str,
+        session_date: date,
+        phase: str,
+        state_before: PortfolioState,
+    ) -> None:
+        if phase not in {"open", "close"}:
+            raise PhaseOrderViolation(f"unknown phase={phase}")
+        run = self.conn.execute("select * from paper_runs where run_id = ?", (run_id,)).fetchone()
+        if run:
+            run_context = str(run["prepared_context_hash"] or "")
+            if run_context and state_before.prepared_context_hash and state_before.prepared_context_hash != run_context:
+                raise ContextIdentityMismatch(
+                    f"prepared_context_hash mismatch run={run_context} state={state_before.prepared_context_hash}"
+                )
+            run_config = str(run["full_config_hash"] or "")
+            if run_config and state_before.full_config_hash and state_before.full_config_hash != run_config:
+                raise ContextIdentityMismatch(
+                    f"full_config_hash mismatch run={run_config} state={state_before.full_config_hash}"
+                )
+        latest = self.conn.execute(
+            """
+            select session_date, phase, state_after_hash from portfolio_state_snapshots
+            where run_id = ?
+            order by session_date desc, case phase when 'open' then 1 when 'close' then 2 else 3 end desc
+            limit 1
+            """,
+            (run_id,),
+        ).fetchone()
+        if latest is None:
+            if phase != "open":
+                raise PhaseOrderViolation("initial phase must be open")
+            return
+        latest_date = date.fromisoformat(str(latest["session_date"]))
+        latest_phase = str(latest["phase"])
+        latest_hash = str(latest["state_after_hash"])
+        before_hash = state_hash(state_before)
+        if before_hash != latest_hash:
+            raise PhaseOrderViolation("state_before does not match latest persisted state")
+        if session_date < latest_date:
+            raise PhaseOrderViolation(f"cannot move backward from {latest_date} to {session_date}")
+        if session_date == latest_date:
+            if latest_phase == "close":
+                raise PhaseOrderViolation(f"{session_date} already closed")
+            if latest_phase == "open" and phase != "close":
+                raise PhaseOrderViolation(f"{session_date} open must be followed by close")
+            return
+        if latest_phase != "close":
+            raise PhaseOrderViolation(f"cannot advance to {session_date} before closing {latest_date}")
+        if phase != "open":
+            raise PhaseOrderViolation("new trading date must start with open")
 
     def orphan_count(self, run_id: str) -> int:
         return sum(self.orphan_breakdown(run_id).values())
@@ -759,6 +906,7 @@ class PaperStateStore:
                 row,
             )
         if equity_payload:
+            equity_storage_payload = _equity_storage_payload(equity_payload)
             self._insert_payload_row(
                 "equity_snapshots",
                 ("run_id", "session_date"),
@@ -767,11 +915,11 @@ class PaperStateStore:
                 (
                     run_id,
                     session_date.isoformat(),
-                    float(equity_payload.get("cash", 0.0)),
-                    float(equity_payload.get("equity", 0.0)),
-                    float(equity_payload.get("exposure", 0.0)),
+                    float(equity_storage_payload.get("cash", 0.0)),
+                    float(equity_storage_payload.get("equity", 0.0)),
+                    float(equity_storage_payload.get("exposure", 0.0)),
                 ),
-                equity_payload,
+                equity_storage_payload,
             )
 
     def _insert_state_snapshot(
@@ -792,8 +940,9 @@ class PaperStateStore:
             """
             insert into portfolio_state_snapshots(
                 run_id, session_date, phase, state_version, state_before_hash, state_after_hash, cash,
-                positions_json, pending_orders_json, risk_state_json, previous_close_equity, payload_hash
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                positions_json, pending_orders_json, risk_state_json, previous_close_equity, strategy_commit,
+                full_config_hash, prepared_context_hash, source_tree_hash, data_policy_version, payload_hash
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -807,6 +956,11 @@ class PaperStateStore:
                 _json(state.pending_orders),
                 _json(state.risk_state),
                 float(state.previous_close_equity),
+                state.strategy_commit,
+                state.full_config_hash,
+                state.prepared_context_hash,
+                state.source_tree_hash,
+                state.data_policy_version,
                 payload_hash,
             ),
         )
@@ -884,6 +1038,21 @@ def _rows(container: dict[str, list[dict[str, Any]]], key: str) -> list[dict[str
     return [dict(row) for row in container.get(key, [])]
 
 
+def _ensure_risk_state(state: PortfolioState) -> None:
+    defaults = {
+        "peak_equity": float(state.previous_close_equity or state.cash),
+        "daily_loss": 0.0,
+        "weekly_loss": 0.0,
+        "active_week": "",
+        "active_week_size_multiplier": 1.0,
+        "halted_next_session": False,
+        "stopped_for_drawdown": False,
+        "previous_close_equity": float(state.previous_close_equity or state.cash),
+    }
+    for key, value in defaults.items():
+        state.risk_state.setdefault(key, value)
+
+
 def _fill_pending_order_id(row: dict[str, Any]) -> str:
     return str(row.get("fill_pending_order_id") or row.get("pending_order_id") or "")
 
@@ -945,23 +1114,81 @@ def _position_snapshot_from_fill(
 
 
 def _equity_payload(state: PortfolioState, session_input: SessionInput, market_data: dict[str, Any] | None) -> dict[str, Any]:
+    reported: dict[str, Any] = {}
     if session_input.equity_payload:
-        return dict(session_input.equity_payload)
-    if market_data and market_data.get("equity_payload"):
-        return dict(market_data["equity_payload"])
-    equity = float(state.cash)
-    return {"cash": float(state.cash), "equity": equity, "exposure": 0.0}
+        reported = dict(session_input.equity_payload)
+    elif market_data and market_data.get("equity_payload"):
+        reported = dict(market_data["equity_payload"])
+    positions_value = _positions_mark_value(state, reported)
+    derived_equity = float(state.cash) + positions_value
+    equity = dict(reported)
+    equity["cash"] = float(state.cash)
+    equity["derived_cash"] = float(state.cash)
+    equity["derived_positions_value"] = positions_value
+    equity["derived_equity"] = derived_equity
+    if "equity" not in equity:
+        equity["equity"] = derived_equity
+    if "reported_cash" not in equity and reported:
+        equity["reported_cash"] = reported.get("cash")
+    if "reported_equity" not in equity and reported:
+        equity["reported_equity"] = reported.get("equity")
+    equity.setdefault("exposure", 0.0)
+    return equity
+
+
+def _equity_storage_payload(equity: dict[str, Any]) -> dict[str, Any]:
+    keys = ("cash", "equity", "exposure", "fill_count")
+    return {key: equity[key] for key in keys if key in equity}
+
+
+def _positions_mark_value(state: PortfolioState, payload: dict[str, Any]) -> float:
+    marks = payload.get("marks") if isinstance(payload.get("marks"), dict) else {}
+    total = 0.0
+    for key, position in state.positions.items():
+        if isinstance(position, dict):
+            shares = int(float(position.get("shares", 0) or 0))
+            code = str(position.get("code", key))
+        else:
+            shares = int(float(position or 0))
+            code = str(key)
+        if shares <= 0:
+            continue
+        mark = marks.get(code) if isinstance(marks, dict) else None
+        if mark is None and isinstance(position, dict):
+            mark = position.get("mark_price", position.get("last_price", position.get("average_price", 0.0)))
+        total += shares * float(mark or 0.0)
+    return total
+
+
+def _active_position_count(state: PortfolioState) -> int:
+    count = 0
+    for position in state.positions.values():
+        if isinstance(position, dict):
+            shares = int(float(position.get("shares", 0) or 0))
+        else:
+            shares = int(float(position or 0))
+        if shares > 0:
+            count += 1
+    return count
 
 
 def _reconcile_state(state: PortfolioState, equity: dict[str, Any]) -> dict[str, Any]:
-    reported_cash = float(equity.get("cash", state.cash))
-    reported_equity = float(equity.get("equity", state.previous_close_equity or reported_cash))
+    reported_cash_raw = equity.get("reported_cash", equity.get("cash", state.cash))
+    reported_equity_raw = equity.get("reported_equity", equity.get("equity", state.previous_close_equity or state.cash))
+    reported_cash = float(reported_cash_raw) if reported_cash_raw is not None else float(state.cash)
+    reported_equity = float(reported_equity_raw) if reported_equity_raw is not None else float(state.previous_close_equity or state.cash)
+    derived_positions_value = float(equity.get("derived_positions_value", 0.0) or 0.0)
+    derived_equity = float(equity.get("derived_equity", float(state.cash) + derived_positions_value) or 0.0)
     return {
         "cash_match": abs(reported_cash - float(state.cash)) < 1e-6,
+        "derived_equity_match": abs(reported_equity - derived_equity) < 1e-4,
         "reported_cash": reported_cash,
         "state_cash": float(state.cash),
         "reported_equity": reported_equity,
-        "position_count": sum(1 for row in state.positions.values() if int(float(row.get("shares", 0) or 0)) > 0),
+        "derived_cash": float(state.cash),
+        "derived_positions_value": derived_positions_value,
+        "derived_equity": derived_equity,
+        "position_count": _active_position_count(state),
         "pending_order_count": len(state.pending_orders),
     }
 

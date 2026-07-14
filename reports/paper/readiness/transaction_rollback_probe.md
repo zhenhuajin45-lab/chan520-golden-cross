@@ -1,4 +1,4 @@
-# Crash Recovery Report
+# Transaction Rollback Probe
 
 ```json
 {

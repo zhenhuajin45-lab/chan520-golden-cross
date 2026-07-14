@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
 
 import pytest
 
 from chan520_skill.paper_state import (
+    ContextIdentityMismatch,
     IdempotencyConflict,
     PaperStateStore,
+    PhaseOrderViolation,
     PortfolioState,
     SessionInput,
     process_session_close,
@@ -144,6 +147,14 @@ def test_session_open_close_mutate_state_and_persist_snapshots(tmp_path):
             audit_schema_version="2",
         )
         day = date(2026, 1, 6)
+        initial_open = SessionInput(
+            session_date=day,
+            equity_payload={"cash": 100000.0, "equity": 100000.0, "exposure": 0.0},
+        )
+        before_initial_open = deepcopy(state)
+        initial_open_result = process_session_open(state, initial_open)
+        store.persist_session_result("run1", day, "open", before_initial_open, initial_open_result)
+
         close_input = SessionInput(
             session_date=day,
             candidates=[{"candidate_id": "cand1", "date": day.isoformat(), "selected": 1, "rank": 1}],
@@ -161,7 +172,7 @@ def test_session_open_close_mutate_state_and_persist_snapshots(tmp_path):
             },
             equity_payload={"cash": 100000.0, "equity": 100000.0, "exposure": 0.0},
         )
-        before_close = PortfolioState(**state.__dict__)
+        before_close = deepcopy(state)
         close_result = process_session_close(state, close_input)
         store.persist_session_result("run1", day, "close", before_close, close_result)
 
@@ -189,14 +200,78 @@ def test_session_open_close_mutate_state_and_persist_snapshots(tmp_path):
             },
             equity_payload={"cash": 98995.0, "equity": 100000.0, "exposure": 0.01},
         )
-        before_open = PortfolioState(**state.__dict__)
+        before_open = deepcopy(state)
         open_result = process_session_open(state, open_input)
         store.persist_session_result("run1", next_day, "open", before_open, open_result)
 
-        assert store.count("portfolio_state_snapshots") == 2
+        assert store.count("portfolio_state_snapshots") == 3
         assert store.count("ledger_events") == 2
         assert store.count("pending_orders") == 1
         assert store.count("fills") == 1
         assert store.load_latest_state("run1").cash == 98995.0
+    finally:
+        store.close()
+
+
+def test_process_session_rejects_legacy_date_overload():
+    state = PortfolioState(run_id="run1", state_version="2", cash=100000.0)
+    with pytest.raises(TypeError):
+        process_session_open(state, date(2026, 1, 5))  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        process_session_close(state, date(2026, 1, 5))  # type: ignore[arg-type]
+
+
+def test_phase_order_rejects_close_before_open(tmp_path):
+    store = PaperStateStore(tmp_path / "paper.sqlite")
+    try:
+        store.init_run(
+            run_id="run1",
+            cohort_id="cohort1",
+            strategy_commit="abc123",
+            full_config_hash="cfg",
+            audit_schema_version="2",
+            initial_cash=100000.0,
+        )
+        state = PortfolioState(
+            run_id="run1",
+            state_version="2",
+            cash=100000.0,
+            previous_close_equity=100000.0,
+            strategy_commit="abc123",
+            full_config_hash="cfg",
+        )
+        day = date(2026, 1, 5)
+        result = process_session_close(state, SessionInput(session_date=day))
+        with pytest.raises(PhaseOrderViolation):
+            store.persist_session_result("run1", day, "close", deepcopy(state), result)
+    finally:
+        store.close()
+
+
+def test_context_identity_mismatch_rejected(tmp_path):
+    store = PaperStateStore(tmp_path / "paper.sqlite")
+    try:
+        store.init_run(
+            run_id="run1",
+            cohort_id="cohort1",
+            strategy_commit="abc123",
+            full_config_hash="cfg",
+            prepared_context_hash="ctx-a",
+            audit_schema_version="2",
+            initial_cash=100000.0,
+        )
+        state = PortfolioState(
+            run_id="run1",
+            state_version="2",
+            cash=100000.0,
+            previous_close_equity=100000.0,
+            strategy_commit="abc123",
+            full_config_hash="cfg",
+            prepared_context_hash="ctx-b",
+        )
+        day = date(2026, 1, 5)
+        result = process_session_open(state, SessionInput(session_date=day))
+        with pytest.raises(ContextIdentityMismatch):
+            store.persist_session_result("run1", day, "open", deepcopy(state), result)
     finally:
         store.close()
