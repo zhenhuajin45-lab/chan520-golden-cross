@@ -51,7 +51,7 @@ from chan520_skill.risk import RiskConfig
 from gm_alpha_store import load_store_data
 
 
-EXPECTED_SQLITE_SHA256 = "3f4fe7f4c4aefd2a6e6abca98ce9b9a4a081da5c2a62eba4e75feae8ffb7f943"
+EXPECTED_SQLITE_SHA256 = "073a6021a1d1664a91b66d65c54afb536a6f040dd7771dd904cd26d8ccb5459d"
 DEFAULT_COHORT_ID = "shadow_ranked_v1"
 DEFAULT_RUN_ID = "shadow_ranked_v1_2026"
 DEFAULT_STORE = Path("data/paper/shadow_ranked_v1.sqlite")
