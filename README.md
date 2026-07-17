@@ -86,3 +86,80 @@ https://qt.gtimg.cn/q=sh600288
 完整实战版规则见 [docs/practical_520_strategy.md](docs/practical_520_strategy.md)。
 回测、市场状态、行业层、风险纪律、架构和测试说明见 [docs/backtest.md](docs/backtest.md)、[docs/regime.md](docs/regime.md)、[docs/sector.md](docs/sector.md)、[docs/risk.md](docs/risk.md)、[docs/architecture.md](docs/architecture.md)、[docs/testing.md](docs/testing.md)。
 V4 固定研究篮子回测、敏感性实验和解释见 [reports/backtest/v4/README.md](reports/backtest/v4/README.md)。
+
+## 本地模拟盘工作台
+
+不接 GM/掘金时，可以使用本地 SQLite 模拟券商。默认账户资金为 100 万，账本写入 `data/local_sim/broker.sqlite`，该文件不会提交到 Git。
+
+```bash
+python3.11 -m venv .venv311
+source .venv311/bin/activate
+pip install -r requirements.txt
+
+python scripts/local_sim_broker.py --initial-cash 1000000 init
+python scripts/local_sim_broker.py buy --symbol SHSE.600288 --volume 100 --price 10.00 --client-order-id demo-001 --session-date 2026-07-15 --signal-name trend_pullback_entry --entry-reason "趋势向上，回踩后收回 MA20，R:R>=2"
+python scripts/export_local_sim_dashboard.py --initial-cash 1000000
+python scripts/check_local_sim_readiness.py --trade-date 2026-07-15 --fix
+cd web_dashboard && python -m http.server 8765
+```
+
+浏览器打开 `http://127.0.0.1:8765/` 查看账户、持仓、每日汇总、订单和成交明细。页面每 15 秒自动读取最新导出数据；每日任务会在关键阶段自动刷新数据文件。本地模拟盘订单必须传 `--session-date`，否则会 fail-closed；买入可填写 `--entry-reason`，卖出可填写 `--exit-reason`、`--risk-reason`、`--risk-reason-code`，这些字段会进入工作台和飞书消息。工作台同时展示风险循环与新增买入两套 readiness，避免“可管理持仓”被误读为“允许开新仓”。
+
+飞书推送使用本地私有配置或环境变量，不提交 webhook：
+
+```bash
+# 环境变量方式
+export FEISHU_LOCAL_SIM_WEBHOOK_URL="你的飞书机器人 webhook"
+
+# 或在本机创建 config_private.local.json:
+# {"feishu":{"local_sim_webhook":"你的飞书机器人 webhook"}}
+
+python scripts/export_local_sim_dashboard.py --initial-cash 1000000
+python scripts/push_local_sim_feishu.py --mode trades --dry-run
+python scripts/push_local_sim_feishu.py --mode trades
+python scripts/push_local_sim_feishu.py --mode review
+```
+
+`plan` 推送盘前计划和阻断边界，`trades` 推送新增成交，`review` 推送每日账户复盘；推送状态用 `data/local_sim/feishu_push_state.json` 防重复。估值不完整时盘后复盘 fail-closed，不发送误导性盈亏。审计结果写入 `reports/local_sim_feishu/YYYY-MM-DD/feishu_push_audit.json`。
+
+如果希望下单成交后立即推送新增成交，可以在本地下单命令后加：
+
+```bash
+python scripts/local_sim_broker.py buy --symbol SHSE.600288 --volume 100 --price 10.00 --client-order-id demo-002 --session-date 2026-07-15 --entry-reason "严格价位触发：开盘价处于技术买入区" --push-feishu
+```
+
+本地模拟盘也可以接入 paper open/close kernel。`close` 生成计划单，`open` 把 kernel 触发的成交同步到本地模拟盘账本：
+
+```bash
+python scripts/paper_runner.py close --date 2026-07-15 --incremental-prefix --initial-cash 1000000 --local-sim-sync
+python scripts/paper_runner.py open --date 2026-07-16 --incremental-prefix --initial-cash 1000000 --local-sim-sync
+```
+
+实时估值和盘中风控候选：
+
+```bash
+python scripts/export_local_sim_dashboard.py --initial-cash 1000000 --mark-quotes
+python scripts/local_sim_risk_scan.py --trade-date 2026-07-15
+python scripts/execute_local_sim_risk_exits.py --trade-date 2026-07-16 --submit
+```
+
+核心计划 `local_sim_core_plan_v2` 额外执行两项硬门：计划价格必须满足 `止损 < 下沿 <= 触发 <= 上沿 < 失效价`；仓位风险按技术止损与 T+1 隔夜波动缓冲的较大值计算，主板缓冲底线 7.5%，创业板/科创板 12%。风险策略 `local_sim_risk_policy_v2` 对 -5.5% 硬止损使用单次新鲜报价快速通道，MA20/MA5 失效仍需二阶段确认；利润保护在峰值浮盈达到 3%、回吐 1.5% 且保留利润低于峰值 65% 时触发候选。未完成风险计划会跨交易日保留武装时间、确认状态和证据；账户存在未解决风险卖单时，新增买入保持关闭。
+
+推荐使用每日编排器。`plan` 只使用上一交易日完整日线；扫描覆盖率低于 85%、市场状态未知、计划几何无效或无严格候选时，新增买入保持关闭。`intraday` 先处理 T+1 风控卖出，再处理买入二阶段确认。
+
+```bash
+python scripts/run_local_sim_daily.py --phase plan --trade-date 2026-07-16 --feishu dry-run
+python scripts/run_local_sim_daily.py --phase preopen --trade-date 2026-07-16 --feishu dry-run
+python scripts/run_local_sim_daily.py --phase intraday --trade-date 2026-07-16 --feishu send
+python scripts/run_local_sim_daily.py --phase eod --trade-date 2026-07-16 --feishu send
+```
+
+Mac 上可安装 `launchd` 任务与 8768 工作台常驻服务。安装器默认拒绝覆盖已有的同名但内容不同的 plist：
+
+```bash
+.venv311/bin/python scripts/install_local_sim_launchd.py
+```
+
+安装后工作日自动执行：08:00 计划、09:20 盘前检查、09:30-09:44 每两分钟一次开盘风控循环，之后在 09:51/10:31/11:15/13:11/14:01/14:31/14:51 继续盘中循环，15:20 盘后复盘。每轮都先处理风险卖出，再处理买入；两个及以上主要指数跌幅达到 1.5% 时阻断新增买入。同阶段 90 秒内的重复任务会幂等跳过，逐次摘要不会覆盖正式运行证据。外层日志写入 `reports/local_sim_launchd/`，每次任务的逐步骤证据仍写入 `reports/local_sim_daily/YYYYMMDD/`。
+
+本地自动执行不代表 GM/正式 shadow kernel 就绪。`auto_open_close_kernel_ready`、`gm_adapter_shadow_ready` 和 `shadow_readiness` 在完成正式 V5 数据、行业映射、回放对账与异常演练前继续保持 `false`。

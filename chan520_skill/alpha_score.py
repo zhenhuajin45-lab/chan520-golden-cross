@@ -50,7 +50,10 @@ def _trend(rows: list[KLine], idx: int, point: IndicatorPoint) -> tuple[int, lis
     if idx >= 20 and point.ma20 is not None:
         sustained = 0
         for pos in range(idx, max(idx - 20, -1), -1):
-            if rows[pos].close > point.ma20:
+            if pos < 19:
+                continue
+            historical_ma20 = sum(item.close for item in rows[pos - 19 : pos + 1]) / 20
+            if rows[pos].close > historical_ma20:
                 sustained += 1
         if sustained >= 12:
             score += 5
@@ -96,9 +99,10 @@ def _volume_quality(rows: list[KLine], idx: int, point: IndicatorPoint) -> tuple
         reasons.append("volume_not_exhausted")
     if idx >= 5:
         pullback = rows[idx - 5 : idx]
-        if pullback and min(item.close for item in pullback) < max(item.close for item in pullback):
+        down_sessions = sum(1 for pos in range(1, len(pullback)) if pullback[pos].close < pullback[pos - 1].close)
+        if pullback and down_sessions >= 2 and row.close < max(item.close for item in pullback):
             avg_pullback_volume = sum(item.volume for item in pullback) / len(pullback)
-            if row.volume <= avg_pullback_volume * 1.5:
+            if row.volume <= avg_pullback_volume:
                 score += 5
                 reasons.append("pullback_volume_control")
     return min(score, 20), reasons

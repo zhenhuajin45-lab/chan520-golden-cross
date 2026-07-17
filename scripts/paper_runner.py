@@ -32,6 +32,7 @@ from chan520_skill.backtest import (
 from chan520_skill.evidence_manifest import git_commit, sha256_file, stable_hash_json
 from chan520_skill.incremental_guard import DataAccessGuard
 from chan520_skill.models import StockMeta
+from chan520_skill.broker_adapter import BrokerOrderRequest, BrokerSide, LocalSimBrokerAdapter, LocalSimBrokerConfig
 from chan520_skill.paper_state import (
     DATA_POLICY_VERSION,
     PAPER_STATE_VERSION,
@@ -95,10 +96,16 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cohort-id", default=DEFAULT_COHORT_ID)
     parser.add_argument("--run-id", default=DEFAULT_RUN_ID)
     parser.add_argument("--output-root", default=str(DEFAULT_REPORT_DIR))
+    parser.add_argument("--initial-cash", type=float, default=100000.0)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--expected-strategy-commit", default="")
     parser.add_argument("--expected-config-hash", default="")
+    parser.add_argument("--local-sim-sync", action="store_true", help="Sync paper close/open plans and fills into the local SQLite simulated broker")
+    parser.add_argument("--local-sim-ledger", default="data/local_sim/broker.sqlite")
+    parser.add_argument("--local-sim-account-id", default="local-sim")
+    parser.add_argument("--local-sim-initial-cash", type=float, default=1_000_000.0)
+    parser.add_argument("--local-sim-dry-run", action="store_true")
     parser.add_argument(
         "--incremental-prefix",
         action="store_true",
@@ -136,7 +143,7 @@ def create_run(args: argparse.Namespace) -> None:
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end)
     data = load_store_data(gm_store, start, end, args.lookback_days, args.max_symbols)
-    context = prepare_context(data, start, end)
+    context = prepare_context(data, start, end, initial_cash=args.initial_cash)
     identity = build_ranked_identity(context)
     verify_expected_identity(args, identity)
     if args.dry_run:
@@ -148,7 +155,7 @@ def create_run(args: argparse.Namespace) -> None:
             run_id=args.run_id,
             cohort_id=args.cohort_id,
             identity=identity,
-            initial_cash=100000.0,
+            initial_cash=args.initial_cash,
         )
     finally:
         store.close()
@@ -171,7 +178,7 @@ def replay(args: argparse.Namespace) -> int:
     end = date.fromisoformat(args.end)
     data = load_store_data(gm_store, start, end, args.lookback_days, args.max_symbols)
     status_by_date = load_status_snapshots(gm_store, start, end)
-    context = prepare_context(data, start, end)
+    context = prepare_context(data, start, end, initial_cash=args.initial_cash)
     strategy_commit = git_commit(Path.cwd())
     result = run_portfolio_kernel(
         context,
@@ -192,15 +199,15 @@ def replay(args: argparse.Namespace) -> int:
             run_id=args.run_id,
             cohort_id=args.cohort_id,
             identity=identity,
-            initial_cash=100000.0,
+            initial_cash=args.initial_cash,
         )
-        payloads = build_day_payloads(result)
+        payloads = build_day_payloads(result, initial_cash=args.initial_cash)
         gate_results = {}
         state = store.load_latest_state(args.run_id) or PortfolioState(
             run_id=args.run_id,
             state_version=PAPER_STATE_VERSION,
-            cash=100000.0,
-            previous_close_equity=100000.0,
+            cash=args.initial_cash,
+            previous_close_equity=args.initial_cash,
             **identity.as_payload(),
         )
         for session_date in context.all_dates:
@@ -281,8 +288,8 @@ def replay(args: argparse.Namespace) -> int:
             ),
         }
         account = {
-            "batch_final_equity": result.equity_curve[-1][1] if result.equity_curve else 100000.0,
-            "paper_final_equity": last_paper_equity(store, args.run_id),
+            "batch_final_equity": result.equity_curve[-1][1] if result.equity_curve else args.initial_cash,
+            "paper_final_equity": last_paper_equity(store, args.run_id, fallback=args.initial_cash),
         }
         account["passed"] = abs(account["batch_final_equity"] - account["paper_final_equity"]) < 1e-6
         reports = {
@@ -327,7 +334,7 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
     guard = DataAccessGuard(session_date) if getattr(args, "incremental_prefix", False) else None
     if guard is not None:
         assert_raw_incremental_data_not_future(data, status_by_date, guard)
-    context = prepare_context(data, start, context_end)
+    context = prepare_context(data, start, context_end, initial_cash=args.initial_cash)
     if guard is not None:
         assert_prepared_context_not_future(context, guard)
     if session_date not in context.all_dates:
@@ -350,16 +357,16 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         run_id=args.run_id,
         cohort_id=args.cohort_id,
         identity=identity,
-        initial_cash=100000.0,
+        initial_cash=args.initial_cash,
     )
     state = store.load_latest_state(args.run_id) or PortfolioState(
         run_id=args.run_id,
         state_version=PAPER_STATE_VERSION,
-        cash=100000.0,
-        previous_close_equity=100000.0,
+        cash=args.initial_cash,
+        previous_close_equity=args.initial_cash,
         **identity.as_payload(),
     )
-    payload = build_day_payloads(result)[session_date]
+    payload = build_day_payloads(result, initial_cash=args.initial_cash)[session_date]
     gate = validate_daily_data_gate(data, context, session_date, status_by_date)
     store.record_data_gate(args.run_id, session_date, "PASS" if gate["passed"] else "FAIL_CLOSED", gate)
     if not gate["passed"]:
@@ -386,6 +393,8 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         if not hasattr(result_open, "state"):
             raise RuntimeError("open state machine did not return SessionResult")
         store.persist_session_result(args.run_id, session_date, "open", before, result_open)
+        if args.local_sim_sync:
+            sync_open_fills_to_local_sim(args, session_date, result_open.fills)
         return
     if args.cmd == "close":
         before = deepcopy(state)
@@ -394,6 +403,8 @@ def run_single_open_close_phase(args: argparse.Namespace, store: PaperStateStore
         if not hasattr(result_close, "state"):
             raise RuntimeError("close state machine did not return SessionResult")
         store.persist_session_result(args.run_id, session_date, "close", before, result_close)
+        if args.local_sim_sync:
+            sync_close_plans_to_local_sim(args, session_date, result_close.pending_orders)
         return
     raise SystemExit(f"unsupported phase: {args.cmd}")
 
@@ -456,6 +467,172 @@ def reconcile_single_phase(args: argparse.Namespace, store: PaperStateStore, ses
         print(json.dumps(details, ensure_ascii=False, sort_keys=True), flush=True)
         return
     store.record_reconciliation(args.run_id, session_date, "account_lifecycle", "PASS" if details["passed"] else "FAIL", details)
+
+
+def local_sim_adapter_from_args(args: argparse.Namespace) -> LocalSimBrokerAdapter:
+    return LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(
+            account_id=args.local_sim_account_id,
+            initial_cash=args.local_sim_initial_cash,
+            ledger_path=args.local_sim_ledger,
+        )
+    )
+
+
+def sync_close_plans_to_local_sim(args: argparse.Namespace, session_date: date, pending_orders: list[dict[str, Any]]) -> None:
+    adapter = local_sim_adapter_from_args(args)
+    if args.local_sim_dry_run:
+        print(
+            json.dumps(
+                {
+                    "local_sim_sync": "close_plans",
+                    "dry_run": True,
+                    "session_date": session_date.isoformat(),
+                    "planned_count": len(pending_orders),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return
+    count = 0
+    for row in pending_orders:
+        adapter.record_planned_order(plan_payload_from_pending(args.run_id, session_date, row))
+        count += 1
+    print(json.dumps({"local_sim_sync": "close_plans", "session_date": session_date.isoformat(), "planned_count": count}, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def sync_open_fills_to_local_sim(args: argparse.Namespace, session_date: date, fills: list[dict[str, Any]]) -> None:
+    adapter = local_sim_adapter_from_args(args)
+    if args.local_sim_dry_run:
+        print(
+            json.dumps(
+                {
+                    "local_sim_sync": "open_fills",
+                    "dry_run": True,
+                    "session_date": session_date.isoformat(),
+                    "fill_count": len(fills),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return
+    results = []
+    for fill in fills:
+        request = broker_request_from_kernel_fill(args.run_id, session_date, fill)
+        result = adapter.submit_order(request)
+        planned_id = str(fill.get("pending_order_id") or fill.get("fill_pending_order_id") or "")
+        if planned_id:
+            adapter.mark_planned_order(
+                planned_id,
+                "FILLED" if result.accepted else f"REJECTED_{result.reason_code.value}",
+                result.message,
+                {"kernel_fill_id": fill.get("fill_id"), "kernel_price": fill.get("price")},
+            )
+        results.append(
+            {
+                "fill_id": fill.get("fill_id"),
+                "symbol": request.symbol,
+                "side": request.side.value,
+                "accepted": result.accepted,
+                "reason_code": result.reason_code.value,
+            }
+        )
+    print(json.dumps({"local_sim_sync": "open_fills", "session_date": session_date.isoformat(), "results": results}, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def plan_payload_from_pending(run_id: str, session_date: date, row: dict[str, Any]) -> dict[str, Any]:
+    side = str(row.get("side") or "").lower()
+    symbol = broker_symbol(str(row.get("code") or ""))
+    reason = str(row.get("reason") or "")
+    signal_close = float(row.get("signal_close", 0.0) or 0.0)
+    rr = float(row.get("rr", 0.0) or 0.0)
+    stop = float(row.get("planned_stop", row.get("stop", 0.0)) or 0.0)
+    target = float(row.get("planned_target", row.get("target", 0.0)) or 0.0)
+    entry_upper = signal_close * 1.03 if side in {"buy", "add"} and signal_close > 0 else 0.0
+    entry_lower = max(stop, signal_close * 0.995) if side in {"buy", "add"} and signal_close > 0 else 0.0
+    return {
+        "planned_order_id": str(row.get("pending_order_id") or ""),
+        "pending_order_id": str(row.get("pending_order_id") or ""),
+        "order_intent_id": str(row.get("order_intent_id") or ""),
+        "candidate_id": str(row.get("candidate_id") or ""),
+        "run_id": run_id,
+        "trade_date": session_date.isoformat(),
+        "decision_date": str(row.get("decision_date") or session_date.isoformat()),
+        "symbol": symbol,
+        "code": str(row.get("code") or ""),
+        "side": "SELL" if side == "sell" else "BUY",
+        "volume": int(float(row.get("shares", 0) or 0)),
+        "shares": int(float(row.get("shares", 0) or 0)),
+        "status": "PLANNED",
+        "signal_name": "paper_kernel_pending_order",
+        "entry_reason": reason if side in {"buy", "add"} else "",
+        "exit_reason": reason if side == "sell" else "",
+        "risk_reason": reason if side == "sell" else "",
+        "risk_reason_code": reason if side == "sell" else "",
+        "reason_text": reason,
+        "signal_close": signal_close,
+        "trigger_price": signal_close,
+        "lower_price": entry_lower,
+        "upper_price": entry_upper,
+        "planned_stop": stop,
+        "planned_target": target,
+        "stop_price": stop,
+        "target_price": target,
+        "invalid_price": stop,
+        "rr": rr,
+        "notes": f"planned_by_paper_runner_close; rr={rr:.4f}",
+    }
+
+
+def broker_request_from_kernel_fill(run_id: str, session_date: date, fill: dict[str, Any]) -> BrokerOrderRequest:
+    raw_side = str(fill.get("side") or "").lower()
+    side = BrokerSide.SELL if raw_side == "sell" else BrokerSide.BUY
+    reason = str(fill.get("reason") or "")
+    extra = {
+        "signal_name": "paper_kernel_open_fill",
+        "entry_reason": reason if side is BrokerSide.BUY else "",
+        "exit_reason": reason if side is BrokerSide.SELL else "",
+        "risk_reason": reason if side is BrokerSide.SELL else "",
+        "risk_reason_code": reason if side is BrokerSide.SELL else "",
+        "notes": json.dumps(
+            {
+                "kernel_fill_id": fill.get("fill_id"),
+                "pending_order_id": fill.get("pending_order_id") or fill.get("fill_pending_order_id"),
+                "planned_stop": fill.get("stop"),
+                "planned_target": fill.get("target"),
+                "opening_gap": fill.get("opening_gap"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ),
+    }
+    return BrokerOrderRequest(
+        symbol=broker_symbol(str(fill.get("code") or "")),
+        side=side,
+        volume=int(float(fill.get("shares", 0) or 0)),
+        price=float(fill.get("price", 0.0) or 0.0),
+        position_effect="CLOSE" if side is BrokerSide.SELL else "OPEN",
+        order_intent_id=str(fill.get("order_intent_id") or fill.get("fill_order_intent_id") or ""),
+        run_id=run_id,
+        session_date=session_date.isoformat(),
+        client_order_id=str(fill.get("fill_id") or ""),
+        extra=extra,
+    )
+
+
+def broker_symbol(code: str) -> str:
+    digits = "".join(ch for ch in str(code) if ch.isdigit())
+    if "." in str(code) and len(digits) >= 6:
+        return str(code)
+    if not digits:
+        return str(code)
+    prefix = "SHSE" if digits.startswith(("5", "6", "9")) else "SZSE"
+    return f"{prefix}.{digits[:6]}"
 
 
 def build_session_input(
@@ -553,10 +730,10 @@ def ranked_identity_configs(context) -> dict[str, Any]:
     }
 
 
-def prepare_context(data, start: date, end: date):
+def prepare_context(data, start: date, end: date, *, initial_cash: float = 100000.0):
     engine = PortfolioEngineConfig(max_positions=5, strategy_mode="strategy_v5_alpha_ranked")
     config = BacktestConfig(
-        initial_cash=engine.initial_cash,
+        initial_cash=initial_cash,
         strategy_mode=engine.strategy_mode,
         selection_policy=engine.selection_policy,
         selection_seed=engine.selection_seed,
@@ -589,7 +766,7 @@ def prepare_context(data, start: date, end: date):
     )
 
 
-def build_day_payloads(result) -> dict[date, dict[str, Any]]:
+def build_day_payloads(result, *, initial_cash: float = 100000.0) -> dict[date, dict[str, Any]]:
     payloads: dict[date, dict[str, Any]] = defaultdict(
         lambda: {
             "candidate_rows": [],
@@ -597,7 +774,7 @@ def build_day_payloads(result) -> dict[date, dict[str, Any]]:
             "fill_rows": [],
             "trade_rows": [],
             "position_link_rows": [],
-            "equity_payload": {"cash": 100000.0, "equity": 100000.0, "exposure": 0.0},
+            "equity_payload": {"cash": initial_cash, "equity": initial_cash, "exposure": 0.0},
         }
     )
     fill_dates: dict[str, date] = {}
@@ -631,7 +808,7 @@ def build_day_payloads(result) -> dict[date, dict[str, Any]]:
         fill_day = fill_dates.get(str(row.get("fill_id", "")))
         if fill_day:
             payloads[fill_day]["position_link_rows"].append(dict(row))
-    cash = 100000.0
+    cash = initial_cash
     fills_by_day = defaultdict(list)
     for fill in result.fills:
         fills_by_day[fill.date].append(fill)
@@ -894,12 +1071,12 @@ def transaction_rollback_probe(store: PaperStateStore, run_id: str, session_date
     }
 
 
-def last_paper_equity(store: PaperStateStore, run_id: str) -> float:
+def last_paper_equity(store: PaperStateStore, run_id: str, *, fallback: float = 100000.0) -> float:
     row = store.conn.execute(
         "select equity from equity_snapshots where run_id = ? order by session_date desc limit 1",
         (run_id,),
     ).fetchone()
-    return float(row["equity"]) if row else 100000.0
+    return float(row["equity"]) if row else fallback
 
 
 def write_readiness_reports(out: Path, reports: dict[str, Any], store: PaperStateStore, run_id: str) -> None:

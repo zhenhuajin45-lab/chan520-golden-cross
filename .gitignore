@@ -7,6 +7,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv*/
 venv/
 env/
 
@@ -25,11 +26,18 @@ data/gm_alpha/*.sqlite-shm
 data/paper/*.sqlite*
 data/paper/*.sqlite-wal
 data/paper/*.sqlite-shm
+data/local_sim/*.sqlite*
+data/local_sim/*.sqlite-wal
+data/local_sim/*.sqlite-shm
+data/local_sim/*.json
+web_dashboard/data/local_sim/*.json
 
 # Local scratch files
 tmp/
 *.log
 config/local_*.json
+config_private.local.json
+configs/*private*.json
 
 # OS/editor
 .DS_Store

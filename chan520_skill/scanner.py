@@ -170,6 +170,23 @@ def scan_market(
     stats["coverage_below_threshold"] = success_rate < 0.85
     if stats["coverage_below_threshold"]:
         print(f"WARNING: scan coverage {success_rate:.2%} below 85% threshold", flush=True)
+    quality_path = output_dir / f"scan_quality_{target.isoformat()}.json"
+    quality_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "chan520_open_source_scan_quality_v1",
+                "target_date": target.isoformat(),
+                **stats,
+                "coverage": success_rate,
+                "minimum_coverage": 0.85,
+                "coverage_pass": success_rate >= 0.85,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     return csv_path, md_path, stats
 
 

@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+from scripts.push_local_sim_feishu import (
+    build_plan_card,
+    build_review_card,
+    build_trade_card,
+    push_plan_card,
+    push_review_card,
+    push_trade_cards,
+)
+
+
+def sample_payload():
+    return {
+        "trade_date": "2026-07-15",
+        "account": {
+            "account_id": "local-sim",
+            "initial_cash": 1_000_000.0,
+            "cash": 998_995.0,
+            "market_value": 1_000.0,
+            "total_equity": 999_995.0,
+            "total_pnl": -5.0,
+            "total_pnl_pct": -0.000005,
+            "gross_exposure_pct": 0.001,
+            "open_position_count": 1,
+            "order_count": 1,
+            "fill_count": 1,
+        },
+        "positions": [
+            {
+                "symbol": "SHSE.600288",
+                "stock_name": "大恒科技",
+                "shares": 100,
+                "average_price": 10.0,
+                "market_value": 1000.0,
+                "signal_name": "trend_pullback_entry",
+                "entry_reason": "趋势向上，回踩后收回 MA20",
+                "entry_notes": "R:R>=2",
+                "peak_unrealized_pnl_pct": 0.04,
+                "profit_protection_armed": True,
+            }
+        ],
+        "orders": [
+            {
+                "order_id": "LSIM-1",
+                "client_order_id": "demo-1",
+                "symbol": "SHSE.600288",
+                "stock_name": "大恒科技",
+                "session_date": "2026-07-15",
+                "signal_name": "trend_pullback_entry",
+                "entry_reason": "趋势向上，回踩后收回 MA20",
+                "notes": "R:R>=2",
+            }
+        ],
+        "fills": [
+            {
+                "fill_id": "FILL-1",
+                "order_id": "LSIM-1",
+                "client_order_id": "demo-1",
+                "symbol": "SHSE.600288",
+                "stock_name": "大恒科技",
+                "side": "BUY",
+                "volume": 100,
+                "price": 10.0,
+                "gross": 1000.0,
+                "commission": 5.0,
+                "stamp_duty": 0.0,
+                "session_date": "2026-07-15",
+                "created_at": "2026-07-15T09:31:00+08:00",
+                "signal_name": "trend_pullback_entry",
+                "entry_reason": "趋势向上，回踩后收回 MA20",
+                "notes": "R:R>=2",
+            }
+        ],
+        "planned_orders": [
+            {
+                "planned_order_id": "PLAN-1",
+                "trade_date": "2026-07-15",
+                "symbol": "SHSE.600288",
+                "stock_name": "大恒科技",
+                "side": "BUY",
+                "volume": 100,
+                "status": "PLANNED",
+                "lower_price": 9.95,
+                "upper_price": 10.3,
+                "trigger_price": 10.0,
+                "reason_text": "趋势回踩计划入场",
+                "payload": {
+                    "geometry_valid": True,
+                    "t1_loss_buffer_pct": 0.075,
+                },
+            }
+        ],
+        "daily": [
+            {
+                "trade_date": "2026-07-15",
+                "fill_count": 1,
+                "buy_gross": 1000.0,
+                "sell_gross": 0.0,
+                "fees": 5.0,
+            }
+        ],
+    }
+
+
+def test_build_trade_card_uses_interactive_card():
+    payload = sample_payload()
+    card = build_trade_card(payload, payload["fills"][0], payload["orders"][0])
+
+    assert card["msg_type"] == "interactive"
+    assert card["card"]["header"]["template"] == "green"
+    assert "买入成交" in card["card"]["header"]["title"]["content"]
+    assert "大恒科技" in str(card)
+    assert "入场理由" in str(card)
+    assert "趋势向上" in str(card)
+
+
+def test_build_review_card_contains_account_summary():
+    card = build_review_card(sample_payload(), "2026-07-15")
+
+    content = str(card)
+    assert card["msg_type"] == "interactive"
+    assert "每日账户复盘" in content
+    assert "初始资金" in content
+    assert "账户盈亏" in content
+    assert "大恒科技" in content
+    assert "SHSE.600288" in content
+    assert "理由分布" in content
+    assert "R:R>=2" in content
+    assert "利润保护" in content
+    assert "待触发/计划订单" in content
+    assert "趋势回踩计划入场" in content
+
+
+def test_build_plan_card_separates_executable_and_watch_only_orders():
+    payload = sample_payload()
+    payload["planned_orders"][0]["status"] = "WATCH_TRIGGER"
+    payload["planned_orders"].append(
+        {
+            "planned_order_id": "PLAN-WATCH",
+            "trade_date": "2026-07-15",
+            "symbol": "SZSE.000001",
+            "stock_name": "平安银行",
+            "side": "BUY",
+            "volume": 0,
+            "status": "WATCH_ONLY",
+            "reason_text": "严格条件未满足",
+        }
+    )
+
+    card = build_plan_card(payload, "2026-07-15")
+
+    content = str(card)
+    assert "盘前核心交易计划" in content
+    assert "严格待触发" in content
+    assert "观察池" in content
+    assert "大恒科技" in content
+    assert "平安银行" in content
+
+
+def test_push_plan_card_dry_run_does_not_mark_state():
+    state = {"pushed_keys": {}}
+    audit = push_plan_card(
+        payload=sample_payload(),
+        state=state,
+        trade_date="2026-07-15",
+        dry_run=True,
+        force=False,
+        timeout=1,
+    )
+
+    assert audit["sent_count"] == 0
+    assert audit["skipped_count"] == 1
+    assert state["pushed_keys"] == {}
+
+
+def test_push_trade_cards_dry_run_does_not_mark_state():
+    state = {"pushed_keys": {}}
+    audit = push_trade_cards(
+        payload=sample_payload(),
+        state=state,
+        trade_date="2026-07-15",
+        dry_run=True,
+        force=False,
+        timeout=1,
+    )
+
+    assert audit["candidate_count"] == 1
+    assert audit["sent_count"] == 0
+    assert audit["skipped_count"] == 1
+    assert state["pushed_keys"] == {}
+
+
+def test_push_review_card_skips_existing_key():
+    state = {"pushed_keys": {"review:2026-07-15": {"pushed_at": "x"}}}
+    audit = push_review_card(
+        payload=sample_payload(),
+        state=state,
+        trade_date="2026-07-15",
+        dry_run=False,
+        force=False,
+        timeout=1,
+    )
+
+    assert audit["sent_count"] == 0
+    assert audit["skipped_count"] == 1
+    assert audit["error_count"] == 0
+
+
+def test_push_review_card_fails_closed_when_valuation_is_incomplete():
+    payload = sample_payload()
+    payload["valuation_complete"] = False
+    payload["valuation_status"] = "DEGRADED"
+    state = {"pushed_keys": {}}
+
+    audit = push_review_card(
+        payload=payload,
+        state=state,
+        trade_date="2026-07-15",
+        dry_run=True,
+        force=False,
+        timeout=1,
+    )
+
+    assert audit["sent_count"] == 0
+    assert audit["error_count"] == 1
+    assert audit["errors"][0]["error"] == "valuation_incomplete"

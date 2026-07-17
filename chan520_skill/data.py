@@ -96,20 +96,44 @@ def auto_history(code: str, end: date, adjust: int = 1) -> tuple[StockMeta, list
 def tencent_quote(code: str, timeout: int = 10) -> dict[str, str]:
     code = normalize_code(code)
     prefix = "sh" if market_id(code) == 1 else "sz"
-    url = f"https://qt.gtimg.cn/q={prefix}{code}"
+    return tencent_symbol_quote(f"{prefix}{code}", timeout=timeout)
+
+
+def tencent_index_quote(symbol: str, timeout: int = 10) -> dict[str, str]:
+    tencent_symbol = {
+        "000001": "sh000001",
+        "399001": "sz399001",
+        "399006": "sz399006",
+        "000688": "sh000688",
+    }.get(str(symbol))
+    if not tencent_symbol:
+        raise ValueError(f"unsupported Tencent index quote: {symbol!r}")
+    return tencent_symbol_quote(tencent_symbol, timeout=timeout)
+
+
+def tencent_symbol_quote(symbol: str, timeout: int = 10) -> dict[str, str]:
+    url = f"https://qt.gtimg.cn/q={symbol}"
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(req, timeout=timeout) as resp:
         text = resp.read().decode("gbk", errors="replace")
     match = re.search(r'="(.*)";', text)
     if not match:
-        raise DataError(f"Tencent returned unexpected quote payload for {code}")
+        raise DataError(f"Tencent returned unexpected quote payload for {symbol}")
     fields = match.group(1).split("~")
+    if len(fields) < 44:
+        raise DataError(f"Tencent returned incomplete quote payload for {symbol}")
     return {
         "name": fields[1],
         "code": fields[2],
         "price": fields[3],
         "prev_close": fields[4],
         "open": fields[5],
+        "volume": fields[36],
+        "amount": fields[37],
+        "turnover": fields[38],
+        "high": fields[33],
+        "low": fields[34],
+        "amplitude": fields[43],
         "datetime": fields[30],
         "pct_chg": fields[32],
     }

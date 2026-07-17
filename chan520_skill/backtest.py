@@ -3622,6 +3622,7 @@ def _analyze_v5_candidate_signals(
             and regime_pass
             and alpha_pass
             and entry_pass
+            and sector_data_status != SectorDataStatus.MISSING.value
             and four_no.ok
             and stop_valid
             and rr_pass
