@@ -7,6 +7,7 @@ from scripts.push_local_sim_feishu import (
     push_plan_card,
     push_review_card,
     push_trade_cards,
+    write_audit_files,
 )
 
 
@@ -116,7 +117,16 @@ def test_build_trade_card_uses_interactive_card():
 
 
 def test_build_review_card_contains_account_summary():
-    card = build_review_card(sample_payload(), "2026-07-15")
+    payload = sample_payload()
+    payload["counterfactual_replay"] = {
+        "status": "PASS",
+        "candidate_count": 2,
+        "filled_count": 1,
+        "net_mark_pnl": 128.0,
+        "net_mark_return_on_equity": 0.000128,
+        "fills": [],
+    }
+    card = build_review_card(payload, "2026-07-15")
 
     content = str(card)
     assert card["msg_type"] == "interactive"
@@ -130,6 +140,8 @@ def test_build_review_card_contains_account_summary():
     assert "利润保护" in content
     assert "待触发/计划订单" in content
     assert "趋势回踩计划入场" in content
+    assert "反事实回放" in content
+    assert "不写入模拟盘账本" in content
 
 
 def test_build_plan_card_separates_executable_and_watch_only_orders():
@@ -225,3 +237,29 @@ def test_push_review_card_fails_closed_when_valuation_is_incomplete():
     assert audit["sent_count"] == 0
     assert audit["error_count"] == 1
     assert audit["errors"][0]["error"] == "valuation_incomplete"
+
+
+def test_audit_files_preserve_latest_run_for_each_message_type(tmp_path):
+    base = {
+        "schema_version": "chan520_local_sim_feishu_audit_v0",
+        "trade_date": "2026-07-20",
+        "data_path": "dashboard.json",
+        "webhook": {"configured": True},
+    }
+    write_audit_files(
+        tmp_path,
+        {**base, "generated_at": "2026-07-20T08:04:19+08:00", "runs": [{"type": "plan", "sent_count": 1}]},
+    )
+    write_audit_files(
+        tmp_path,
+        {**base, "generated_at": "2026-07-20T15:20:04+08:00", "runs": [{"type": "review", "sent_count": 1}]},
+    )
+
+    import json
+
+    aggregate = json.loads((tmp_path / "feishu_push_audit.json").read_text(encoding="utf-8"))
+    assert [row["type"] for row in aggregate["runs"]] == ["plan", "review"]
+    assert len(aggregate["history"]) == 2
+    assert (tmp_path / "feishu_push_audit_plan.json").exists()
+    assert (tmp_path / "feishu_push_audit_review.json").exists()
+    assert len(list((tmp_path / "runs").glob("*.json"))) == 2

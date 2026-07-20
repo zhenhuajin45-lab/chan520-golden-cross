@@ -95,8 +95,7 @@ def main() -> int:
         "webhook": webhook_source_info(),
         "runs": runs,
     }
-    audit_path = ROOT / "reports" / "local_sim_feishu" / trade_date / "feishu_push_audit.json"
-    write_json(audit_path, audit)
+    write_audit_files(ROOT / "reports" / "local_sim_feishu" / trade_date, audit)
     print(json.dumps(summarize_audit(audit), ensure_ascii=False, sort_keys=True), flush=True)
     return exit_code
 
@@ -337,6 +336,7 @@ def build_review_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any
     fills = [row for row in payload.get("fills", []) if row_date(row) == trade_date]
     positions = list(payload.get("positions") or [])
     plans = [row for row in payload.get("planned_orders", []) if str(row.get("trade_date") or "") in {"", trade_date}]
+    replay = payload.get("counterfactual_replay") if isinstance(payload.get("counterfactual_replay"), dict) else {}
     elements = [
         div(f"**每日账户复盘**\n{trade_date}"),
         fields_block(
@@ -364,9 +364,26 @@ def build_review_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any
         div("**持仓明细**\n" + position_lines(positions)),
         div("**当日成交明细**\n" + fill_lines(fills)),
         div("**当日理由分布**\n" + reason_summary_lines(fills)),
+        div("**熊市防御候选反事实回放（仅研究）**\n" + counterfactual_lines(replay)),
         div(f"说明：估值口径 {payload.get('valuation_basis') or '-'}，状态 {payload.get('valuation_status') or '-'}。估值不完整时本复盘会 fail-closed，不会推送误导性盈亏。"),
     ]
     return card_payload("review", "Chan520 本地模拟盘｜每日账户复盘", elements)
+
+
+def counterfactual_lines(replay: dict[str, Any]) -> str:
+    if not replay:
+        return "未生成研究回放；不影响实际订单与账户。"
+    if replay.get("status") == "FAIL_CLOSED":
+        return f"数据不完整，回放已关闭：{replay.get('error') or '-'}"
+    lines = [
+        f"状态 {replay.get('status') or '-'}，候选 {safe_int(replay.get('candidate_count'))} 只，模拟触发 {safe_int(replay.get('filled_count'))} 只，收盘净盯市 {pnl_text(replay.get('net_mark_pnl'), replay.get('net_mark_return_on_equity'))}。",
+        "该结果不写入模拟盘账本，不代表应当放宽熊市禁买门槛。",
+    ]
+    for row in (replay.get("fills") or [])[:4]:
+        lines.append(
+            f"- {stock_label(row)} {row.get('fill_minute') or '-'} @ {price(row.get('fill_price'))}，收盘 {price(row.get('close_price'))}，净盯市 {pnl_text(row.get('net_mark_pnl'))}"
+        )
+    return "\n".join(lines)
 
 
 def position_lines(rows: list[dict[str, Any]]) -> str:
@@ -594,6 +611,40 @@ def write_json(path: Path, payload: Any) -> None:
     with path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
         fh.write("\n")
+
+
+def write_audit_files(root: Path, audit: dict[str, Any]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    generated_at = str(audit.get("generated_at") or now_str())
+    stamp = "".join(ch for ch in generated_at if ch.isdigit())[:14] or datetime.now(SHANGHAI_TZ).strftime("%Y%m%d%H%M%S")
+    runs = [row for row in audit.get("runs", []) if isinstance(row, dict) and row.get("type")]
+    for run in runs:
+        mode = str(run["type"])
+        mode_audit = {**audit, "runs": [run]}
+        write_json(root / f"feishu_push_audit_{mode}.json", mode_audit)
+        write_json(root / "runs" / f"{stamp}_{mode}.json", mode_audit)
+
+    aggregate_path = root / "feishu_push_audit.json"
+    previous = read_json(aggregate_path, {})
+    latest_by_type = previous.get("latest_by_type") if isinstance(previous.get("latest_by_type"), dict) else {}
+    if not latest_by_type:
+        latest_by_type = {
+            str(row.get("type")): row
+            for row in previous.get("runs", [])
+            if isinstance(row, dict) and row.get("type")
+        }
+    latest_by_type.update({str(row["type"]): row for row in runs})
+    history = previous.get("history") if isinstance(previous.get("history"), list) else []
+    history.append({"generated_at": generated_at, "runs": runs})
+    mode_order = {"plan": 0, "trades": 1, "review": 2}
+    aggregate = {
+        **audit,
+        "schema_version": "chan520_local_sim_feishu_audit_v1",
+        "runs": sorted(latest_by_type.values(), key=lambda row: mode_order.get(str(row.get("type")), 99)),
+        "latest_by_type": latest_by_type,
+        "history": history[-200:],
+    }
+    write_json(aggregate_path, aggregate)
 
 
 def summarize_audit(audit: dict[str, Any]) -> dict[str, Any]:

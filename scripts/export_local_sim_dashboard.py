@@ -169,15 +169,17 @@ def build_payload(
     selected_orders = [
         order for order in orders if not trade_date or str(order.get("session_date") or day_from_timestamp(order.get("created_at"))) == trade_date
     ][:100]
+    selected_trade_date = trade_date or latest_trade_date(orders, fills)
     return {
         "schema_version": "chan520_local_sim_dashboard_v0",
         "generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
-        "trade_date": trade_date or latest_trade_date(orders, fills),
+        "trade_date": selected_trade_date,
         "valuation_basis": valuation["basis"],
         "valuation_status": valuation["status"],
         "valuation_complete": valuation["complete"],
-        "core_plan": load_core_plan(trade_date or latest_trade_date(orders, fills)),
-        "readiness": load_readiness(trade_date or latest_trade_date(orders, fills)),
+        "core_plan": load_core_plan(selected_trade_date),
+        "readiness": load_readiness(selected_trade_date),
+        "counterfactual_replay": load_counterfactual_replay(selected_trade_date),
         "account": {
             "account_id": account_id,
             "initial_cash": initial_cash,
@@ -492,8 +494,34 @@ def load_core_plan(trade_date: str) -> dict[str, Any]:
         "scan_quality": payload.get("scan_quality") or {},
         "market_regime": payload.get("market_regime") or {},
         "research_warnings": payload.get("research_warnings") or [],
+        "research_cohorts": payload.get("research_cohorts") or {},
         "geometry_blocked_count": geometry_blocked_count,
         "t1_risk_policy": "board_floor_plus_atr_and_amplitude_v1",
+    }
+
+
+def load_counterfactual_replay(trade_date: str) -> dict[str, Any]:
+    if not trade_date:
+        return {}
+    path = ROOT / "reports" / "local_sim_counterfactual" / trade_date.replace("-", "") / "watch_only_replay.json"
+    payload = read_json(path, {})
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "status": payload.get("status"),
+        "policy_id": payload.get("policy_id"),
+        "research_only": True,
+        "live_execution_enabled": False,
+        "candidate_count": payload.get("candidate_count", 0),
+        "candidate_symbols": payload.get("candidate_symbols") or [],
+        "filled_count": payload.get("filled_count", 0),
+        "fills": payload.get("fills") or [],
+        "net_mark_pnl": payload.get("net_mark_pnl", 0),
+        "net_mark_return_on_equity": payload.get("net_mark_return_on_equity", 0),
+        "replay_equity": payload.get("replay_equity", 0),
+        "data_complete": payload.get("data_complete"),
+        "error": payload.get("error", ""),
+        "generated_at": payload.get("generated_at"),
     }
 
 

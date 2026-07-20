@@ -157,6 +157,35 @@ h2 {
   color: #176b50;
 }
 
+.research-strip {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(320px, 1fr) minmax(360px, 1.4fr);
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border: 1px solid #9bd8c3;
+  border-radius: 8px;
+  background: #edf9f4;
+}
+
+.research-strip.danger {
+  border-color: #f3b0aa;
+  background: #fff0ee;
+}
+
+.research-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.research-fills {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
 .kpis {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
@@ -421,6 +450,10 @@ th {
   }
 
   .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .research-strip {
     grid-template-columns: 1fr;
   }
 

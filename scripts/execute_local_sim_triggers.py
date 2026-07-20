@@ -269,6 +269,7 @@ def evaluate_plan(
     market_context: dict[str, Any],
     account_marks_ok: bool,
     active_risk_exit_count: int,
+    raw_quote: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     symbol = str(plan.get("symbol") or "")
     code = normalize_code(symbol)
@@ -291,7 +292,7 @@ def evaluate_plan(
     if market_context.get("status") != "OK":
         return reject("MARKET_CONTEXT_UNAVAILABLE", str(market_context.get("message") or "intraday index quotes unavailable"))
     try:
-        quote = normalize_quote(tencent_quote(code), now=now, max_age_minutes=max_age_minutes)
+        quote = normalize_quote(raw_quote if raw_quote is not None else tencent_quote(code), now=now, max_age_minutes=max_age_minutes)
     except (DataError, ValueError, TimeoutError, OSError) as exc:
         return reject("QUOTE_ERROR", f"{type(exc).__name__}: {exc}")
     price = float(quote["price"])
@@ -601,8 +602,19 @@ def reject(reason: str, message: str, *, quote: dict[str, Any] | None = None) ->
     return {"action": "WAIT", "reason": reason, "message": message, "quote": quote or {}}
 
 
-def plan_rank(plan: dict[str, Any]) -> tuple[str, str]:
-    return (str(plan.get("order_intent_id") or ""), str(plan.get("planned_order_id") or ""))
+def plan_rank(plan: dict[str, Any]) -> tuple[int, str, str]:
+    payload = plan.get("payload") if isinstance(plan.get("payload"), dict) else {}
+    priority = safe_int(plan.get("execution_priority") or payload.get("execution_priority"), 1_000_000)
+    return (priority, str(plan.get("order_intent_id") or ""), str(plan.get("planned_order_id") or ""))
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:

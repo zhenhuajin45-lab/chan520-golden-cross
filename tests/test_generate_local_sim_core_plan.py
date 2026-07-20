@@ -256,3 +256,68 @@ def test_t1_loss_buffer_reduces_high_volatility_position_size():
     )
 
     assert shares == 1000
+
+
+def test_bear_market_creates_research_only_defensive_cohort_without_live_buys(tmp_path):
+    ledger = tmp_path / "local_sim.sqlite"
+    adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id="plan-test", initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    rows = [
+        {
+            "code": "600177",
+            "name": "雅戈尔",
+            "verdict": "观察（等待确认）",
+            "defect_count": "1",
+            "score": "20",
+            "close": "10.00",
+            "ma5": "9.90",
+            "ma20": "9.50",
+            "rsi14": "62",
+        },
+        {
+            "code": "001314",
+            "name": "亿道信息",
+            "verdict": "观察（等待确认）",
+            "defect_count": "1",
+            "score": "17",
+            "close": "10.00",
+            "ma5": "9.90",
+            "ma20": "9.50",
+            "rsi14": "56",
+        },
+    ]
+
+    payload = core_plan.generate_plan(
+        adapter=adapter,
+        ledger=Path(ledger),
+        account_id="plan-test",
+        trade_date=date(2026, 7, 20),
+        signal_date=date(2026, 7, 17),
+        scan_path=tmp_path / "scan.csv",
+        scan_rows=rows,
+        regime={"state": "BEAR", "regime_ok": False, "detail": "down"},
+        max_candidates=20,
+        max_buy_plans=2,
+        max_new_exposure_pct=0.15,
+        risk_per_plan_pct=0.005,
+    )
+
+    cohort = payload["research_cohorts"]["bear_defensive"]
+    assert payload["executable_buy_count"] == 0
+    assert cohort["symbols"] == ["600177"]
+    assert cohort["live_execution_enabled"] is False
+    defensive = next(row for row in payload["plans"] if row["symbol"] == "600177")
+    assert defensive["status"] == "WATCH_ONLY"
+    assert defensive["volume"] == 0
+    assert defensive["research_only"] is True
+    assert defensive["research_cohort"] == "BEAR_DEFENSIVE_WATCH"
+
+
+def test_execution_priority_prefers_lower_t1_and_volatility_risk():
+    low_risk = {"t1_loss_buffer_pct": 0.075, "average_amplitude_pct": 0.02, "rr": 2.1}
+    high_risk = {"t1_loss_buffer_pct": 0.12, "average_amplitude_pct": 0.01, "rr": 4.0}
+
+    assert core_plan.execution_risk_priority_key({"code": "600001"}, low_risk) < core_plan.execution_risk_priority_key(
+        {"code": "300001"}, high_risk
+    )

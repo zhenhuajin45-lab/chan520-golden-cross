@@ -144,19 +144,25 @@ def generate_plan(
     expired = expire_old_buy_plans(ledger, account_id, trade_date.isoformat())
     account = adapter.account_snapshot()
     equity = float(account["cash"]) + sum(float(row["shares"]) * float(row["average_price"]) for row in account["positions"])
-    # The current Monte Carlo evidence does not support alpha-score ranking for
-    # execution. Freeze selection to symbol order until ranking is revalidated.
+    # Alpha-score ranking remains disabled. Risk evidence only decides which
+    # already-qualified plan gets scarce execution capacity first.
     ordered = sorted(scan_rows, key=lambda row: str(row.get("code") or ""))
-    strict_rows = [row for row in ordered if strict_scan_pass(row)][:max_candidates]
-    watch_rows = [row for row in ordered if watch_scan_pass(row) and row not in strict_rows][:max_candidates]
+    strict_candidates = [
+        (row, candidate_levels(row, signal_date))
+        for row in ordered
+        if strict_scan_pass(row)
+    ]
+    strict_candidates.sort(key=lambda item: execution_risk_priority_key(item[0], item[1]))
+    strict_candidates = strict_candidates[:max_candidates]
+    strict_rows = [row for row, _levels in strict_candidates]
+    watch_rows = [row for row in ordered if watch_scan_pass(row) and row not in strict_rows]
     created: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
     planned_gross = 0.0
     scan_quality = scan_quality or {"coverage_pass": True, "coverage": 1.0, "minimum_coverage": 0.85}
     strict_enabled = bool(regime.get("regime_ok")) and bool(scan_quality.get("coverage_pass"))
 
-    for rank, row in enumerate(strict_rows, start=1):
-        levels = candidate_levels(row, signal_date)
+    for rank, (row, levels) in enumerate(strict_candidates, start=1):
         zone = entry_zone(row, levels)
         code = str(row.get("code") or "")
         close = safe_float(row.get("close"))
@@ -197,9 +203,15 @@ def generate_plan(
             created.append(plan)
             planned_gross += close * shares
 
-    for rank, row in enumerate(watch_rows, start=1):
+    watch_candidates = []
+    for row in watch_rows:
         levels = fallback_levels(row)
         zone = entry_zone(row, levels)
+        watch_candidates.append((row, levels, zone))
+    watch_candidates.sort(key=lambda item: research_priority_key(item[0], item[1], item[2]))
+    watch_candidates = watch_candidates[:max_candidates]
+    bear_defensive_symbols: list[str] = []
+    for rank, (row, levels, zone) in enumerate(watch_candidates, start=1):
         plan = plan_payload(
             row,
             trade_date,
@@ -212,6 +224,13 @@ def generate_plan(
             regime,
             ["SCAN_WATCH_ONLY", "STRICT_ENTRY_REQUIRED", *zone["reason_codes"]],
         )
+        if bear_defensive_eligible(row, zone, regime):
+            plan["research_only"] = True
+            plan["research_cohort"] = "BEAR_DEFENSIVE_WATCH"
+            plan["research_policy_id"] = "bear_defensive_watch_v1"
+            plan["execution_priority_basis"] = "geometry_then_t1_then_score_tiebreak_v1"
+            plan["reason_codes"] = [*plan["reason_codes"], "BEAR_DEFENSIVE_RESEARCH_ONLY"]
+            bear_defensive_symbols.append(str(row.get("code") or ""))
         adapter.record_planned_order(plan)
         audits.append(plan)
 
@@ -219,7 +238,7 @@ def generate_plan(
     return {
         "schema_version": "chan520_local_sim_core_plan_v2",
         "policy_id": POLICY_ID,
-        "selection_policy": "hard_gate_geometry_then_symbol_order_v2",
+        "selection_policy": "hard_gate_then_t1_risk_priority_v3",
         "alpha_ranking_execution_enabled": False,
         "sizing_policy": "t1_volatility_risk_with_5pct_and_exposure_caps_v2",
         "generated_at": now(),
@@ -237,6 +256,25 @@ def generate_plan(
         "execution_readiness": "TRADE_READY" if created else "RISK_ONLY",
         "planned_new_gross": planned_gross,
         "planned_new_exposure_pct": planned_gross / equity if equity else 0.0,
+        "account_equity": equity,
+        "research_cohorts": {
+            "bear_defensive": {
+                "policy_id": "bear_defensive_watch_v1",
+                "status": "RESEARCH_ONLY",
+                "eligible_count": len(bear_defensive_symbols),
+                "symbols": bear_defensive_symbols,
+                "constraints": [
+                    "market_regime=BEAR",
+                    "WATCH_ONLY",
+                    "main_board",
+                    "geometry_valid",
+                    "score>=18",
+                    "ma5>ma20",
+                    "rsi14<=70",
+                ],
+                "live_execution_enabled": False,
+            }
+        },
         "research_warnings": [
             "V11 conditional randomization did not validate ranked alpha selection; ranking is disabled for automatic orders.",
             "Open-source scan evidence is not a substitute for the GM V5 dynamic-universe/sector kernel; formal auto_open_close_kernel_ready remains false.",
@@ -299,6 +337,41 @@ def strict_scan_pass(row: dict[str, str]) -> bool:
 def watch_scan_pass(row: dict[str, str]) -> bool:
     verdict = str(row.get("verdict") or "")
     return verdict.startswith("观察") and safe_float(row.get("score")) >= 15 and safe_int(row.get("defect_count")) <= 1
+
+
+def execution_risk_priority_key(row: dict[str, str], levels: dict[str, Any]) -> tuple[float, float, float, str]:
+    amplitude = safe_float(levels.get("average_amplitude_pct"), 999.0)
+    if amplitude <= 0:
+        amplitude = 999.0
+    return (
+        safe_float(levels.get("t1_loss_buffer_pct"), 999.0),
+        amplitude,
+        -safe_float(levels.get("rr")),
+        str(row.get("code") or ""),
+    )
+
+
+def research_priority_key(
+    row: dict[str, str], levels: dict[str, Any], zone: dict[str, Any]
+) -> tuple[int, float, float, str]:
+    return (
+        0 if zone.get("geometry_valid") else 1,
+        safe_float(levels.get("t1_loss_buffer_pct"), 999.0),
+        -safe_float(row.get("score")),
+        str(row.get("code") or ""),
+    )
+
+
+def bear_defensive_eligible(row: dict[str, str], zone: dict[str, Any], regime: dict[str, Any]) -> bool:
+    code = str(row.get("code") or "")
+    return (
+        str(regime.get("state") or "").upper() == "BEAR"
+        and bool(zone.get("geometry_valid"))
+        and not code.startswith(("3", "688", "689"))
+        and safe_float(row.get("score")) >= 18
+        and safe_float(row.get("ma5")) > safe_float(row.get("ma20")) > 0
+        and 0 < safe_float(row.get("rsi14")) <= 70
+    )
 
 
 def candidate_levels(row: dict[str, str], signal_date: date) -> dict[str, Any]:
@@ -452,6 +525,8 @@ def plan_payload(
         "planned_order_id": f"CORE:{trade_date.isoformat()}:{code}",
         "pending_order_id": f"CORE:{trade_date.isoformat()}:{code}",
         "order_intent_id": f"CORE-{trade_date.isoformat()}-{rank:02d}",
+        "execution_priority": rank,
+        "execution_priority_basis": "t1_buffer_then_volatility_then_rr_v1",
         "run_id": f"core-plan-{trade_date.isoformat()}",
         "trade_date": trade_date.isoformat(),
         "signal_date": signal_date.isoformat(),
@@ -474,6 +549,7 @@ def plan_payload(
         "target_price_available": bool(levels.get("target_price_available")),
         "t1_loss_buffer_pct": levels.get("t1_loss_buffer_pct", board_t1_floor_pct(code)),
         "t1_risk_budget_amount": safe_float(row.get("close")) * shares * safe_float(levels.get("t1_loss_buffer_pct")),
+        "signal_close": safe_float(row.get("close")),
         "ma5": safe_float(row.get("ma5")),
         "ma10": safe_float(row.get("ma10")),
         "ma20": safe_float(row.get("ma20")),

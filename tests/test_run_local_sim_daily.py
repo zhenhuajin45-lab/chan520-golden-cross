@@ -44,8 +44,11 @@ def test_eod_records_review_not_trade_push():
     steps = build_steps(args(phase="eod", feishu="send"), "2026-07-15")
 
     assert any(item["name"] == "risk_scan" for item in steps)
+    assert any(item["name"] == "replay_watch_only" for item in steps)
     assert any(item["name"] == "feishu_review" for item in steps)
     assert not any(item["name"] == "feishu_trades" for item in steps)
+    names = [item["name"] for item in steps]
+    assert names.index("risk_scan") < names.index("replay_watch_only") < names.index("feishu_review")
 
 
 def test_plan_phase_generates_core_plan_before_dashboard_and_feishu():

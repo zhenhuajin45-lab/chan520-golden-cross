@@ -90,6 +90,7 @@ function render() {
         ${renderValuationAlert(payload)}
         ${renderReadinessAlert(payload)}
         ${renderCorePlanAlert(payload)}
+        ${renderCounterfactualReplay(payload.counterfactual_replay || {})}
         ${renderKpis(account)}
         <section class="grid">
           <article class="panel">
@@ -205,6 +206,29 @@ function renderReadinessAlert(payload) {
   const buyText = buyReady ? "新增买入 READY" : "新增买入 BLOCKED";
   const blockers = (readiness.buy_entry_blocking_checks || []).join(", ") || "无";
   return `<div class="valuation-alert ${kind}">${escapeHtml(readiness.status)}｜${escapeHtml(riskText)}｜${escapeHtml(buyText)}｜买入阻断 ${escapeHtml(blockers)}</div>`;
+}
+
+function renderCounterfactualReplay(replay) {
+  if (!replay.status) return "";
+  const failed = replay.status === "FAIL_CLOSED";
+  const fills = (replay.fills || []).map((row) =>
+    `${stockText(row)} ${escapeHtml(row.fill_minute || "-")} @ ${price(row.fill_price)} → ${price(row.close_price)}，净盯市 <span class="${pnlClass(row.net_mark_pnl)}">${signedMoney(row.net_mark_pnl)}</span>`
+  ).join("<br>") || "无模拟触发";
+  return `
+    <section class="research-strip ${failed ? "danger" : ""}">
+      <div>
+        <strong>熊市防御候选反事实回放</strong>
+        <p class="meta">仅研究，不写入模拟盘账本，不放宽实际禁买门槛</p>
+      </div>
+      <div class="research-metrics">
+        <span>状态 ${escapeHtml(replay.status)}</span>
+        <span>候选 ${intText(replay.candidate_count)} 只</span>
+        <span>模拟触发 ${intText(replay.filled_count)} 只</span>
+        <span class="${pnlClass(replay.net_mark_pnl)}">净盯市 ${signedMoney(replay.net_mark_pnl)} / ${signedPct(replay.net_mark_return_on_equity)}</span>
+      </div>
+      <div class="research-fills">${failed ? escapeHtml(replay.error || "数据不完整") : fills}</div>
+    </section>
+  `;
 }
 
 function kpi(label, value, valueClass = "") {
@@ -399,6 +423,10 @@ function stockCell(row) {
     <span class="stock-code">${escapeHtml(symbol)}</span>
     ${name ? `<span class="stock-name">${escapeHtml(name)}</span>` : ""}
   `;
+}
+
+function stockText(row) {
+  return `${escapeHtml(row.symbol || "-")} ${escapeHtml(row.stock_name || "")}`.trim();
 }
 
 function compactText(parts) {
