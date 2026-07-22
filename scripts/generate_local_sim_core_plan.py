@@ -402,8 +402,10 @@ def generate_plan(
         code = str(row.get("code") or "")
         close = safe_float(row.get("close"))
         reasons = [*levels["reason_codes"], *zone["reason_codes"]]
+        adjusted_history = execution_history_adjusted(row)
         hard_pass = (
             strict_enabled
+            and adjusted_history
             and levels["rr"] >= 2.0
             and levels["target"] > close
             and zone["geometry_valid"]
@@ -415,6 +417,8 @@ def generate_plan(
                 reasons.append("SCAN_COVERAGE_BLOCKED")
         if levels["rr"] < 2.0:
             reasons.append("RR_TOO_LOW")
+        if not adjusted_history:
+            reasons.append("UNADJUSTED_HISTORY_BLOCKED")
         shares = 0
         if hard_pass:
             shares = planned_shares(
@@ -475,6 +479,7 @@ def generate_plan(
                 close = safe_float(row.get("close"))
                 pilot_eligible = (
                     scan_quality.get("coverage_pass") is True
+                    and execution_history_adjusted(row)
                     and pilot_zone.get("geometry_valid") is True
                     and safe_float(pilot_levels.get("rr")) >= BEAR_PILOT_MIN_RR
                     and safe_float(pilot_levels.get("target")) > close > 0
@@ -681,6 +686,10 @@ def strict_scan_pass(row: dict[str, str]) -> bool:
         and safe_int(row.get("defect_count")) == 0
         and close > ma5 > ma20 > 0
     )
+
+
+def execution_history_adjusted(row: dict[str, Any]) -> bool:
+    return str(row.get("history_source") or "legacy_adjusted_unknown") != "sina_unadjusted"
 
 
 def watch_scan_pass(row: dict[str, str]) -> bool:
@@ -894,6 +903,7 @@ def plan_payload(
         "signal_date": signal_date.isoformat(),
         "symbol": code,
         "stock_name": str(row.get("name") or ""),
+        "signal_history_source": str(row.get("history_source") or "legacy_adjusted_unknown"),
         "industry": str(row.get("industry") or "UNMAPPED"),
         "side": "BUY",
         "volume": shares,

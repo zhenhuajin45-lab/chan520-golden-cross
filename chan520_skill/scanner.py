@@ -6,6 +6,7 @@ import platform
 import re
 import subprocess
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -38,6 +39,7 @@ class UniverseStock:
 class ScanRow:
     code: str
     name: str
+    history_source: str
     close: float
     pct_chg: float
     verdict: str
@@ -341,6 +343,7 @@ def scan_market(
     stats = {
         **universe_metadata,
         "history_source_policy": ["tencent_qfq", "sina_unadjusted", "eastmoney_qfq"],
+        "history_source_counts": dict(Counter(row.history_source for row in rows)),
         "universe": len(universe),
         "rows": len(rows),
         "failures": failures,
@@ -381,11 +384,13 @@ def _scan_one(stock: UniverseStock, target: date) -> ScanRow | None:
         klines = _tencent_kline(stock, target)
         rows = trim_to_date(klines, target)
         report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
+        history_source = "tencent_qfq"
     except Exception:
         try:
             _meta, rows = sina_history(stock.code, target, timeout=5)
             rows = trim_to_date(rows, target)
             report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
+            history_source = "sina_unadjusted"
         except Exception:
             try:
                 # Keep the final fallback bounded. auto_history retries
@@ -397,6 +402,7 @@ def _scan_one(stock: UniverseStock, target: date) -> ScanRow | None:
                     rows,
                     target,
                 )
+                history_source = "eastmoney_qfq"
             except Exception:
                 return None
     score = sum(
@@ -407,6 +413,7 @@ def _scan_one(stock: UniverseStock, target: date) -> ScanRow | None:
     return ScanRow(
         code=stock.code,
         name=stock.name,
+        history_source=history_source,
         close=report.target.close,
         pct_chg=report.target.pct_chg,
         verdict=report.verdict,

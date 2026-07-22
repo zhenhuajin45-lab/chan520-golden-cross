@@ -462,3 +462,9 @@ def test_signal_date_probe_stops_at_prior_calendar_day(monkeypatch):
 
     assert signal_date == date(2026, 7, 22)
     assert requested == [date(2026, 7, 22)]
+
+
+def test_unadjusted_scan_history_is_not_execution_eligible():
+    assert core_plan.execution_history_adjusted({"history_source": "tencent_qfq"}) is True
+    assert core_plan.execution_history_adjusted({"history_source": "eastmoney_qfq"}) is True
+    assert core_plan.execution_history_adjusted({"history_source": "sina_unadjusted"}) is False
