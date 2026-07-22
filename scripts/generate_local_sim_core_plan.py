@@ -44,12 +44,13 @@ def main() -> int:
     parser.add_argument("--max-new-exposure-pct", type=float, default=0.15)
     parser.add_argument("--risk-per-plan-pct", type=float, default=0.005)
     parser.add_argument("--refresh-scan-if-missing", action="store_true")
+    parser.add_argument("--offline-regime", action="store_true", help="Fail closed with UNKNOWN regime instead of fetching index data")
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
     trade_date = date.fromisoformat(args.trade_date)
-    verify_trade_date(trade_date)
     signal_date = resolve_signal_date(trade_date, args.signal_date)
+    verify_trade_date(trade_date, signal_date)
     scan_path = ROOT / "reports" / f"scan_{signal_date.isoformat()}" / f"market_scan_{signal_date.isoformat()}.csv"
     scan_stats = None
     if not scan_path.exists() and args.refresh_scan_if_missing:
@@ -61,7 +62,7 @@ def main() -> int:
         LocalSimBrokerConfig(account_id=args.account_id, initial_cash=args.initial_cash, ledger_path=args.ledger)
     )
     adapter.initialize_account()
-    regime = resolve_market_regime(signal_date)
+    regime = resolve_market_regime(signal_date, offline=args.offline_regime)
     rows = read_scan(scan_path)
     scan_quality = resolve_scan_quality(scan_path, scan_stats)
     payload = generate_plan(
@@ -99,19 +100,29 @@ def resolve_signal_date(trade_date: date, supplied: str = "") -> date:
     return max(prior)
 
 
-def verify_trade_date(trade_date: date) -> None:
+def verify_trade_date(trade_date: date, signal_date: date) -> None:
+    # A complete prior-session scan is local evidence that the signal date was
+    # a market session. Combined with a weekday trade date, it lets the
+    # scheduled plan run without depending on AkShare's unbounded calendar
+    # request during the pre-open window.
+    local_scan = ROOT / "reports" / f"scan_{signal_date.isoformat()}" / f"market_scan_{signal_date.isoformat()}.csv"
+    quality_path = local_scan.with_name(f"scan_quality_{signal_date.isoformat()}.json")
+    if trade_date.weekday() < 5 and local_scan.exists() and quality_path.exists():
+        return
     try:
         import akshare as ak
 
         frame = ak.tool_trade_date_hist_sina()
         sessions = {item.date() if hasattr(item, "date") else date.fromisoformat(str(item)[:10]) for item in frame["trade_date"]}
     except Exception as exc:  # noqa: BLE001 - unavailable calendar must fail closed.
-        raise RuntimeError(f"FAIL_CLOSED: trading calendar unavailable: {type(exc).__name__}: {exc}") from exc
+        raise RuntimeError(f"FAIL_CLOSED: trading calendar unavailable and no complete local prior-session scan: {type(exc).__name__}: {exc}") from exc
     if trade_date not in sessions:
         raise RuntimeError(f"FAIL_CLOSED: {trade_date} is not an A-share trading session")
 
 
-def resolve_market_regime(signal_date: date) -> dict[str, Any]:
+def resolve_market_regime(signal_date: date, *, offline: bool = False) -> dict[str, Any]:
+    if offline:
+        return {"state": "UNKNOWN", "regime_ok": False, "detail": "offline_regime: index data fetch skipped; buy entries fail closed"}
     try:
         state = fetch_regime("000001", signal_date, adjust=0)
     except Exception as exc:  # noqa: BLE001 - plan generation must record an unavailable regime.
@@ -148,7 +159,7 @@ def generate_plan(
     # already-qualified plan gets scarce execution capacity first.
     ordered = sorted(scan_rows, key=lambda row: str(row.get("code") or ""))
     strict_candidates = [
-        (row, candidate_levels(row, signal_date))
+        (row, candidate_levels(row, signal_date, offline=str(regime.get("state") or "").upper() == "UNKNOWN"))
         for row in ordered
         if strict_scan_pass(row)
     ]
@@ -247,6 +258,7 @@ def generate_plan(
         "signal_date": signal_date.isoformat(),
         "scan_path": str(scan_path),
         "market_regime": regime,
+        "supplemental_market_context": load_supplemental_market_context(signal_date),
         "scan_quality": scan_quality,
         "expired_plan_count": expired,
         "strict_scan_count": len(strict_rows),
@@ -280,6 +292,39 @@ def generate_plan(
             "Open-source scan evidence is not a substitute for the GM V5 dynamic-universe/sector kernel; formal auto_open_close_kernel_ready remains false.",
         ],
         "plans": audits,
+    }
+
+
+def load_supplemental_market_context(signal_date: date) -> dict[str, Any]:
+    path = ROOT / "reports" / "market_context" / signal_date.strftime("%Y%m%d") / "ths_data_center.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {
+            "status": "UNAVAILABLE",
+            "source": "tonghuashun_public_data_center",
+            "trade_date": signal_date.isoformat(),
+            "used_for_execution_gate": False,
+        }
+    audit = payload.get("audit") if isinstance(payload.get("audit"), dict) else {}
+    display = payload.get("display") if isinstance(payload.get("display"), dict) else {}
+    limit_up = payload.get("limit_up") if isinstance(payload.get("limit_up"), dict) else {}
+    return {
+        "status": "PASS" if audit.get("passed") is True else "DEGRADED",
+        "source": "tonghuashun_public_data_center",
+        "source_path": str(path),
+        "trade_date": str(payload.get("trade_date") or signal_date.isoformat()),
+        "generated_at": payload.get("generated_at"),
+        "endpoint_count": safe_int(audit.get("endpoint_count")),
+        "failed_count": safe_int(audit.get("failed_count")),
+        "emotion_status": limit_up.get("emotion_status"),
+        "emotion_label": limit_up.get("emotion_label"),
+        "summary_line": display.get("summary_line"),
+        "money_line": display.get("money_line"),
+        "hot_topics": list(display.get("hot_topics") or [])[:16],
+        "exposure_hint": display.get("exposure_hint"),
+        "used_for_execution_gate": False,
+        "role": "supplemental_validation_only",
     }
 
 
@@ -374,7 +419,7 @@ def bear_defensive_eligible(row: dict[str, str], zone: dict[str, Any], regime: d
     )
 
 
-def candidate_levels(row: dict[str, str], signal_date: date) -> dict[str, Any]:
+def candidate_levels(row: dict[str, str], signal_date: date, *, offline: bool = False) -> dict[str, Any]:
     close = safe_float(row.get("close"))
     ma20 = safe_float(row.get("ma20"))
     stop = max(ma20 * 0.985, close * 0.945) if close > 0 and ma20 > 0 else 0.0
@@ -384,19 +429,23 @@ def candidate_levels(row: dict[str, str], signal_date: date) -> dict[str, Any]:
     t1_loss_buffer_pct = board_t1_floor_pct(str(row.get("code") or ""))
     reason_codes: list[str] = []
     evidence_status = "COMPLETE"
-    try:
-        _meta, history = auto_history(str(row.get("code") or ""), signal_date, adjust=1)
-        history = trim_to_date(history, signal_date)
-        prior_highs = [item.high for item in history[-81:-1]]
-        target = max(prior_highs) if prior_highs else 0.0
-        atr14 = average_true_range(history[-15:])
-        amplitudes = [max(item.high - item.low, 0.0) / item.close for item in history[-20:] if item.close > 0]
-        average_amplitude_pct = sum(amplitudes) / len(amplitudes) if amplitudes else 0.0
-        atr_pct = atr14 / close if close > 0 else 0.0
-        t1_loss_buffer_pct = max(t1_loss_buffer_pct, atr_pct * 2.0, average_amplitude_pct * 1.25)
-    except Exception as exc:  # noqa: BLE001 - missing pressure must fail closed for executable entries.
-        reason_codes.append(f"PRESSURE_DATA_UNAVAILABLE:{type(exc).__name__}")
+    if offline:
+        reason_codes.append("PRESSURE_DATA_UNAVAILABLE:OFFLINE")
         evidence_status = "UNAVAILABLE"
+    else:
+        try:
+            _meta, history = auto_history(str(row.get("code") or ""), signal_date, adjust=1)
+            history = trim_to_date(history, signal_date)
+            prior_highs = [item.high for item in history[-81:-1]]
+            target = max(prior_highs) if prior_highs else 0.0
+            atr14 = average_true_range(history[-15:])
+            amplitudes = [max(item.high - item.low, 0.0) / item.close for item in history[-20:] if item.close > 0]
+            average_amplitude_pct = sum(amplitudes) / len(amplitudes) if amplitudes else 0.0
+            atr_pct = atr14 / close if close > 0 else 0.0
+            t1_loss_buffer_pct = max(t1_loss_buffer_pct, atr_pct * 2.0, average_amplitude_pct * 1.25)
+        except Exception as exc:  # noqa: BLE001 - missing pressure must fail closed for executable entries.
+            reason_codes.append(f"PRESSURE_DATA_UNAVAILABLE:{type(exc).__name__}")
+            evidence_status = "UNAVAILABLE"
     rr = (target - close) / (close - stop) if target > close > stop else 0.0
     if target <= close:
         reason_codes.append("NO_UPSIDE_PRESSURE_SPACE")

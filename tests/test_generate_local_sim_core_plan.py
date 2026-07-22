@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -26,7 +27,7 @@ def test_core_plan_only_makes_strict_rows_executable_and_expires_old_plans(tmp_p
     monkeypatch.setattr(
         core_plan,
         "candidate_levels",
-        lambda _row, _signal_date: {
+        lambda _row, _signal_date, **_kwargs: {
             "stop": 9.5,
             "target": 12.0,
             "rr": 4.0,
@@ -101,7 +102,7 @@ def test_unknown_market_regime_generates_no_executable_buys(tmp_path, monkeypatc
     monkeypatch.setattr(
         core_plan,
         "candidate_levels",
-        lambda _row, _signal_date: {
+        lambda _row, _signal_date, **_kwargs: {
             "stop": 9.5,
             "target": 12.0,
             "rr": 4.0,
@@ -152,7 +153,7 @@ def test_low_scan_coverage_fails_closed_even_for_strict_candidate(tmp_path, monk
     monkeypatch.setattr(
         core_plan,
         "candidate_levels",
-        lambda _row, _signal_date: {
+        lambda _row, _signal_date, **_kwargs: {
             "stop": 9.5,
             "target": 12.0,
             "rr": 4.0,
@@ -202,7 +203,7 @@ def test_invalid_entry_geometry_is_never_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(
         core_plan,
         "candidate_levels",
-        lambda _row, _signal_date: {
+        lambda _row, _signal_date, **_kwargs: {
             "stop": 10.2,
             "target": 13.0,
             "rr": 4.0,
@@ -321,3 +322,29 @@ def test_execution_priority_prefers_lower_t1_and_volatility_risk():
     assert core_plan.execution_risk_priority_key({"code": "600001"}, low_risk) < core_plan.execution_risk_priority_key(
         {"code": "300001"}, high_risk
     )
+
+
+def test_supplemental_ths_context_is_audited_but_not_an_execution_gate(tmp_path, monkeypatch):
+    context_dir = tmp_path / "reports" / "market_context" / "20260721"
+    context_dir.mkdir(parents=True)
+    (context_dir / "ths_data_center.json").write_text(
+        json.dumps(
+            {
+                "trade_date": "2026-07-21",
+                "generated_at": "2026-07-22T08:00:00+08:00",
+                "audit": {"passed": True, "endpoint_count": 17, "failed_count": 0},
+                "limit_up": {"emotion_status": "PASS", "emotion_label": "涨停情绪偏强"},
+                "display": {"summary_line": "涨停 120", "hot_topics": ["芯片"]},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(core_plan, "ROOT", tmp_path)
+
+    context = core_plan.load_supplemental_market_context(date(2026, 7, 21))
+
+    assert context["status"] == "PASS"
+    assert context["emotion_label"] == "涨停情绪偏强"
+    assert context["used_for_execution_gate"] is False
+    assert context["role"] == "supplemental_validation_only"

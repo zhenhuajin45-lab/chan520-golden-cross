@@ -39,6 +39,16 @@ def test_export_includes_planned_orders_and_quote_fallback(tmp_path):
             "reason_text": "盘中失效价风控候选",
         }
     )
+    adapter.record_planned_order(
+        {
+            "planned_order_id": "old-plan",
+            "trade_date": "2026-07-14",
+            "symbol": "SZSE.000001",
+            "side": "BUY",
+            "volume": 100,
+            "status": "EXPIRED_PLAN_DATE",
+        }
+    )
 
     payload = build_payload(Path(ledger), "local-test", "2026-07-15")
 
@@ -54,6 +64,7 @@ def test_export_includes_planned_orders_and_quote_fallback(tmp_path):
     assert payload["planned_orders"][0]["stock_name"] == "大恒科技"
     assert payload["planned_orders"][0]["display_symbol"] == "SHSE.600288 大恒科技"
     assert payload["planned_orders"][0]["reason_text"] == "盘中失效价风控候选"
+    assert len(payload["planned_orders"]) == 1
 
 
 def test_export_uses_last_valid_quote_cache_and_reports_sellable_shares(tmp_path, monkeypatch):
@@ -137,3 +148,27 @@ def test_export_exposes_profit_high_water_state(tmp_path):
 
     assert payload["positions"][0]["peak_unrealized_pnl_pct"] == 0.04
     assert payload["positions"][0]["profit_protection_armed"] is True
+
+
+def test_missing_core_plan_is_reported_as_generation_failure(tmp_path, monkeypatch):
+    run_dir = tmp_path / "reports" / "local_sim_daily" / "20260722"
+    run_dir.mkdir(parents=True)
+    (run_dir / "plan_summary.json").write_text(
+        """{
+          "status": "FAIL",
+          "steps": [{
+            "name": "generate_core_plan",
+            "returncode": 1,
+            "stderr_tail": "Eastmoney 502"
+          }]
+        }""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exporter, "ROOT", tmp_path)
+
+    core = exporter.load_core_plan("2026-07-22")
+
+    assert core["status"] == "GENERATION_FAILED"
+    assert core["executable_buy_count"] == 0
+    assert core["failure_step"] == "generate_core_plan"
+    assert "502" in core["failure_reason"]

@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run scheduled Chan520 local simulated trading workflow")
     parser.add_argument("--phase", choices=["plan", "preopen", "intraday", "eod"], required=True)
     parser.add_argument("--trade-date", default="auto")
+    parser.add_argument("--signal-date", default="", help="Prior completed market session used by the plan phase")
+    parser.add_argument("--offline-regime", action="store_true", help="Generate a fail-closed plan without fetching index data")
     parser.add_argument("--initial-cash", type=float, default=1_000_000.0)
     parser.add_argument("--max-age-minutes", type=int, default=5)
     parser.add_argument("--max-fills", type=int, default=2)
@@ -80,10 +83,16 @@ def main() -> int:
 def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
     if args.phase == "plan":
+        plan_args = ["--trade-date", trade_date, "--refresh-scan-if-missing"]
+        signal_date = str(getattr(args, "signal_date", "") or "")
+        if signal_date:
+            plan_args.extend(["--signal-date", signal_date])
+        if bool(getattr(args, "offline_regime", False)):
+            plan_args.append("--offline-regime")
         steps.append(
             step(
                 "generate_core_plan",
-                script("generate_local_sim_core_plan.py", "--trade-date", trade_date, "--refresh-scan-if-missing"),
+                script("generate_local_sim_core_plan.py", *plan_args),
             )
         )
         steps.append(export_dashboard_step(trade_date, args.initial_cash))
@@ -209,31 +218,50 @@ def step(name: str, cmd: list[str]) -> dict[str, Any]:
 def run_step(step_payload: dict[str, Any], index: int, log_dir: Path) -> dict[str, Any]:
     name = str(step_payload["name"])
     started = datetime.now(SHANGHAI_TZ)
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         step_payload["cmd"],
         cwd=ROOT,
         env=clean_env(),
         text=True,
-        capture_output=True,
-        timeout=1800,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=1800)
+        returncode = proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        # Kill the whole step process group: network clients can leave child
+        # processes holding the capture pipes open after the parent is killed.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            stdout, stderr = proc.communicate()
+        stdout = stdout or exc.stdout or ""
+        stderr = stderr or exc.stderr or ""
+        stderr += "\nstep timed out after 1800 seconds; process group terminated\n"
+        returncode = 124
     ended = datetime.now(SHANGHAI_TZ)
     prefix = f"{index:02d}_{safe_name(name)}"
     stdout_path = log_dir / f"{prefix}.stdout.log"
     stderr_path = log_dir / f"{prefix}.stderr.log"
-    stdout_path.write_text(proc.stdout, encoding="utf-8")
-    stderr_path.write_text(proc.stderr, encoding="utf-8")
+    stdout_path.write_text(stdout, encoding="utf-8")
+    stderr_path.write_text(stderr, encoding="utf-8")
     return {
         "name": name,
         "cmd": redact_cmd(step_payload["cmd"]),
-        "returncode": proc.returncode,
+        "returncode": returncode,
         "started_at": started.isoformat(timespec="seconds"),
         "ended_at": ended.isoformat(timespec="seconds"),
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
-        "stdout_tail": proc.stdout[-2000:],
-        "stderr_tail": proc.stderr[-2000:],
+        "stdout_tail": stdout[-2000:],
+        "stderr_tail": stderr[-2000:],
     }
 
 

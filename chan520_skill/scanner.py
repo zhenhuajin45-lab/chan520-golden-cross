@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import platform
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,17 +11,20 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from http.client import RemoteDisconnected
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import requests
 
-from .data import DataError, auto_history, normalize_code, trim_to_date
+from .data import DataError, eastmoney_history, normalize_code, trim_to_date
 from .models import KLine, StockMeta
 from .strategy import analyze
 from .indicators import fmt
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -59,14 +63,77 @@ class ScanRow:
     ma5_slope: str
 
 
-def fetch_hs_universe(timeout: int = 20) -> list[UniverseStock]:
+def fetch_hs_universe(
+    timeout: int = 5,
+    *,
+    target: date | None = None,
+    reports_root: Path | None = None,
+) -> list[UniverseStock]:
+    stocks, _metadata = resolve_hs_universe(timeout=timeout, target=target, reports_root=reports_root)
+    return stocks
+
+
+def resolve_hs_universe(
+    timeout: int = 5,
+    *,
+    target: date | None = None,
+    reports_root: Path | None = None,
+) -> tuple[list[UniverseStock], dict[str, Any]]:
+    # Use the explicitly bounded HTTP endpoint first. AkShare's wrapper can
+    # block in an SSL read without propagating our timeout, preventing the
+    # scanner from even reaching the worker pool.
+    errors: list[str] = []
+    try:
+        stocks = _fetch_eastmoney_universe(timeout)
+        if stocks:
+            return stocks, {
+                "universe_source": "eastmoney_realtime",
+                "universe_asof": target.isoformat() if target else "",
+                "universe_fallback": False,
+                "universe_errors": [],
+            }
+    except Exception as exc:  # noqa: BLE001 - a qualified local snapshot is the fail-safe source.
+        errors.append(f"eastmoney:{type(exc).__name__}:{exc}")
+
+    try:
+        stocks = _fetch_sina_universe(timeout)
+        if stocks:
+            return stocks, {
+                "universe_source": "sina_realtime",
+                "universe_asof": target.isoformat() if target else "",
+                "universe_fallback": True,
+                "universe_errors": errors,
+            }
+    except Exception as exc:  # noqa: BLE001 - continue to audited local evidence.
+        errors.append(f"sina:{type(exc).__name__}:{exc}")
+
+    cached, cached_asof = _load_cached_universe(target=target, reports_root=reports_root)
+    if cached:
+        return cached, {
+            "universe_source": "qualified_local_scan",
+            "universe_asof": cached_asof.isoformat() if cached_asof else "",
+            "universe_fallback": True,
+            "universe_errors": errors,
+        }
+
+    # Keep AkShare only as a last-resort compatibility fallback. It is not
+    # used before the deterministic local snapshot because its transport
+    # timeout is uncontrolled.
     try:
         stocks = _fetch_akshare_universe()
         if stocks:
-            return stocks
-    except Exception:
-        pass
+            return stocks, {
+                "universe_source": "akshare_code_name",
+                "universe_asof": target.isoformat() if target else "",
+                "universe_fallback": True,
+                "universe_errors": errors,
+            }
+    except Exception as exc:  # noqa: BLE001 - report all attempted sources on final failure.
+        errors.append(f"akshare:{type(exc).__name__}:{exc}")
+    raise DataError("A-share universe unavailable: " + " | ".join(errors))
 
+
+def _fetch_eastmoney_universe(timeout: int) -> list[UniverseStock]:
     stocks: list[UniverseStock] = []
     page = 1
     page_size = 10000
@@ -110,6 +177,121 @@ def fetch_hs_universe(timeout: int = 20) -> list[UniverseStock]:
     return stocks
 
 
+def _fetch_sina_universe(timeout: int) -> list[UniverseStock]:
+    count_url = (
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        "Market_Center.getHQNodeStockCount?node=hs_a"
+    )
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+    count_response = requests.get(count_url, headers=headers, timeout=timeout)
+    count_response.raise_for_status()
+    match = re.search(r"\d+", count_response.text)
+    if not match:
+        raise DataError("Sina universe count missing")
+    page_size = 100
+    page_count = (int(match.group()) + page_size - 1) // page_size
+    base_url = (
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        "Market_Center.getHQNodeData"
+    )
+
+    def fetch_page(page: int) -> list[dict[str, Any]]:
+        params = {
+            "page": page,
+            "num": page_size,
+            "sort": "symbol",
+            "asc": 1,
+            "node": "hs_a",
+            "symbol": "",
+            "_s_r_a": "page",
+        }
+        response = requests.get(base_url, params=params, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise DataError(f"invalid Sina universe page {page}")
+        return payload
+
+    records: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(fetch_page, page): page for page in range(1, page_count + 1)}
+        for future in as_completed(futures):
+            records.extend(future.result())
+    stocks: list[UniverseStock] = []
+    seen: set[str] = set()
+    for item in records:
+        code = normalize_code(str(item.get("code") or ""))
+        name = str(item.get("name") or "")
+        if code in seen or not code.startswith(("0", "3", "6")) or _is_excluded_name(name):
+            continue
+        seen.add(code)
+        stocks.append(
+            UniverseStock(
+                code=code,
+                name=name,
+                market=1 if code.startswith(("5", "6", "9")) else 0,
+                close=_float_or_none(item.get("trade")),
+                pct_chg=_float_or_none(item.get("changepercent")),
+                turnover=_float_or_none(item.get("turnoverratio")),
+            )
+        )
+    if len(stocks) < 1000:
+        raise DataError(f"Sina universe incomplete: {len(stocks)}")
+    stocks.sort(key=lambda item: item.code)
+    return stocks
+
+
+def _load_cached_universe(
+    *,
+    target: date | None,
+    reports_root: Path | None,
+) -> tuple[list[UniverseStock], date | None]:
+    root = reports_root or ROOT / "reports"
+    candidates: list[tuple[date, Path]] = []
+    for scan_path in root.glob("scan_*/market_scan_*.csv"):
+        try:
+            scan_date = date.fromisoformat(scan_path.stem.removeprefix("market_scan_"))
+        except ValueError:
+            continue
+        if target is not None and scan_date >= target:
+            continue
+        quality = _read_local_json(scan_path.with_name(f"scan_quality_{scan_date.isoformat()}.json"))
+        if quality.get("coverage_pass") is not True:
+            continue
+        candidates.append((scan_date, scan_path))
+    for scan_date, scan_path in sorted(candidates, reverse=True):
+        stocks: list[UniverseStock] = []
+        seen: set[str] = set()
+        try:
+            with scan_path.open("r", encoding="utf-8-sig", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    code = normalize_code(str(row.get("code") or ""))
+                    name = str(row.get("name") or "")
+                    if code in seen or not code.startswith(("0", "3", "6")) or _is_excluded_name(name):
+                        continue
+                    seen.add(code)
+                    stocks.append(
+                        UniverseStock(
+                            code=code,
+                            name=name,
+                            market=1 if code.startswith(("5", "6", "9")) else 0,
+                        )
+                    )
+        except (OSError, csv.Error, ValueError):
+            continue
+        if len(stocks) >= 1000:
+            return stocks, scan_date
+    return [], None
+
+
+def _read_local_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _fetch_akshare_universe() -> list[UniverseStock]:
     import akshare as ak
 
@@ -131,9 +313,14 @@ def scan_market(
     output_dir: Path,
     max_workers: int = 16,
     include_observe: bool = True,
-) -> tuple[Path, Path, dict[str, int]]:
+) -> tuple[Path, Path, dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    universe = fetch_hs_universe()
+    universe, universe_metadata = resolve_hs_universe(target=target, reports_root=output_dir.parent)
+    print(
+        f"universe source: {universe_metadata['universe_source']} "
+        f"asof={universe_metadata['universe_asof'] or '-'} count={len(universe)}",
+        flush=True,
+    )
     rows: list[ScanRow] = []
     failures = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -146,7 +333,7 @@ def scan_market(
                 failures += 1
             elif include_observe or result.verdict != "不入选":
                 rows.append(result)
-            if completed % 50 == 0:
+            if completed % 10 == 0:
                 print(f"scan progress: {completed}/{len(universe)}, rows={len(rows)}, failures={failures}", flush=True)
 
     rows.sort(key=lambda row: (row.verdict != "入选", -row.score, -row.satisfied_count, row.code))
@@ -155,6 +342,8 @@ def scan_market(
     _write_csv(csv_path, rows)
     _write_markdown(md_path, rows, len(universe), failures, target)
     stats = {
+        **universe_metadata,
+        "history_source_policy": ["tencent_qfq", "eastmoney_qfq"],
         "universe": len(universe),
         "rows": len(rows),
         "failures": failures,
@@ -197,7 +386,10 @@ def _scan_one(stock: UniverseStock, target: date) -> ScanRow | None:
         report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
     except Exception:
         try:
-            meta, rows = auto_history(stock.code, target)
+            # Keep the fallback bounded. auto_history retries Eastmoney and
+            # then Tencent again with much larger defaults; when Tencent is
+            # degraded this multiplied into hours of queue starvation.
+            meta, rows = eastmoney_history(stock.code, target, timeout=5)
             rows = trim_to_date(rows, target)
             report = analyze(StockMeta(code=stock.code, name=meta.name or stock.name, market=stock.market), rows, target)
         except Exception:

@@ -185,15 +185,17 @@ function renderCorePlanAlert(payload) {
   const core = payload.core_plan || {};
   if (!core.status) return "";
   const quality = core.scan_quality || {};
+  const supplemental = core.supplemental_market_context || {};
   const coverage = Number(quality.coverage);
   const coverageText = Number.isFinite(coverage) ? `${(coverage * 100).toFixed(2)}%` : "未知";
   const kind = core.status === "PASS" && Number(core.executable_buy_count || 0) > 0 ? "ok" : core.status === "PASS" ? "warning" : "danger";
   const boundary = core.status !== "PASS"
-    ? "自动新增买入已关闭，仅保留现有持仓风控。"
+    ? `自动新增买入已关闭，仅保留现有持仓风控。${core.failure_reason ? ` 原因：${core.failure_reason}` : ""}`
     : Number(core.executable_buy_count || 0) > 0
       ? `仅 ${intText(core.executable_buy_count)} 只严格候选可进入盘中二阶段确认。`
-      : "没有严格候选，观察池不会自动成交。";
-  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜扫描覆盖率 ${escapeHtml(coverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}｜${escapeHtml(boundary)}</div>`;
+      : "没有通过全部执行门槛的可执行买入，观察池不会自动成交。";
+  const supplementalText = supplemental.emotion_label ? `｜同花顺旁路 ${supplemental.emotion_label}` : "";
+  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜扫描覆盖率 ${escapeHtml(coverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}｜${escapeHtml(boundary)}</div>`;
 }
 
 function renderReadinessAlert(payload) {

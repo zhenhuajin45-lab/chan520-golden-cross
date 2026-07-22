@@ -295,6 +295,7 @@ def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
     core = payload.get("core_plan") if isinstance(payload.get("core_plan"), dict) else {}
     readiness = payload.get("readiness") if isinstance(payload.get("readiness"), dict) else {}
     quality = core.get("scan_quality") if isinstance(core.get("scan_quality"), dict) else {}
+    supplemental = core.get("supplemental_market_context") if isinstance(core.get("supplemental_market_context"), dict) else {}
     elements = [
         div(f"**盘前核心交易计划**\n{trade_date}"),
         fields_block(
@@ -305,6 +306,7 @@ def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
                 ("计划状态", core.get("status") or "-"),
                 ("扫描覆盖率", pct(quality.get("coverage"))),
                 ("市场状态", (core.get("market_regime") or {}).get("state") or "-"),
+                ("同花顺旁路", supplemental.get("emotion_label") or supplemental.get("status") or "-"),
                 ("风险闭环", ready_label(readiness.get("local_sim_risk_loop_ready"))),
                 ("新增买入", ready_label(readiness.get("local_sim_buy_entry_ready"))),
                 ("几何拦截", f"{safe_int(core.get('geometry_blocked_count'))} 只"),
@@ -324,7 +326,9 @@ def core_plan_boundary(core: dict[str, Any]) -> str:
     if not core:
         return "未找到核心计划摘要，自动买入保持关闭。"
     if core.get("status") != "PASS":
-        return "计划已 fail-closed；不会新增买入，只执行现有持仓风控。"
+        reason = compact_text(core.get("failure_step"), core.get("failure_reason"))
+        suffix = f" 失败原因：{reason}" if reason != "-" else ""
+        return f"计划已 fail-closed；不会新增买入，只执行现有持仓风控。{suffix}"
     if safe_int(core.get("executable_buy_count")) <= 0:
         return "没有通过严格门槛的可执行买入；观察池不会自动成交。"
     return f"仅 {safe_int(core.get('executable_buy_count'))} 只严格候选可进入盘中二阶段确认。"

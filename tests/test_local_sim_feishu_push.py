@@ -186,6 +186,22 @@ def test_push_plan_card_dry_run_does_not_mark_state():
     assert state["pushed_keys"] == {}
 
 
+def test_plan_card_exposes_generation_failure_reason():
+    payload = sample_payload()
+    payload["core_plan"] = {
+        "status": "GENERATION_FAILED",
+        "failure_step": "generate_core_plan",
+        "failure_reason": "Sina and Eastmoney unavailable",
+    }
+
+    card = build_plan_card(payload, "2026-07-15")
+
+    content = str(card)
+    assert "GENERATION_FAILED" in content
+    assert "generate_core_plan" in content
+    assert "Sina and Eastmoney unavailable" in content
+
+
 def test_push_trade_cards_dry_run_does_not_mark_state():
     state = {"pushed_keys": {}}
     audit = push_trade_cards(

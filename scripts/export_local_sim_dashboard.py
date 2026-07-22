@@ -170,6 +170,9 @@ def build_payload(
         order for order in orders if not trade_date or str(order.get("session_date") or day_from_timestamp(order.get("created_at"))) == trade_date
     ][:100]
     selected_trade_date = trade_date or latest_trade_date(orders, fills)
+    selected_planned_orders = [
+        row for row in planned_orders if not selected_trade_date or str(row.get("trade_date") or "") == selected_trade_date
+    ]
     return {
         "schema_version": "chan520_local_sim_dashboard_v0",
         "generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
@@ -211,7 +214,7 @@ def build_payload(
         ],
         "orders": [{**item, **stock_identity(item, stock_names)} for item in selected_orders],
         "fills": [{**item, **stock_identity(item, stock_names)} for item in selected_fills],
-        "planned_orders": [{**item, **stock_identity(item, stock_names)} for item in planned_orders],
+        "planned_orders": [{**item, **stock_identity(item, stock_names)} for item in selected_planned_orders],
         "daily": daily_rows(fills_by_day),
     }
 
@@ -473,6 +476,8 @@ def load_core_plan(trade_date: str) -> dict[str, Any]:
     payload = read_json(path, {})
     if not isinstance(payload, dict):
         return {}
+    if not payload:
+        return load_core_plan_failure(trade_date)
     plans = payload.get("plans") if isinstance(payload.get("plans"), list) else []
     geometry_blocked_count = sum(
         1
@@ -493,10 +498,41 @@ def load_core_plan(trade_date: str) -> dict[str, Any]:
         "watch_scan_count": payload.get("watch_scan_count", 0),
         "scan_quality": payload.get("scan_quality") or {},
         "market_regime": payload.get("market_regime") or {},
+        "supplemental_market_context": payload.get("supplemental_market_context") or {},
         "research_warnings": payload.get("research_warnings") or [],
         "research_cohorts": payload.get("research_cohorts") or {},
         "geometry_blocked_count": geometry_blocked_count,
         "t1_risk_policy": "board_floor_plus_atr_and_amplitude_v1",
+    }
+
+
+def load_core_plan_failure(trade_date: str) -> dict[str, Any]:
+    summary_path = ROOT / "reports" / "local_sim_daily" / trade_date.replace("-", "") / "plan_summary.json"
+    summary = read_json(summary_path, {})
+    if not isinstance(summary, dict) or summary.get("status") != "FAIL":
+        return {}
+    steps = summary.get("steps") if isinstance(summary.get("steps"), list) else []
+    failed = next((row for row in steps if isinstance(row, dict) and int(row.get("returncode") or 0) != 0), {})
+    reason = str(failed.get("stderr_tail") or failed.get("stdout_tail") or "core plan generation failed").strip()
+    if len(reason) > 500:
+        reason = reason[-500:]
+    return {
+        "status": "GENERATION_FAILED",
+        "policy_id": None,
+        "selection_policy": None,
+        "signal_date": None,
+        "executable_buy_count": 0,
+        "strict_scan_count": 0,
+        "watch_scan_count": 0,
+        "scan_quality": {},
+        "market_regime": {},
+        "supplemental_market_context": {},
+        "research_warnings": [],
+        "research_cohorts": {},
+        "geometry_blocked_count": 0,
+        "t1_risk_policy": "board_floor_plus_atr_and_amplitude_v1",
+        "failure_step": failed.get("name") or "generate_core_plan",
+        "failure_reason": reason,
     }
 
 
