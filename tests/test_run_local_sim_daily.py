@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from argparse import Namespace
 from datetime import datetime
+from pathlib import Path
+import subprocess
+import sys
 from zoneinfo import ZoneInfo
 
 from scripts.run_local_sim_daily import acquire_run_guard, build_steps, release_run_guard
 
 
 TZ = ZoneInfo("Asia/Shanghai")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def args(**overrides):
@@ -89,3 +93,16 @@ def test_run_guard_skips_duplicate_without_overwriting_phase_summary(tmp_path):
     )
     assert guard is None
     assert skip["status"] == "SKIPPED_DUPLICATE"
+
+
+def test_daily_entrypoint_loads_project_package_outside_repo(tmp_path):
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "run_local_sim_daily.py"), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Run scheduled Chan520 local simulated trading workflow" in result.stdout

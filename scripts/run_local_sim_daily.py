@@ -13,14 +13,16 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from chan520_skill.execution_policy import (
     BEAR_PILOT_ACCOUNT_ID,
     BEAR_PILOT_MAX_EXPOSURE_PCT,
     BEAR_PILOT_MAX_FILLS,
 )
 
-
-ROOT = Path(__file__).resolve().parents[1]
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 PYTHON = ROOT / ".venv311" / "bin" / "python"
 if not PYTHON.exists():
