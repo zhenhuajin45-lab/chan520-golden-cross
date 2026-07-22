@@ -19,6 +19,12 @@ class DataError(RuntimeError):
     pass
 
 
+TENCENT_KLINE_ENDPOINTS = (
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+)
+
+
 def market_id(code: str) -> int:
     code = normalize_code(code)
     return 1 if code.startswith(("5", "6", "9")) else 0
@@ -71,10 +77,7 @@ def tencent_history(
     begin = end - timedelta(days=lookback_days)
     symbol = f"{prefix}{code}"
     params = f"{symbol},day,{begin.isoformat()},{end.isoformat()},640,{adjust}"
-    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + urlencode({"param": params})
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"})
-    with urlopen(req, timeout=timeout) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    payload = tencent_kline_payload(params, timeout=timeout)
     data = payload.get("data", {}).get(symbol, {})
     key = f"{adjust}day" if adjust in {"qfq", "hfq"} else "day"
     klines = data.get(key) or data.get("qfqday") or data.get("day")
@@ -83,6 +86,81 @@ def tencent_history(
     name = tencent_quote(code).get("name", code)
     rows = [_parse_tencent_kline(row, previous=None if i == 0 else klines[i - 1]) for i, row in enumerate(klines)]
     return StockMeta(code=code, name=name, market=market_id(code)), rows
+
+
+def sina_history(
+    code: str,
+    end: date,
+    lookback_days: int = 560,
+    timeout: int = 20,
+) -> tuple[StockMeta, list[KLine]]:
+    code = normalize_code(code)
+    prefix = "sh" if market_id(code) == 1 else "sz"
+    url = (
+        "https://quotes.sina.cn/cn/api/json_v2.php/"
+        "CN_MarketDataService.getKLineData?"
+        + urlencode(
+            {
+                "symbol": f"{prefix}{code}",
+                "scale": 240,
+                "ma": "no",
+                "datalen": min(max(lookback_days, 120), 1023),
+            }
+        )
+    )
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (RemoteDisconnected, TimeoutError, URLError, json.JSONDecodeError) as exc:
+        raise DataError(f"Sina kline unavailable for {code}: {type(exc).__name__}:{exc}") from exc
+    if not isinstance(payload, list):
+        raise DataError(f"Sina returned invalid kline data for {code}")
+    rows: list[KLine] = []
+    for item in payload:
+        current_date = date.fromisoformat(str(item["day"])[:10])
+        if current_date > end:
+            continue
+        open_price = float(item["open"])
+        close = float(item["close"])
+        high = float(item["high"])
+        low = float(item["low"])
+        volume = float(item.get("volume") or 0.0)
+        prev_close = rows[-1].close if rows else open_price
+        change = close - prev_close
+        pct_chg = change / prev_close * 100 if prev_close else 0.0
+        amplitude = (high - low) / prev_close * 100 if prev_close else 0.0
+        rows.append(
+            KLine(
+                current_date,
+                open_price,
+                close,
+                high,
+                low,
+                volume,
+                0.0,
+                amplitude,
+                pct_chg,
+                change,
+                0.0,
+            )
+        )
+    if not rows or rows[-1].date != end:
+        raise DataError(f"Sina returned no exact-date kline data for {code} on {end}")
+    return StockMeta(code=code, name=code, market=market_id(code)), rows
+
+
+def tencent_kline_payload(params: str, *, timeout: int = 20) -> dict:
+    errors: list[str] = []
+    for endpoint in TENCENT_KLINE_ENDPOINTS:
+        url = endpoint + "?" + urlencode({"param": params})
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"})
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (RemoteDisconnected, TimeoutError, URLError, json.JSONDecodeError) as exc:
+            errors.append(f"{endpoint}:{type(exc).__name__}:{exc}")
+    raise DataError("Tencent kline endpoints unavailable: " + " | ".join(errors))
 
 
 def auto_history(code: str, end: date, adjust: int = 1) -> tuple[StockMeta, list[KLine]]:

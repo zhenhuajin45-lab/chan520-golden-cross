@@ -6,6 +6,7 @@ from datetime import date
 from pathlib import Path
 
 from chan520_skill.broker_adapter import LocalSimBrokerAdapter, LocalSimBrokerConfig
+from chan520_skill.models import KLine
 from scripts import generate_local_sim_core_plan as core_plan
 
 
@@ -430,3 +431,34 @@ def test_supplemental_ths_context_is_audited_but_not_an_execution_gate(tmp_path,
     assert context["emotion_label"] == "涨停情绪偏强"
     assert context["used_for_execution_gate"] is False
     assert context["role"] == "supplemental_validation_only"
+
+
+def test_qualified_store_beats_degraded_scan_file(tmp_path):
+    degraded_rows = [{"code": "600001", "name": "partial"}]
+    stored_rows = [{"code": "600001", "name": "qualified"}]
+
+    rows, quality, evidence_path = core_plan.prefer_qualified_scan_evidence(
+        degraded_rows,
+        {"coverage_pass": False, "coverage": 0.03},
+        tmp_path / "market_scan.csv",
+        (stored_rows, {"coverage_pass": True, "coverage": 0.99}),
+    )
+
+    assert rows == stored_rows
+    assert quality["coverage_pass"] is True
+    assert evidence_path == core_plan.MARKET_STORE
+
+
+def test_signal_date_probe_stops_at_prior_calendar_day(monkeypatch):
+    requested = []
+
+    def fake_loader(_symbol, end):
+        requested.append(end)
+        return [KLine(date(2026, 7, 22), 1, 1, 1, 1, 1, 0, 0, 0, 0, 0)]
+
+    monkeypatch.setattr(core_plan, "tencent_index_history", fake_loader)
+
+    signal_date = core_plan.resolve_signal_date(date(2026, 7, 23))
+
+    assert signal_date == date(2026, 7, 22)
+    assert requested == [date(2026, 7, 22)]

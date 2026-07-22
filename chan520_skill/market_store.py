@@ -161,13 +161,26 @@ def upsert_scan(
     path: str | Path = DEFAULT_PATH,
 ) -> None:
     initialize(path)
-    stamp = now()
+    stamp = datetime.now(TZ).isoformat(timespec="microseconds")
     records = [
         (target.isoformat(), str(row.get("code") or ""), json.dumps(row, ensure_ascii=False), source, stamp)
         for row in rows
         if str(row.get("code") or "")
     ]
     with connect(path) as conn:
+        existing = conn.execute(
+            "select payload_json from scan_quality where trade_date = ?",
+            (target.isoformat(),),
+        ).fetchone()
+        existing_quality = json.loads(existing[0]) if existing is not None else {}
+        if quality.get("coverage_pass") is not True:
+            if existing_quality.get("coverage_pass") is True:
+                return
+            conn.execute(
+                "insert or replace into scan_quality values (?, ?, ?, ?)",
+                (target.isoformat(), json.dumps(quality, ensure_ascii=False), source, stamp),
+            )
+            return
         conn.executemany("insert or replace into scan_snapshots values (?, ?, ?, ?, ?)", records)
         conn.execute(
             "insert or replace into scan_quality values (?, ?, ?, ?)",
@@ -179,14 +192,26 @@ def load_scan(target: date, *, path: str | Path = DEFAULT_PATH) -> tuple[list[di
     if not Path(path).exists():
         return None
     with connect(path) as conn:
-        rows = conn.execute(
-            "select payload_json from scan_snapshots where trade_date = ? order by code",
+        quality = conn.execute(
+            "select payload_json, updated_at from scan_quality where trade_date = ?",
             (target.isoformat(),),
-        ).fetchall()
-        quality = conn.execute("select payload_json from scan_quality where trade_date = ?", (target.isoformat(),)).fetchone()
-    if not rows or quality is None:
+        ).fetchone()
+        if quality is None:
+            return None
+        quality_payload = json.loads(quality["payload_json"])
+        if quality_payload.get("coverage_pass") is True:
+            rows = conn.execute(
+                "select payload_json from scan_snapshots where trade_date = ? and updated_at = ? order by code",
+                (target.isoformat(), quality["updated_at"]),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "select payload_json from scan_snapshots where trade_date = ? order by code",
+                (target.isoformat(),),
+            ).fetchall()
+    if not rows:
         return None
-    return [json.loads(row[0]) for row in rows], json.loads(quality[0])
+    return [json.loads(row[0]) for row in rows], quality_payload
 
 
 def upsert_minute_day(

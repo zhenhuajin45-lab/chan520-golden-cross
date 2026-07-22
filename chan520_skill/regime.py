@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 from datetime import date, timedelta
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
-from .data import DataError, _read_json_with_retry, trim_to_date
+from .data import DataError, _read_json_with_retry, tencent_kline_payload, trim_to_date
 from .indicators import build_indicators, pct_change
 from .models import KLine, RegimeState
 from .quality import ensure_data_quality
@@ -123,10 +121,7 @@ def tencent_index_history(symbol: str, end: date, lookback_days: int = 560, time
         raise DataError(f"unsupported index symbol for Tencent fallback: {symbol}")
     begin = end - timedelta(days=lookback_days)
     params = f"{tencent_symbol},day,{begin.isoformat()},{end.isoformat()},640,qfq"
-    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + urlencode({"param": params})
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"})
-    with urlopen(req, timeout=timeout) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    payload = tencent_kline_payload(params, timeout=timeout)
     data = payload.get("data", {}).get(tencent_symbol, {})
     klines = data.get("day")
     if not klines:

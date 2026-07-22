@@ -7,7 +7,7 @@ import re
 import sqlite3
 import sys
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -27,7 +27,7 @@ from chan520_skill.execution_policy import (  # noqa: E402
     BEAR_PILOT_POSITION_PCT,
     CORE_PLAN_POLICY_ID,
 )
-from chan520_skill.data import eastmoney_history, tencent_history, trim_to_date  # noqa: E402
+from chan520_skill.data import eastmoney_history, sina_history, tencent_history, trim_to_date  # noqa: E402
 from chan520_skill.market_store import (  # noqa: E402
     DEFAULT_PATH as MARKET_STORE,
     initialize as initialize_market_store,
@@ -100,6 +100,13 @@ def main() -> int:
     pilot_adapter.initialize_account()
     rows = read_scan(scan_path)
     scan_quality = resolve_scan_quality(scan_path, scan_stats)
+    stored_scan = load_stored_scan(signal_date, path=MARKET_STORE)
+    rows, scan_quality, scan_path = prefer_qualified_scan_evidence(
+        rows,
+        scan_quality,
+        scan_path,
+        stored_scan,
+    )
     upsert_scan(signal_date, rows, scan_quality, source="qualified_scan_csv", path=MARKET_STORE)
     sector_map = resolve_sector_map(rows)
     regime = resolve_market_regime(signal_date, offline=args.offline_regime)
@@ -135,9 +142,10 @@ def resolve_signal_date(trade_date: date, supplied: str = "") -> date:
             raise ValueError("signal_date must be earlier than trade_date")
         return signal_date
     errors = []
+    completed_session_cutoff = trade_date - timedelta(days=1)
     for loader in (tencent_index_history, index_history):
         try:
-            rows = loader("000001", trade_date)
+            rows = loader("000001", completed_session_cutoff)
             prior = [row.date for row in rows if row.date < trade_date]
             if prior:
                 return max(prior)
@@ -221,16 +229,33 @@ def restore_scan_files(
     quality_path.write_text(json.dumps(quality, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def prefer_qualified_scan_evidence(
+    rows: list[dict[str, Any]],
+    quality: dict[str, Any],
+    scan_path: Path,
+    stored_scan: tuple[list[dict[str, Any]], dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], Path]:
+    if quality.get("coverage_pass") is True or stored_scan is None:
+        return rows, quality, scan_path
+    stored_rows, stored_quality = stored_scan
+    if stored_rows and stored_quality.get("coverage_pass") is True:
+        return stored_rows, stored_quality, MARKET_STORE
+    return rows, quality, scan_path
+
+
 def load_candidate_history(code: str, target: date, *, offline: bool) -> tuple[Any, list[Any], str] | None:
     if not offline:
         errors = []
         for source, loader, kwargs in (
             ("tencent", tencent_history, {"adjust": "qfq"}),
+            ("sina_unadjusted", sina_history, {}),
             ("eastmoney", eastmoney_history, {"adjust": 1}),
         ):
             try:
                 meta, rows = loader(code, target, **kwargs)
                 rows = trim_to_date(rows, target)
+                if not rows or rows[-1].date != target:
+                    raise RuntimeError(f"{source} exact-date history unavailable for {target}")
                 upsert_history(code, meta.name, meta.market, rows, source=source, path=MARKET_STORE)
                 return meta, rows, source
             except Exception as exc:  # noqa: BLE001 - try every bounded source before local fallback.
@@ -617,7 +642,8 @@ def resolve_scan_quality(scan_path: Path, supplied: dict[str, Any] | None = None
             "minimum_coverage": 0.85,
             "coverage_pass": coverage >= 0.85,
         }
-    quality_path = scan_path.parent / f"scan_quality_{scan_path.parent.name.removeprefix('scan_')}.json"
+    scan_date = scan_path.stem.removeprefix("market_scan_")
+    quality_path = scan_path.parent / f"scan_quality_{scan_date}.json"
     if quality_path.exists():
         try:
             payload = json.loads(quality_path.read_text(encoding="utf-8"))

@@ -38,3 +38,49 @@ def test_store_round_trips_scan_and_same_date_minutes(tmp_path):
     assert scan is not None and scan[0][0]["code"] == "600001"
     assert cached is not None and cached["prev_close"] == 10.0
     assert load_minute_day("600001", date(2026, 7, 22), is_index=False, path=path) is None
+
+
+def test_store_records_degraded_quality_without_partial_snapshot(tmp_path):
+    path = tmp_path / "market.db"
+    target = date(2026, 7, 22)
+    upsert_scan(target, [{"code": "600001", "name": "partial"}], {"coverage_pass": False}, source="test", path=path)
+
+    loaded = load_scan(target, path=path)
+
+    assert loaded is None
+
+
+def test_store_degraded_retry_does_not_replace_qualified_snapshot(tmp_path):
+    path = tmp_path / "market.db"
+    target = date(2026, 7, 22)
+    upsert_scan(target, [{"code": "600001", "name": "qualified"}], {"coverage_pass": True}, source="test", path=path)
+    upsert_scan(target, [{"code": "600001", "name": "partial"}], {"coverage_pass": False}, source="retry", path=path)
+
+    rows, quality = load_scan(target, path=path) or ([], {})
+
+    assert rows == [{"code": "600001", "name": "qualified"}]
+    assert quality["coverage_pass"] is True
+
+
+def test_store_reads_only_latest_qualified_scan_batch(tmp_path):
+    path = tmp_path / "market.db"
+    target = date(2026, 7, 22)
+    upsert_scan(
+        target,
+        [{"code": "600001", "name": "current"}, {"code": "600002", "name": "stale"}],
+        {"coverage_pass": True},
+        source="first",
+        path=path,
+    )
+    upsert_scan(
+        target,
+        [{"code": "600001", "name": "current"}],
+        {"coverage_pass": True},
+        source="recovery",
+        path=path,
+    )
+
+    rows, quality = load_scan(target, path=path) or ([], {})
+
+    assert rows == [{"code": "600001", "name": "current"}]
+    assert quality["coverage_pass"] is True

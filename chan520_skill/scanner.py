@@ -9,16 +9,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, timedelta
-from http.client import RemoteDisconnected
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.error import URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 import requests
 
-from .data import DataError, eastmoney_history, normalize_code, trim_to_date
+from .data import DataError, eastmoney_history, normalize_code, sina_history, tencent_kline_payload, trim_to_date
 from .models import KLine, StockMeta
 from .strategy import analyze
 from .indicators import fmt
@@ -343,7 +340,7 @@ def scan_market(
     _write_markdown(md_path, rows, len(universe), failures, target)
     stats = {
         **universe_metadata,
-        "history_source_policy": ["tencent_qfq", "eastmoney_qfq"],
+        "history_source_policy": ["tencent_qfq", "sina_unadjusted", "eastmoney_qfq"],
         "universe": len(universe),
         "rows": len(rows),
         "failures": failures,
@@ -386,14 +383,22 @@ def _scan_one(stock: UniverseStock, target: date) -> ScanRow | None:
         report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
     except Exception:
         try:
-            # Keep the fallback bounded. auto_history retries Eastmoney and
-            # then Tencent again with much larger defaults; when Tencent is
-            # degraded this multiplied into hours of queue starvation.
-            meta, rows = eastmoney_history(stock.code, target, timeout=5)
+            _meta, rows = sina_history(stock.code, target, timeout=5)
             rows = trim_to_date(rows, target)
-            report = analyze(StockMeta(code=stock.code, name=meta.name or stock.name, market=stock.market), rows, target)
+            report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
         except Exception:
-            return None
+            try:
+                # Keep the final fallback bounded. auto_history retries
+                # Tencent again with larger defaults when Eastmoney fails.
+                meta, rows = eastmoney_history(stock.code, target, timeout=5)
+                rows = trim_to_date(rows, target)
+                report = analyze(
+                    StockMeta(code=stock.code, name=meta.name or stock.name, market=stock.market),
+                    rows,
+                    target,
+                )
+            except Exception:
+                return None
     score = sum(
         item.score
         for item in report.large_cycle + report.buy_points + report.trend_rules + report.position_rules + report.exit_rules
@@ -430,8 +435,7 @@ def _tencent_kline(stock: UniverseStock, end: date, timeout: int = 5) -> list[KL
     begin = end - timedelta(days=560)
     symbol = f"{prefix}{stock.code}"
     params = f"{symbol},day,{begin.isoformat()},{end.isoformat()},640,qfq"
-    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + urlencode({"param": params})
-    payload = _read_json_urllib(url, timeout=timeout, referer="https://gu.qq.com/")
+    payload = tencent_kline_payload(params, timeout=timeout)
     data = payload.get("data", {}).get(symbol, {})
     klines = data.get("qfqday") or data.get("day")
     if not klines:
@@ -511,20 +515,6 @@ def _read_json_with_powershell(url: str, timeout: int) -> dict:
         timeout=timeout + 5,
     )
     return json.loads(completed.stdout)
-
-
-def _read_json_urllib(url: str, timeout: int, referer: str, attempts: int = 1) -> dict:
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
-        try:
-            with urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except (RemoteDisconnected, TimeoutError, URLError) as exc:
-            last_error = exc
-            if attempt < attempts:
-                time.sleep(0.2 * attempt)
-    raise DataError(f"urllib read json failed after {attempts} attempts: {last_error}")
 
 
 def _write_csv(path: Path, rows: Iterable[ScanRow]) -> None:
