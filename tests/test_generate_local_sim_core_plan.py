@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import date
 from pathlib import Path
 
@@ -313,6 +314,87 @@ def test_bear_market_creates_research_only_defensive_cohort_without_live_buys(tm
     assert defensive["volume"] == 0
     assert defensive["research_only"] is True
     assert defensive["research_cohort"] == "BEAR_DEFENSIVE_WATCH"
+
+
+def test_bear_market_arms_isolated_small_pilot_without_changing_core_account(tmp_path, monkeypatch):
+    ledger = tmp_path / "local_sim.sqlite"
+    core_adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id="plan-test", initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    pilot_adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(
+            account_id=core_plan.BEAR_PILOT_ACCOUNT_ID,
+            initial_cash=1_000_000.0,
+            ledger_path=str(ledger),
+        )
+    )
+    monkeypatch.setattr(
+        core_plan,
+        "candidate_levels",
+        lambda _row, _signal_date, **_kwargs: {
+            "stop": 9.4,
+            "target": 11.5,
+            "rr": 2.5,
+            "t1_loss_buffer_pct": 0.075,
+            "reason_codes": [],
+            "level_evidence_status": "COMPLETE",
+            "target_price_available": True,
+            "level_evidence_source": "test",
+        },
+    )
+    rows = [
+        {
+            "code": code,
+            "name": name,
+            "verdict": "观察（等待确认）",
+            "defect_count": "1",
+            "score": "20",
+            "close": "10.00",
+            "ma5": "9.90",
+            "ma20": "9.50",
+            "rsi14": "62",
+        }
+        for code, name in [("600177", "雅戈尔"), ("600671", "天目药业"), ("300142", "沃森生物")]
+    ]
+
+    payload = core_plan.generate_plan(
+        adapter=core_adapter,
+        ledger=Path(ledger),
+        account_id="plan-test",
+        trade_date=date(2026, 7, 22),
+        signal_date=date(2026, 7, 21),
+        scan_path=tmp_path / "scan.csv",
+        scan_rows=rows,
+        regime={"state": "BEAR", "regime_ok": False, "detail": "down"},
+        scan_quality={"coverage": 0.99, "coverage_pass": True},
+        pilot_adapter=pilot_adapter,
+        pilot_account_id=core_plan.BEAR_PILOT_ACCOUNT_ID,
+        max_candidates=20,
+        max_buy_plans=2,
+        max_new_exposure_pct=0.15,
+        risk_per_plan_pct=0.005,
+    )
+
+    assert payload["executable_buy_count"] == 0
+    assert payload["execution_funnel"]["bear_pilot_count"] == 2
+    cohort = payload["research_cohorts"]["bear_pilot"]
+    assert cohort["status"] == "ARMED"
+    assert cohort["core_account_affected"] is False
+    assert cohort["gm_submit_enabled"] is False
+    assert cohort["planned_exposure_pct"] <= core_plan.BEAR_PILOT_MAX_EXPOSURE_PCT
+    with sqlite3.connect(ledger) as conn:
+        conn.row_factory = sqlite3.Row
+        pilot_plans = [
+            dict(row)
+            for row in conn.execute(
+                "select status, volume from planned_orders where account_id = ? order by planned_order_id",
+                (core_plan.BEAR_PILOT_ACCOUNT_ID,),
+            ).fetchall()
+        ]
+    assert len(pilot_plans) == 2
+    assert all(row["status"] == "WATCH_TRIGGER" for row in pilot_plans)
+    assert all(row["volume"] == 2500 for row in pilot_plans)
+    assert core_adapter.account_snapshot()["cash"] == 1_000_000.0
 
 
 def test_execution_priority_prefers_lower_t1_and_volatility_risk():

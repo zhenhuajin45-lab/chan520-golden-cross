@@ -35,6 +35,7 @@ def main() -> int:
     parser.add_argument("--profit-giveback-pct", type=float, default=0.015)
     parser.add_argument("--profit-retained-ratio", type=float, default=0.65)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--output", default="")
     args = parser.parse_args()
 
     payload = read_json(Path(args.data), {})
@@ -42,7 +43,7 @@ def main() -> int:
     audit = scan_risk(payload, state, args)
     if not args.dry_run:
         write_json(Path(args.state), state)
-    audit_path = ROOT / "reports" / "local_sim_risk" / audit["trade_date"] / "risk_scan.json"
+    audit_path = Path(args.output) if args.output else ROOT / "reports" / "local_sim_risk" / audit["trade_date"] / "risk_scan.json"
     write_json(audit_path, audit)
     print(json.dumps({"trade_date": audit["trade_date"], "candidate_count": len(audit["candidates"]), "dry_run": args.dry_run}, ensure_ascii=False, sort_keys=True), flush=True)
     return 0 if audit.get("status") != "FAIL_CLOSED" else 2

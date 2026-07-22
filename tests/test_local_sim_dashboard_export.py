@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from chan520_skill.broker_adapter import BrokerOrderRequest, BrokerSide, LocalSimBrokerAdapter, LocalSimBrokerConfig
+from chan520_skill.execution_policy import BEAR_PILOT_ACCOUNT_ID, CORE_ACCOUNT_ID
 from scripts import export_local_sim_dashboard as exporter
 from scripts.export_local_sim_dashboard import build_payload
 
@@ -172,3 +173,35 @@ def test_missing_core_plan_is_reported_as_generation_failure(tmp_path, monkeypat
     assert core["executable_buy_count"] == 0
     assert core["failure_step"] == "generate_core_plan"
     assert "502" in core["failure_reason"]
+
+
+def test_core_dashboard_embeds_isolated_bear_pilot_account(tmp_path):
+    ledger = tmp_path / "local_sim.sqlite"
+    core = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id=CORE_ACCOUNT_ID, initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    core.initialize_account()
+    pilot = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id=BEAR_PILOT_ACCOUNT_ID, initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    pilot.record_planned_order(
+        {
+            "planned_order_id": "BEAR-PILOT:2026-07-22:600671",
+            "trade_date": "2026-07-22",
+            "symbol": "600671",
+            "stock_name": "天目药业",
+            "side": "BUY",
+            "volume": 2500,
+            "status": "WATCH_TRIGGER",
+            "reason_text": "熊市防御研究小仓",
+        }
+    )
+
+    payload = build_payload(Path(ledger), CORE_ACCOUNT_ID, "2026-07-22")
+
+    research = payload["research_pilot"]
+    assert research["status"] == "ACTIVE"
+    assert research["account"]["account_id"] == BEAR_PILOT_ACCOUNT_ID
+    assert research["core_account_affected"] is False
+    assert research["gm_submit_enabled"] is False
+    assert research["planned_orders"][0]["stock_name"] == "天目药业"

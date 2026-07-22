@@ -219,6 +219,86 @@ def test_push_trade_cards_dry_run_does_not_mark_state():
     assert state["pushed_keys"] == {}
 
 
+def test_core_trade_push_honors_legacy_deduplication_key():
+    state = {"pushed_keys": {"fill:FILL-1": {"pushed_at": "before-account-scopes"}}}
+
+    audit = push_trade_cards(
+        payload=sample_payload(),
+        state=state,
+        trade_date="2026-07-15",
+        dry_run=False,
+        force=False,
+        timeout=1,
+    )
+
+    assert audit["sent_count"] == 0
+    assert audit["skipped_count"] == 1
+    assert audit["skipped"][0]["reason"] == "already_pushed"
+
+
+def test_feishu_cards_include_isolated_bear_pilot_plan_trade_and_review():
+    payload = sample_payload()
+    payload["core_plan"] = {
+        "status": "PASS",
+        "execution_funnel": {"scanned_count": 4976, "strict_count": 1, "watch_count": 23, "core_executable_count": 0, "bear_pilot_count": 1},
+        "research_cohorts": {
+            "bear_pilot": {
+                "status": "ARMED",
+                "position_cap_pct": 0.025,
+                "account_exposure_cap_pct": 0.05,
+                "max_positions": 2,
+            }
+        },
+    }
+    pilot_fill = {
+        **payload["fills"][0],
+        "fill_id": "PILOT-FILL-1",
+        "order_id": "PILOT-ORDER-1",
+        "symbol": "SHSE.600671",
+        "stock_name": "天目药业",
+        "entry_reason": "熊市防御形态，R:R>=2",
+    }
+    pilot_order = {**payload["orders"][0], "order_id": "PILOT-ORDER-1", "symbol": "SHSE.600671", "stock_name": "天目药业"}
+    pilot_plan = {
+        **payload["planned_orders"][0],
+        "planned_order_id": "BEAR-PILOT:2026-07-15:600671",
+        "symbol": "SHSE.600671",
+        "stock_name": "天目药业",
+        "status": "WATCH_TRIGGER",
+        "reason_text": "熊市防御研究小仓",
+    }
+    payload["research_pilot"] = {
+        "status": "ACTIVE",
+        "valuation_complete": True,
+        "account": {**payload["account"], "account_id": "local-sim-bear-pilot", "gross_exposure_pct": 0.025},
+        "positions": [],
+        "orders": [pilot_order],
+        "fills": [pilot_fill],
+        "planned_orders": [pilot_plan],
+    }
+
+    trade_card = build_trade_card(payload, {**pilot_fill, "_research_pilot": True}, pilot_order)
+    plan_card = build_plan_card(payload, "2026-07-15")
+    review_card = build_review_card(payload, "2026-07-15")
+    audit = push_trade_cards(
+        payload=payload,
+        state={"pushed_keys": {}},
+        trade_date="2026-07-15",
+        dry_run=True,
+        force=False,
+        timeout=1,
+    )
+
+    assert "熊市研究小仓" in str(trade_card)
+    assert "天目药业" in str(plan_card)
+    assert "单票上限" in str(plan_card)
+    assert "4976" in str(plan_card)
+    assert "独立于核心" in str(review_card)
+    assert "熊市防御形态" in str(review_card)
+    assert audit["candidate_count"] == 2
+    assert {row["key"] for row in audit["cards"]} == {"fill:core:FILL-1", "fill:bear_pilot:PILOT-FILL-1"}
+
+
 def test_push_review_card_skips_existing_key():
     state = {"pushed_keys": {"review:2026-07-15": {"pushed_at": "x"}}}
     audit = push_review_card(

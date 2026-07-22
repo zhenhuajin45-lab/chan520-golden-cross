@@ -90,6 +90,7 @@ function render() {
         ${renderValuationAlert(payload)}
         ${renderReadinessAlert(payload)}
         ${renderCorePlanAlert(payload)}
+        ${renderResearchPilot(payload.research_pilot || {}, payload.core_plan || {})}
         ${renderCounterfactualReplay(payload.counterfactual_replay || {})}
         ${renderKpis(account)}
         <section class="grid">
@@ -187,6 +188,7 @@ function renderCorePlanAlert(payload) {
   const quality = core.scan_quality || {};
   const supplemental = core.supplemental_market_context || {};
   const style = core.candidate_style_diagnostic || {};
+  const funnel = core.execution_funnel || {};
   const coverage = Number(quality.coverage);
   const coverageText = Number.isFinite(coverage) ? `${(coverage * 100).toFixed(2)}%` : "未知";
   const kind = core.status === "PASS" && Number(core.executable_buy_count || 0) > 0 ? "ok" : core.status === "PASS" ? "warning" : "danger";
@@ -197,7 +199,81 @@ function renderCorePlanAlert(payload) {
       : "没有通过全部执行门槛的可执行买入，观察池不会自动成交。";
   const supplementalText = supplemental.emotion_label ? `｜同花顺旁路 ${supplemental.emotion_label}` : "";
   const styleText = style.status ? `｜风格偏离 ${style.mismatch_alert ? "预警" : "正常"}` : "";
-  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜扫描覆盖率 ${escapeHtml(coverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}｜${escapeHtml(boundary)}</div>`;
+  const funnelText = funnel.scanned_count != null
+    ? `｜执行漏斗 ${intText(funnel.scanned_count)} 扫描 → ${intText(funnel.strict_count)} 严格 → ${intText(funnel.core_executable_count)} 核心 → ${intText(funnel.bear_pilot_count)} 熊市小仓`
+    : "";
+  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜扫描覆盖率 ${escapeHtml(coverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}${escapeHtml(funnelText)}｜${escapeHtml(boundary)}</div>`;
+}
+
+function renderResearchPilot(pilot, core) {
+  if (!pilot.status) return "";
+  const account = pilot.account || {};
+  const cohort = ((core.research_cohorts || {}).bear_pilot) || {};
+  const plans = pilot.planned_orders || [];
+  const activePlans = plans.filter((row) => ["WATCH_TRIGGER", "CONFIRMED_TRIGGER"].includes(String(row.status || "")));
+  const positions = pilot.positions || [];
+  const fills = pilot.fills || [];
+  if (pilot.status === "NOT_INITIALIZED") {
+    return `<div class="valuation-alert warning">熊市研究小仓尚未初始化；核心账户不受影响，自动新增买入保持原边界。</div>`;
+  }
+  return `
+    <section class="pilot-workbench">
+      <div class="pilot-head">
+        <div>
+          <h2>熊市研究小仓</h2>
+          <p class="meta">独立账户 ${escapeHtml(account.account_id || pilot.account_id || "-")}｜仅本地模拟研究｜不连接 GM｜不影响核心账户</p>
+        </div>
+        <span class="pilot-status">${escapeHtml(cohort.status || pilot.status)}</span>
+      </div>
+      <div class="pilot-metrics">
+        <span>总资产 <strong>${money(account.total_equity)}</strong></span>
+        <span>盈亏 <strong class="${pnlClass(account.total_pnl)}">${signedMoney(account.total_pnl)} / ${signedPct(account.total_pnl_pct)}</strong></span>
+        <span>仓位 <strong>${pct(account.gross_exposure_pct)}</strong></span>
+        <span>持仓 <strong>${intText(account.open_position_count)}</strong></span>
+        <span>待触发 <strong>${intText(activePlans.length)}</strong></span>
+        <span>单票/总仓上限 <strong>${pct(cohort.position_cap_pct ?? pilot.position_cap_pct)} / ${pct(cohort.account_exposure_cap_pct ?? pilot.account_exposure_cap_pct)}</strong></span>
+      </div>
+      <div class="pilot-grid">
+        <div>
+          <h3>计划与入场理由</h3>
+          ${renderPilotPlans(activePlans)}
+        </div>
+        <div>
+          <h3>持仓与成交</h3>
+          ${renderPilotActivity(positions, fills)}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderPilotPlans(rows) {
+  if (!rows.length) return `<p class="pilot-empty">当前无待触发研究计划</p>`;
+  return rows.slice(0, 4).map((row) => `
+    <div class="pilot-row">
+      <strong>${stockText(row)}</strong>
+      <span>${intText(row.volume)} 股｜${price(row.lower_price)}-${price(row.upper_price || row.trigger_price)}｜止损 ${price(row.stop_price)}｜目标 ${price(row.target_price)}</span>
+      <small>${escapeHtml(planReason(row))}</small>
+    </div>
+  `).join("");
+}
+
+function renderPilotActivity(positions, fills) {
+  const positionRows = positions.slice(0, 4).map((row) => `
+    <div class="pilot-row">
+      <strong>${stockText(row)}</strong>
+      <span>${intText(row.shares)} 股｜成本 ${price(row.average_price)}｜现价 ${price(row.market_price)}｜<b class="${pnlClass(row.unrealized_pnl)}">${signedMoney(row.unrealized_pnl)}</b></span>
+      <small>可卖 ${intText(row.sellable_shares)}｜${escapeHtml(positionEntryReason(row))}</small>
+    </div>
+  `);
+  const fillRows = fills.slice(0, Math.max(0, 4 - positionRows.length)).map((row) => `
+    <div class="pilot-row">
+      <strong>${sideLabel(row.side)} ${stockText(row)}</strong>
+      <span>${intText(row.volume)} 股 @ ${price(row.price)}</span>
+      <small>${escapeHtml(tradeReason(row))}</small>
+    </div>
+  `);
+  return [...positionRows, ...fillRows].join("") || `<p class="pilot-empty">当前无持仓和成交</p>`;
 }
 
 function renderReadinessAlert(payload) {

@@ -17,6 +17,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from chan520_skill.broker_adapter import LocalSimBrokerAdapter, LocalSimBrokerConfig  # noqa: E402
+from chan520_skill.execution_policy import (  # noqa: E402
+    BEAR_PILOT_ACCOUNT_ID,
+    BEAR_PILOT_EXECUTION_SCOPE,
+    BEAR_PILOT_MAX_EXPOSURE_PCT,
+    BEAR_PILOT_MAX_FILLS,
+    BEAR_PILOT_MIN_RR,
+    BEAR_PILOT_POLICY_ID,
+    BEAR_PILOT_POSITION_PCT,
+    CORE_PLAN_POLICY_ID,
+)
 from chan520_skill.data import eastmoney_history, tencent_history, trim_to_date  # noqa: E402
 from chan520_skill.market_store import (  # noqa: E402
     DEFAULT_PATH as MARKET_STORE,
@@ -34,7 +44,7 @@ from chan520_skill.scanner import scan_market  # noqa: E402
 
 
 TZ = ZoneInfo("Asia/Shanghai")
-POLICY_ID = "local_sim_core_plan_v2"
+POLICY_ID = CORE_PLAN_POLICY_ID
 ACTIVE_BUY_STATUSES = (
     "PLANNED",
     "WATCH_TRIGGER",
@@ -50,11 +60,13 @@ def main() -> int:
     parser.add_argument("--signal-date", default="")
     parser.add_argument("--ledger", default="data/local_sim/broker.sqlite")
     parser.add_argument("--account-id", default="local-sim")
+    parser.add_argument("--pilot-account-id", default=BEAR_PILOT_ACCOUNT_ID)
     parser.add_argument("--initial-cash", type=float, default=1_000_000.0)
     parser.add_argument("--max-candidates", type=int, default=20)
     parser.add_argument("--max-buy-plans", type=int, default=2)
     parser.add_argument("--max-new-exposure-pct", type=float, default=0.15)
     parser.add_argument("--risk-per-plan-pct", type=float, default=0.005)
+    parser.add_argument("--disable-bear-pilot", action="store_true")
     parser.add_argument("--refresh-scan-if-missing", action="store_true")
     parser.add_argument("--offline-regime", action="store_true", help="Fail closed with UNKNOWN regime instead of fetching index data")
     parser.add_argument("--output", default="")
@@ -78,6 +90,14 @@ def main() -> int:
         LocalSimBrokerConfig(account_id=args.account_id, initial_cash=args.initial_cash, ledger_path=args.ledger)
     )
     adapter.initialize_account()
+    pilot_adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(
+            account_id=args.pilot_account_id,
+            initial_cash=args.initial_cash,
+            ledger_path=args.ledger,
+        )
+    )
+    pilot_adapter.initialize_account()
     rows = read_scan(scan_path)
     scan_quality = resolve_scan_quality(scan_path, scan_stats)
     upsert_scan(signal_date, rows, scan_quality, source="qualified_scan_csv", path=MARKET_STORE)
@@ -94,6 +114,8 @@ def main() -> int:
         regime=regime,
         scan_quality=scan_quality,
         sector_map=sector_map,
+        pilot_adapter=None if args.disable_bear_pilot else pilot_adapter,
+        pilot_account_id=args.pilot_account_id,
         max_candidates=args.max_candidates,
         max_buy_plans=args.max_buy_plans,
         max_new_exposure_pct=args.max_new_exposure_pct,
@@ -314,12 +336,15 @@ def generate_plan(
     regime: dict[str, Any],
     scan_quality: dict[str, Any] | None = None,
     sector_map: dict[str, str] | None = None,
+    pilot_adapter: LocalSimBrokerAdapter | None = None,
+    pilot_account_id: str = BEAR_PILOT_ACCOUNT_ID,
     max_candidates: int,
     max_buy_plans: int,
     max_new_exposure_pct: float,
     risk_per_plan_pct: float,
 ) -> dict[str, Any]:
     expired = expire_old_buy_plans(ledger, account_id, trade_date.isoformat())
+    pilot_expired = expire_old_buy_plans(ledger, pilot_account_id, trade_date.isoformat()) if pilot_adapter else 0
     account = adapter.account_snapshot()
     equity = float(account["cash"]) + sum(float(row["shares"]) * float(row["average_price"]) for row in account["positions"])
     # Alpha-score ranking remains disabled. Risk evidence only decides which
@@ -341,6 +366,9 @@ def generate_plan(
     created: list[dict[str, Any]] = []
     audits: list[dict[str, Any]] = []
     planned_gross = 0.0
+    pilot_plans: list[dict[str, Any]] = []
+    pilot_planned_gross = 0.0
+    pilot_equity = account_equity(pilot_adapter) if pilot_adapter else 0.0
     scan_quality = scan_quality or {"coverage_pass": True, "coverage": 1.0, "minimum_coverage": 0.85}
     strict_enabled = bool(regime.get("regime_ok")) and bool(scan_quality.get("coverage_pass"))
 
@@ -416,6 +444,43 @@ def generate_plan(
             plan["research_policy_id"] = "bear_defensive_watch_v2"
             plan["reason_codes"] = [*plan["reason_codes"], "BEAR_DEFENSIVE_RESEARCH_ONLY"]
             bear_defensive_symbols.append(str(row.get("code") or ""))
+            if pilot_adapter is not None and len(pilot_plans) < BEAR_PILOT_MAX_FILLS:
+                pilot_levels = candidate_levels(row, signal_date, offline=False)
+                pilot_zone = entry_zone(row, pilot_levels)
+                close = safe_float(row.get("close"))
+                pilot_eligible = (
+                    scan_quality.get("coverage_pass") is True
+                    and pilot_zone.get("geometry_valid") is True
+                    and safe_float(pilot_levels.get("rr")) >= BEAR_PILOT_MIN_RR
+                    and safe_float(pilot_levels.get("target")) > close > 0
+                )
+                if pilot_eligible:
+                    shares = planned_shares(
+                        equity=pilot_equity,
+                        entry=close,
+                        stop=safe_float(pilot_levels.get("stop")),
+                        score=safe_float(row.get("score")),
+                        risk_per_plan_pct=BEAR_PILOT_POSITION_PCT,
+                        t1_loss_buffer_pct=safe_float(pilot_levels.get("t1_loss_buffer_pct")),
+                        value_pct=BEAR_PILOT_POSITION_PCT,
+                    )
+                    remaining = max(pilot_equity * BEAR_PILOT_MAX_EXPOSURE_PCT - pilot_planned_gross, 0.0)
+                    shares = min(shares, int((remaining / close) // 100) * 100 if close > 0 else 0)
+                    if shares > 0:
+                        pilot = bear_pilot_plan(
+                            row,
+                            trade_date,
+                            signal_date,
+                            len(pilot_plans) + 1,
+                            shares,
+                            pilot_levels,
+                            pilot_zone,
+                            regime,
+                            pilot_account_id,
+                        )
+                        pilot_adapter.record_planned_order(pilot)
+                        pilot_plans.append(pilot)
+                        pilot_planned_gross += close * shares
         adapter.record_planned_order(plan)
         audits.append(plan)
 
@@ -437,6 +502,7 @@ def generate_plan(
         "candidate_style_diagnostic": style_diagnostic,
         "scan_quality": scan_quality,
         "expired_plan_count": expired,
+        "pilot_expired_plan_count": pilot_expired,
         "strict_scan_count": len(strict_rows),
         "watch_scan_count": len(watch_rows),
         "executable_buy_count": len(created),
@@ -445,6 +511,17 @@ def generate_plan(
         "planned_new_gross": planned_gross,
         "planned_new_exposure_pct": planned_gross / equity if equity else 0.0,
         "account_equity": equity,
+        "execution_funnel": {
+            "scanned_count": int(scan_quality.get("success") or scan_quality.get("successful_count") or scan_quality.get("usable_count") or len(ordered)),
+            "universe_count": int(scan_quality.get("universe") or scan_quality.get("universe_count") or scan_quality.get("expected_count") or len(ordered)),
+            "strict_count": len(strict_rows),
+            "watch_count": len(watch_rows),
+            "shortlisted_count": len(audits),
+            "geometry_valid_count": sum(row.get("geometry_valid") is True for row in audits),
+            "core_executable_count": len(created),
+            "bear_defensive_count": len(bear_defensive_symbols),
+            "bear_pilot_count": len(pilot_plans),
+        },
         "research_cohorts": {
             "bear_defensive": {
                 "policy_id": "bear_defensive_watch_v2",
@@ -470,6 +547,22 @@ def generate_plan(
                 ),
                 "activation": "reconstruct signal-date regime and require BEAR",
                 "live_execution_enabled": False,
+            },
+            "bear_pilot": {
+                "policy_id": BEAR_PILOT_POLICY_ID,
+                "status": "ARMED" if pilot_plans else "NO_ELIGIBLE_PLAN",
+                "account_id": pilot_account_id,
+                "eligible_count": len(pilot_plans),
+                "symbols": [str(row.get("symbol") or "") for row in pilot_plans],
+                "max_positions": BEAR_PILOT_MAX_FILLS,
+                "position_cap_pct": BEAR_PILOT_POSITION_PCT,
+                "account_exposure_cap_pct": BEAR_PILOT_MAX_EXPOSURE_PCT,
+                "minimum_risk_reward": BEAR_PILOT_MIN_RR,
+                "planned_gross": round(pilot_planned_gross, 2),
+                "planned_exposure_pct": pilot_planned_gross / pilot_equity if pilot_equity else 0.0,
+                "execution_scope": BEAR_PILOT_EXECUTION_SCOPE,
+                "core_account_affected": False,
+                "gm_submit_enabled": False,
             },
         },
         "research_warnings": [
@@ -681,6 +774,7 @@ def planned_shares(
     score: float,
     risk_per_plan_pct: float,
     t1_loss_buffer_pct: float = 0.0,
+    value_pct: float = 0.05,
 ) -> int:
     if equity <= 0 or entry <= stop or stop <= 0:
         return 0
@@ -690,7 +784,6 @@ def planned_shares(
         return 0
     risk_cap = int((equity * risk_per_plan_pct / effective_risk_per_share) // 100) * 100
     _ = score
-    value_pct = 0.05
     value_cap = int((equity * value_pct / entry) // 100) * 100
     return max(min(risk_cap, value_cap), 0)
 
@@ -816,6 +909,67 @@ def plan_payload(
         "sizing_policy": "equal_base_5pct_with_risk_and_exposure_caps_v1",
     }
     return payload
+
+
+def bear_pilot_plan(
+    row: dict[str, str],
+    trade_date: date,
+    signal_date: date,
+    rank: int,
+    shares: int,
+    levels: dict[str, Any],
+    zone: dict[str, Any],
+    regime: dict[str, Any],
+    account_id: str,
+) -> dict[str, Any]:
+    payload = plan_payload(
+        row,
+        trade_date,
+        signal_date,
+        rank,
+        "WATCH_TRIGGER",
+        shares,
+        levels,
+        zone,
+        regime,
+        ["BEAR_PILOT_RESEARCH_ONLY"],
+    )
+    code = str(row.get("code") or "")
+    payload.update(
+        {
+            "planned_order_id": f"BEAR-PILOT:{trade_date.isoformat()}:{code}",
+            "pending_order_id": f"BEAR-PILOT:{trade_date.isoformat()}:{code}",
+            "order_intent_id": f"BEAR-PILOT-{trade_date.isoformat()}-{rank:02d}",
+            "run_id": f"bear-pilot-{trade_date.isoformat()}",
+            "account_id": account_id,
+            "local_sim_execution_policy_id": BEAR_PILOT_POLICY_ID,
+            "execution_scope": BEAR_PILOT_EXECUTION_SCOPE,
+            "research_only": True,
+            "research_pilot": True,
+            "research_cohort": "BEAR_DEFENSIVE_PILOT",
+            "core_account_affected": False,
+            "gm_submit_enabled": False,
+            "reason_code": "BEAR_PILOT_RISK_QUALIFIED",
+            "reason_codes": [
+                "BEAR_DEFENSIVE_SHAPE",
+                "RR_GTE_2",
+                "VALID_ENTRY_GEOMETRY",
+                "LOCAL_SIM_RESEARCH_ONLY",
+            ],
+            "blocking_reason_codes": [],
+            "sizing_policy": "bear_pilot_2_5pct_with_t1_risk_cap_v1",
+        }
+    )
+    return payload
+
+
+def account_equity(adapter: LocalSimBrokerAdapter | None) -> float:
+    if adapter is None:
+        return 0.0
+    account = adapter.account_snapshot()
+    return float(account["cash"]) + sum(
+        float(row["shares"]) * float(row["average_price"]) for row in account.get("positions", [])
+    )
 
 
 def expire_old_buy_plans(ledger: Path, account_id: str, trade_date: str) -> int:

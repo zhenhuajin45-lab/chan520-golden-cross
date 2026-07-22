@@ -147,6 +147,8 @@ python scripts/execute_local_sim_risk_exits.py --trade-date 2026-07-16 --submit
 
 推荐使用每日编排器。`plan` 只使用上一交易日完整日线；扫描覆盖率低于 85%、市场状态未知、计划几何无效或无严格候选时，新增买入保持关闭。`intraday` 先处理 T+1 风控卖出，再处理买入二阶段确认。
 
+当市场状态为 `BEAR` 时，核心账户仍严格禁止新增买入。符合主板防御形态、完整止损/目标证据、有效价格几何且 `R:R >= 2` 的观察候选，可进入独立账户 `local-sim-bear-pilot`：单票最多 2.5%，最多 2 只，总仓最多 5%。该账户沿用报价新鲜度、停牌/涨跌停、二阶段确认、T+1 和盘中风险退出规则，仅用于本地模拟研究，不连接 GM，也不改变核心账户或 `shadow_readiness=false`。工作台与飞书分别展示两套账户，成交去重和风控状态不混用。
+
 ```bash
 python scripts/run_local_sim_daily.py --phase plan --trade-date 2026-07-16 --feishu dry-run
 python scripts/run_local_sim_daily.py --phase preopen --trade-date 2026-07-16 --feishu dry-run

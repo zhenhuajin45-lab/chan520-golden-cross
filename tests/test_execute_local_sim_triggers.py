@@ -6,6 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from chan520_skill.broker_adapter import LocalSimBrokerAdapter, LocalSimBrokerConfig
+from chan520_skill.execution_policy import BEAR_PILOT_ACCOUNT_ID, BEAR_PILOT_EXECUTION_SCOPE, BEAR_PILOT_POLICY_ID
 from scripts import execute_local_sim_triggers as triggers
 
 
@@ -43,6 +44,93 @@ def make_adapter(tmp_path: Path) -> tuple[LocalSimBrokerAdapter, Path]:
         }
     )
     return adapter, ledger
+
+
+def make_bear_pilot_adapter(tmp_path: Path, *, account_id: str = BEAR_PILOT_ACCOUNT_ID):
+    ledger = tmp_path / "bear_pilot.sqlite"
+    adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id=account_id, initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    adapter.record_planned_order(
+        {
+            "planned_order_id": "BEAR-PILOT:2026-07-15:600671",
+            "order_intent_id": "BEAR-PILOT-2026-07-15-01",
+            "trade_date": "2026-07-15",
+            "symbol": "600671",
+            "side": "BUY",
+            "volume": 2500,
+            "status": "WATCH_TRIGGER",
+            "lower_price": 9.8,
+            "upper_price": 10.2,
+            "invalid_price": 10.5,
+            "stop_price": 9.4,
+            "target_price": 11.5,
+            "trigger_price": 9.9,
+            "ma5": 9.9,
+            "ma20": 9.5,
+            "market_regime": "BEAR",
+            "local_sim_execution_policy_id": BEAR_PILOT_POLICY_ID,
+            "execution_scope": BEAR_PILOT_EXECUTION_SCOPE,
+            "research_pilot": True,
+            "research_only": True,
+            "core_account_affected": False,
+            "gm_submit_enabled": False,
+            "reason_text": "熊市防御形态，R:R>=2，本地研究小仓",
+        }
+    )
+    return adapter, ledger
+
+
+def test_bear_pilot_uses_two_stage_confirmation_in_isolated_account(tmp_path, monkeypatch):
+    adapter, ledger = make_bear_pilot_adapter(tmp_path)
+    monkeypatch.setattr(triggers, "tencent_quote", lambda code: {
+        "code": code,
+        "name": "天目药业",
+        "price": "10.0",
+        "prev_close": "10.0",
+        "open": "9.95",
+        "datetime": "20260715100100",
+    })
+    common = dict(
+        adapter=adapter,
+        ledger=ledger,
+        account_id=BEAR_PILOT_ACCOUNT_ID,
+        trade_date="2026-07-15",
+        max_age_minutes=5,
+        max_fills=2,
+        max_exposure_pct=0.05,
+        max_trigger_drawdown_pct=1.2,
+        submit=True,
+        market_context=healthy_market_context(),
+    )
+
+    first = triggers.run_trigger_cycle(now=datetime(2026, 7, 15, 10, 2, tzinfo=TZ), **common)
+    second = triggers.run_trigger_cycle(now=datetime(2026, 7, 15, 10, 5, tzinfo=TZ), **common)
+
+    assert first["results"][0]["reason"] == "TRIGGER_CONFIRMED"
+    assert second["results"][0]["reason"] == "TRIGGER_MATCHED"
+    assert adapter.account_snapshot()["positions"][0]["shares"] == 2500
+
+
+def test_bear_pilot_plan_is_rejected_outside_isolated_account(tmp_path, monkeypatch):
+    adapter, ledger = make_bear_pilot_adapter(tmp_path, account_id="local-test")
+    monkeypatch.setattr(triggers, "tencent_quote", lambda _code: {})
+
+    payload = triggers.run_trigger_cycle(
+        adapter=adapter,
+        ledger=ledger,
+        account_id="local-test",
+        trade_date="2026-07-15",
+        now=datetime(2026, 7, 15, 10, 2, tzinfo=TZ),
+        max_age_minutes=5,
+        max_fills=2,
+        max_exposure_pct=0.05,
+        max_trigger_drawdown_pct=1.2,
+        submit=True,
+        market_context=healthy_market_context(),
+    )
+
+    assert payload["results"][0]["reason"] == "RESEARCH_PILOT_ACCOUNT_MISMATCH"
 
 
 def test_trigger_cycle_blocks_before_continuous_auction(tmp_path, monkeypatch):

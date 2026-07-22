@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from chan520_skill.execution_policy import (
+    BEAR_PILOT_ACCOUNT_ID,
+    BEAR_PILOT_MAX_EXPOSURE_PCT,
+    BEAR_PILOT_MAX_FILLS,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -103,6 +109,7 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
                 sla_seconds=300,
             )
         )
+        steps.append(export_pilot_dashboard_step(trade_date, args.initial_cash))
         steps.append(export_dashboard_step(trade_date, args.initial_cash))
         steps.append(feishu_step(args, trade_date, "plan"))
     elif args.phase == "preopen":
@@ -130,6 +137,8 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
                 ),
             )
         )
+        steps.append(export_pilot_dashboard_step(trade_date, args.initial_cash))
+        steps.append(pilot_preopen_dry_run_step(args, trade_date))
         steps.append(export_dashboard_step(trade_date, args.initial_cash))
         steps.append(feishu_step(args, trade_date, "review"))
     elif args.phase == "intraday":
@@ -166,6 +175,7 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
         if not args.dry_run_triggers:
             trigger_cmd.append("--submit")
         steps.append(step("execute_triggers", trigger_cmd))
+        steps.extend(pilot_intraday_steps(args, trade_date))
         steps.append(export_dashboard_step(trade_date, args.initial_cash))
         steps.append(feishu_step(args, trade_date, "trades"))
     else:
@@ -187,6 +197,8 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
                 ),
             )
         )
+        steps.append(export_pilot_dashboard_step(trade_date, args.initial_cash))
+        steps.append(pilot_risk_scan_step(args, trade_date))
         steps.append(export_dashboard_step(trade_date, args.initial_cash))
         steps.append(feishu_step(args, trade_date, "review"))
         steps.append(
@@ -216,6 +228,113 @@ def export_dashboard_step(trade_date: str, initial_cash: float) -> dict[str, Any
             "--mark-quotes",
         ),
     )
+
+
+def export_pilot_dashboard_step(trade_date: str, initial_cash: float) -> dict[str, Any]:
+    return step(
+        "export_bear_pilot_dashboard",
+        script(
+            "export_local_sim_dashboard.py",
+            "--trade-date",
+            trade_date,
+            "--initial-cash",
+            str(initial_cash),
+            "--account-id",
+            BEAR_PILOT_ACCOUNT_ID,
+            "--output",
+            str(ROOT / "web_dashboard" / "data" / "local_sim" / "latest_bear_pilot.json"),
+            "--quote-cache",
+            str(ROOT / "data" / "local_sim" / "bear_pilot_quote_cache.json"),
+            "--risk-state",
+            str(ROOT / "data" / "local_sim" / "bear_pilot_risk_state.json"),
+            "--mark-quotes",
+        ),
+    )
+
+
+def pilot_risk_scan_step(args: argparse.Namespace, trade_date: str) -> dict[str, Any]:
+    cmd = script(
+        "local_sim_risk_scan.py",
+        "--trade-date",
+        trade_date,
+        "--account-id",
+        BEAR_PILOT_ACCOUNT_ID,
+        "--data",
+        str(ROOT / "web_dashboard" / "data" / "local_sim" / "latest_bear_pilot.json"),
+        "--state",
+        str(ROOT / "data" / "local_sim" / "bear_pilot_risk_state.json"),
+        "--output",
+        str(ROOT / "reports" / "local_sim_risk" / trade_date / "bear_pilot_risk_scan.json"),
+    )
+    if bool(getattr(args, "dry_run_triggers", False)):
+        cmd.append("--dry-run")
+    return step("bear_pilot_risk_scan", cmd)
+
+
+def pilot_preopen_dry_run_step(args: argparse.Namespace, trade_date: str) -> dict[str, Any]:
+    return step(
+        "bear_pilot_preopen_dry_run",
+        script(
+            "execute_local_sim_triggers.py",
+            "--trade-date",
+            trade_date,
+            "--account-id",
+            BEAR_PILOT_ACCOUNT_ID,
+            "--max-age-minutes",
+            str(args.max_age_minutes),
+            "--max-fills",
+            str(BEAR_PILOT_MAX_FILLS),
+            "--max-exposure-pct",
+            str(BEAR_PILOT_MAX_EXPOSURE_PCT),
+            "--confirmation-max-minutes",
+            str(args.confirmation_max_minutes),
+            "--output",
+            str(ROOT / "reports" / "local_sim_triggers" / trade_date.replace("-", "") / "bear_pilot_preopen.json"),
+        ),
+    )
+
+
+def pilot_intraday_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any]]:
+    risk_exit = script(
+        "execute_local_sim_risk_exits.py",
+        "--trade-date",
+        trade_date,
+        "--account-id",
+        BEAR_PILOT_ACCOUNT_ID,
+        "--max-age-minutes",
+        str(args.max_age_minutes),
+        "--confirmation-max-minutes",
+        str(args.confirmation_max_minutes),
+        "--output",
+        str(ROOT / "reports" / "local_sim_risk_exit" / trade_date.replace("-", "") / "bear_pilot_latest.json"),
+    )
+    trigger = script(
+        "execute_local_sim_triggers.py",
+        "--trade-date",
+        trade_date,
+        "--account-id",
+        BEAR_PILOT_ACCOUNT_ID,
+        "--max-age-minutes",
+        str(args.max_age_minutes),
+        "--max-fills",
+        str(BEAR_PILOT_MAX_FILLS),
+        "--max-exposure-pct",
+        str(BEAR_PILOT_MAX_EXPOSURE_PCT),
+        "--confirmation-max-minutes",
+        str(args.confirmation_max_minutes),
+        "--output",
+        str(ROOT / "reports" / "local_sim_triggers" / trade_date.replace("-", "") / "bear_pilot_latest.json"),
+    )
+    if not args.dry_run_triggers:
+        risk_exit.append("--submit")
+        trigger.append("--submit")
+    return [
+        export_pilot_dashboard_step(trade_date, args.initial_cash),
+        pilot_risk_scan_step(args, trade_date),
+        step("execute_bear_pilot_risk_exits", risk_exit),
+        step("execute_bear_pilot_triggers", trigger),
+        export_pilot_dashboard_step(trade_date, args.initial_cash),
+    ]
 
 
 def feishu_step(args: argparse.Namespace, trade_date: str, mode: str) -> dict[str, Any] | None:

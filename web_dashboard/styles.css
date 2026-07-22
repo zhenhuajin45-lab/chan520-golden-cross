@@ -174,6 +174,99 @@ h2 {
   background: #fff0ee;
 }
 
+.pilot-workbench {
+  margin-bottom: 16px;
+  border-top: 3px solid #344054;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.pilot-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+}
+
+.pilot-status {
+  color: #344054;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.pilot-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.pilot-metrics span {
+  min-width: 0;
+  padding: 10px 12px;
+  border-right: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pilot-metrics span:last-child {
+  border-right: 0;
+}
+
+.pilot-metrics strong {
+  display: block;
+  margin-top: 3px;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.pilot-metrics strong.pnl-positive {
+  color: var(--buy);
+}
+
+.pilot-metrics strong.pnl-negative {
+  color: var(--sell);
+}
+
+.pilot-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+}
+
+.pilot-grid > div {
+  min-width: 0;
+  padding: 12px 16px 14px;
+}
+
+.pilot-grid > div + div {
+  border-left: 1px solid var(--line);
+}
+
+.pilot-grid h3 {
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.pilot-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.7fr) minmax(220px, 1.3fr);
+  gap: 2px 12px;
+  padding: 8px 0;
+  border-top: 1px solid #edf1f6;
+}
+
+.pilot-row small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
+.pilot-empty {
+  padding: 14px 0;
+  color: var(--muted);
+}
+
 .research-metrics {
   display: flex;
   flex-wrap: wrap;
@@ -454,6 +547,27 @@ th {
   }
 
   .research-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .pilot-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pilot-metrics span:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .pilot-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .pilot-grid > div + div {
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+
+  .pilot-row {
     grid-template-columns: 1fr;
   }
 

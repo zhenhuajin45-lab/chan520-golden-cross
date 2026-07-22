@@ -31,6 +31,8 @@ def test_preopen_uses_dry_run_trigger_without_submit():
     trigger = next(item for item in steps if item["name"] == "trigger_preopen_dry_run")
     assert "--submit" not in trigger["cmd"]
     assert any(item["name"] == "readiness" for item in steps)
+    pilot = next(item for item in steps if item["name"] == "bear_pilot_preopen_dry_run")
+    assert "--submit" not in pilot["cmd"]
 
 
 def test_intraday_submits_unless_explicit_dry_run():
@@ -54,7 +56,12 @@ def test_eod_records_review_not_trade_push():
 def test_plan_phase_generates_core_plan_before_dashboard_and_feishu():
     steps = build_steps(args(phase="plan", feishu="send"), "2026-07-15")
 
-    assert [item["name"] for item in steps] == ["generate_core_plan", "export_dashboard", "feishu_plan"]
+    assert [item["name"] for item in steps] == [
+        "generate_core_plan",
+        "export_bear_pilot_dashboard",
+        "export_dashboard",
+        "feishu_plan",
+    ]
 
 
 def test_intraday_executes_risk_exits_before_buy_triggers():
@@ -62,6 +69,8 @@ def test_intraday_executes_risk_exits_before_buy_triggers():
     names = [item["name"] for item in steps]
 
     assert names.index("execute_risk_exits") < names.index("execute_triggers")
+    assert names.index("bear_pilot_risk_scan") < names.index("execute_bear_pilot_risk_exits")
+    assert names.index("execute_bear_pilot_risk_exits") < names.index("execute_bear_pilot_triggers")
 
 
 def test_run_guard_skips_duplicate_without_overwriting_phase_summary(tmp_path):

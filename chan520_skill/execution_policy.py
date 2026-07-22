@@ -1,0 +1,13 @@
+from __future__ import annotations
+
+
+CORE_ACCOUNT_ID = "local-sim"
+CORE_PLAN_POLICY_ID = "local_sim_core_plan_v2"
+
+BEAR_PILOT_ACCOUNT_ID = "local-sim-bear-pilot"
+BEAR_PILOT_POLICY_ID = "local_sim_bear_pilot_v1"
+BEAR_PILOT_MAX_FILLS = 2
+BEAR_PILOT_POSITION_PCT = 0.025
+BEAR_PILOT_MAX_EXPOSURE_PCT = 0.05
+BEAR_PILOT_MIN_RR = 2.0
+BEAR_PILOT_EXECUTION_SCOPE = "LOCAL_SIM_RESEARCH_ONLY"

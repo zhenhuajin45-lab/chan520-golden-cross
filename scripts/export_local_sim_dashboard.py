@@ -16,6 +16,14 @@ if str(ROOT) not in sys.path:
 
 from chan520_skill.broker_adapter import LocalSimBrokerAdapter, LocalSimBrokerConfig
 from chan520_skill.data import DataError, normalize_code, tencent_quote
+from chan520_skill.execution_policy import (
+    BEAR_PILOT_ACCOUNT_ID,
+    BEAR_PILOT_EXECUTION_SCOPE,
+    BEAR_PILOT_MAX_EXPOSURE_PCT,
+    BEAR_PILOT_MAX_FILLS,
+    BEAR_PILOT_POSITION_PCT,
+    CORE_ACCOUNT_ID,
+)
 from chan520_skill.microstructure import price_limit
 
 
@@ -55,6 +63,7 @@ def main() -> int:
         quote_max_age_minutes=args.quote_max_age_minutes,
         quote_cache=quote_cache,
         risk_state=read_json(Path(args.risk_state), {"positions": {}}),
+        include_research_pilot=args.account_id == CORE_ACCOUNT_ID,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -75,6 +84,7 @@ def build_payload(
     quote_max_age_minutes: int = 20,
     quote_cache: dict[str, Any] | None = None,
     risk_state: dict[str, Any] | None = None,
+    include_research_pilot: bool = True,
 ) -> dict:
     with sqlite3.connect(ledger) as conn:
         conn.row_factory = sqlite3.Row
@@ -173,8 +183,8 @@ def build_payload(
     selected_planned_orders = [
         row for row in planned_orders if not selected_trade_date or str(row.get("trade_date") or "") == selected_trade_date
     ]
-    return {
-        "schema_version": "chan520_local_sim_dashboard_v0",
+    payload = {
+        "schema_version": "chan520_local_sim_dashboard_v1",
         "generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),
         "trade_date": selected_trade_date,
         "valuation_basis": valuation["basis"],
@@ -216,6 +226,59 @@ def build_payload(
         "fills": [{**item, **stock_identity(item, stock_names)} for item in selected_fills],
         "planned_orders": [{**item, **stock_identity(item, stock_names)} for item in selected_planned_orders],
         "daily": daily_rows(fills_by_day),
+    }
+    if include_research_pilot and account_id == CORE_ACCOUNT_ID:
+        payload["research_pilot"] = load_research_pilot(
+            ledger,
+            selected_trade_date,
+            mark_quotes=mark_quotes,
+            quote_max_age_minutes=quote_max_age_minutes,
+        )
+    return payload
+
+
+def load_research_pilot(
+    ledger: Path,
+    trade_date: str,
+    *,
+    mark_quotes: bool,
+    quote_max_age_minutes: int,
+) -> dict[str, Any]:
+    with sqlite3.connect(ledger) as conn:
+        exists = conn.execute(
+            "select 1 from accounts where account_id = ?",
+            (BEAR_PILOT_ACCOUNT_ID,),
+        ).fetchone()
+    if not exists:
+        return {
+            "status": "NOT_INITIALIZED",
+            "account_id": BEAR_PILOT_ACCOUNT_ID,
+            "execution_scope": BEAR_PILOT_EXECUTION_SCOPE,
+            "core_account_affected": False,
+            "gm_submit_enabled": False,
+            "position_cap_pct": BEAR_PILOT_POSITION_PCT,
+            "account_exposure_cap_pct": BEAR_PILOT_MAX_EXPOSURE_PCT,
+            "max_positions": BEAR_PILOT_MAX_FILLS,
+        }
+    pilot = build_payload(
+        ledger,
+        BEAR_PILOT_ACCOUNT_ID,
+        trade_date,
+        mark_quotes=mark_quotes,
+        quote_max_age_minutes=quote_max_age_minutes,
+        quote_cache=read_json(ROOT / "data" / "local_sim" / "bear_pilot_quote_cache.json", {"quotes": {}}),
+        risk_state=read_json(ROOT / "data" / "local_sim" / "bear_pilot_risk_state.json", {"positions": {}}),
+        include_research_pilot=False,
+    )
+    return {
+        **pilot,
+        "status": "ACTIVE",
+        "execution_scope": BEAR_PILOT_EXECUTION_SCOPE,
+        "core_account_affected": False,
+        "gm_submit_enabled": False,
+        "position_cap_pct": BEAR_PILOT_POSITION_PCT,
+        "account_exposure_cap_pct": BEAR_PILOT_MAX_EXPOSURE_PCT,
+        "max_positions": BEAR_PILOT_MAX_FILLS,
     }
 
 
@@ -502,6 +565,7 @@ def load_core_plan(trade_date: str) -> dict[str, Any]:
         "candidate_style_diagnostic": payload.get("candidate_style_diagnostic") or {},
         "research_warnings": payload.get("research_warnings") or [],
         "research_cohorts": payload.get("research_cohorts") or {},
+        "execution_funnel": payload.get("execution_funnel") or {},
         "geometry_blocked_count": geometry_blocked_count,
         "t1_risk_policy": "board_floor_plus_atr_and_amplitude_v1",
     }

@@ -111,21 +111,38 @@ def push_trade_cards(
 ) -> dict[str, Any]:
     pushed = state.setdefault("pushed_keys", {})
     webhook = "" if dry_run else resolve_webhook()[0]
+    pilot = research_pilot(payload)
     fills = [
-        row for row in payload.get("fills", [])
+        {**row, "_account_scope": "core"} for row in payload.get("fills", [])
         if not trade_date or row_date(row) == trade_date
     ]
-    orders_by_id = {str(row.get("order_id") or ""): row for row in payload.get("orders", [])}
+    fills.extend(
+        {**row, "_account_scope": "bear_pilot", "_research_pilot": True}
+        for row in pilot.get("fills", [])
+        if not trade_date or row_date(row) == trade_date
+    )
+    orders_by_id = {
+        ("core", str(row.get("order_id") or "")): row
+        for row in payload.get("orders", [])
+    }
+    orders_by_id.update(
+        {
+            ("bear_pilot", str(row.get("order_id") or "")): row
+            for row in pilot.get("orders", [])
+        }
+    )
     sent: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     cards: list[dict[str, Any]] = []
     for fill in sorted(fills, key=lambda row: str(row.get("created_at") or row.get("fill_id") or "")):
-        key = f"fill:{fill.get('fill_id')}"
-        if not force and key in pushed:
+        scope = str(fill.get("_account_scope") or "core")
+        key = f"fill:{scope}:{fill.get('fill_id')}"
+        legacy_key = f"fill:{fill.get('fill_id')}" if scope == "core" else ""
+        if not force and (key in pushed or (legacy_key and legacy_key in pushed)):
             skipped.append({"key": key, "reason": "already_pushed", "symbol": fill.get("symbol"), "side": fill.get("side")})
             continue
-        order = orders_by_id.get(str(fill.get("order_id") or ""), {})
+        order = orders_by_id.get((scope, str(fill.get("order_id") or "")), {})
         card = build_trade_card(payload, fill, order)
         cards.append({"key": key, "symbol": fill.get("symbol"), "side": fill.get("side")})
         if dry_run:
@@ -174,7 +191,9 @@ def push_review_card(
     skipped: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     card = build_review_card(payload, trade_date)
-    if payload.get("valuation_complete") is False:
+    pilot = research_pilot(payload)
+    pilot_valuation_incomplete = bool(pilot.get("positions")) and pilot.get("valuation_complete") is False
+    if payload.get("valuation_complete") is False or pilot_valuation_incomplete:
         errors.append({"key": key, "error": "valuation_incomplete", "valuation_status": payload.get("valuation_status")})
     elif not force and key in pushed:
         skipped.append({"key": key, "reason": "already_pushed"})
@@ -256,9 +275,12 @@ def build_trade_card(payload: dict[str, Any], fill: dict[str, Any], order: dict[
     kind = "buy" if side == "BUY" else "sell"
     side_label = "买入成交" if side == "BUY" else "卖出成交"
     fee = safe_float(fill.get("commission")) + safe_float(fill.get("stamp_duty"))
-    account = payload.get("account") or {}
+    pilot = research_pilot(payload)
+    is_pilot = bool(fill.get("_research_pilot"))
+    account = (pilot.get("account") or {}) if is_pilot else (payload.get("account") or {})
+    account_label = "熊市研究小仓" if is_pilot else "核心模拟盘"
     elements = [
-        div(f"**{side_label}｜本地模拟盘**\n{stock_label(fill)}"),
+        div(f"**{side_label}｜{account_label}**\n{stock_label(fill)}"),
         fields_block(
             [
                 ("代码", fill.get("symbol") or "-"),
@@ -282,9 +304,9 @@ def build_trade_card(payload: dict[str, Any], fill: dict[str, Any], order: dict[
         ),
         div(f"**{trade_reason_label(fill)}**\n{trade_reason_text(fill, order)}"),
         {"tag": "hr"},
-        div("说明：这是 Chan520 本地模拟盘成交记录，不连接真实券商账户。"),
+        div(f"说明：这是 Chan520 {account_label}成交记录，不连接真实券商账户；研究小仓不影响核心账户。"),
     ]
-    return card_payload(kind, f"Chan520 本地模拟盘｜{side_label}", elements)
+    return card_payload(kind, f"Chan520 {account_label}｜{side_label}", elements)
 
 
 def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
@@ -297,6 +319,19 @@ def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
     quality = core.get("scan_quality") if isinstance(core.get("scan_quality"), dict) else {}
     supplemental = core.get("supplemental_market_context") if isinstance(core.get("supplemental_market_context"), dict) else {}
     style = core.get("candidate_style_diagnostic") if isinstance(core.get("candidate_style_diagnostic"), dict) else {}
+    funnel = core.get("execution_funnel") if isinstance(core.get("execution_funnel"), dict) else {}
+    pilot = research_pilot(payload)
+    pilot_plans = [
+        row for row in pilot.get("planned_orders", [])
+        if str(row.get("trade_date") or "") == trade_date
+        and str(row.get("status") or "") in {"WATCH_TRIGGER", "CONFIRMED_TRIGGER"}
+    ]
+    pilot_cohort = {
+        "position_cap_pct": pilot.get("position_cap_pct"),
+        "account_exposure_cap_pct": pilot.get("account_exposure_cap_pct"),
+        "max_positions": pilot.get("max_positions"),
+        **((core.get("research_cohorts") or {}).get("bear_pilot") or {}),
+    }
     elements = [
         div(f"**盘前核心交易计划**\n{trade_date}"),
         fields_block(
@@ -311,14 +346,17 @@ def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
                 ("风险闭环", ready_label(readiness.get("local_sim_risk_loop_ready"))),
                 ("新增买入", ready_label(readiness.get("local_sim_buy_entry_ready"))),
                 ("几何拦截", f"{safe_int(core.get('geometry_blocked_count'))} 只"),
+                ("熊市研究小仓", f"{len(pilot_plans)} 只"),
             ]
         ),
+        div("**执行漏斗**\n" + execution_funnel_lines(funnel)),
         div("**执行边界**\n" + core_plan_boundary(core)),
         div("**市场宽度与候选风格（诊断，不参与放宽入场）**\n" + style_diagnostic_lines(style)),
         {"tag": "hr"},
         div("**T+1/风控优先**\n" + planned_order_lines(risks)),
         div("**严格待触发**\n" + planned_order_lines(executable)),
         div("**观察池（不会自动成交）**\n" + planned_order_lines(watches)),
+        div("**熊市研究小仓（独立账户，不影响核心）**\n" + bear_pilot_plan_lines(pilot_plans, pilot_cohort)),
         div("说明：盘前计划只使用上一交易日完整日线；盘中仍需二阶段确认与市场风险门。"),
     ]
     return card_payload("plan", "Chan520 本地模拟盘｜盘前核心计划", elements)
@@ -334,6 +372,25 @@ def core_plan_boundary(core: dict[str, Any]) -> str:
     if safe_int(core.get("executable_buy_count")) <= 0:
         return "没有通过严格门槛的可执行买入；观察池不会自动成交。"
     return f"仅 {safe_int(core.get('executable_buy_count'))} 只严格候选可进入盘中二阶段确认。"
+
+
+def execution_funnel_lines(funnel: dict[str, Any]) -> str:
+    if not funnel:
+        return "本次未记录执行漏斗。"
+    return (
+        f"扫描 {safe_int(funnel.get('scanned_count'))} → 严格 {safe_int(funnel.get('strict_count'))} → "
+        f"观察 {safe_int(funnel.get('watch_count'))} → 核心可执行 {safe_int(funnel.get('core_executable_count'))} → "
+        f"熊市研究小仓 {safe_int(funnel.get('bear_pilot_count'))}。"
+    )
+
+
+def bear_pilot_plan_lines(rows: list[dict[str, Any]], cohort: dict[str, Any]) -> str:
+    boundary = (
+        f"状态 {cohort.get('status') or '-'}；单票上限 {pct(cohort.get('position_cap_pct'))}，"
+        f"账户总仓上限 {pct(cohort.get('account_exposure_cap_pct'))}，最多 {safe_int(cohort.get('max_positions'))} 只，"
+        "仅本地模拟研究，不连接 GM。"
+    )
+    return boundary + "\n" + planned_order_lines(rows)
 
 
 def style_diagnostic_lines(style: dict[str, Any]) -> str:
@@ -356,6 +413,11 @@ def build_review_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any
     positions = list(payload.get("positions") or [])
     plans = [row for row in payload.get("planned_orders", []) if str(row.get("trade_date") or "") in {"", trade_date}]
     replay = payload.get("counterfactual_replay") if isinstance(payload.get("counterfactual_replay"), dict) else {}
+    pilot = research_pilot(payload)
+    pilot_account = pilot.get("account") or {}
+    pilot_positions = list(pilot.get("positions") or [])
+    pilot_fills = [row for row in pilot.get("fills", []) if row_date(row) == trade_date]
+    pilot_plans = [row for row in pilot.get("planned_orders", []) if str(row.get("trade_date") or "") == trade_date]
     elements = [
         div(f"**每日账户复盘**\n{trade_date}"),
         fields_block(
@@ -383,10 +445,33 @@ def build_review_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any
         div("**持仓明细**\n" + position_lines(positions)),
         div("**当日成交明细**\n" + fill_lines(fills)),
         div("**当日理由分布**\n" + reason_summary_lines(fills)),
+        div("**熊市研究小仓账户（独立于核心）**\n" + bear_pilot_review_lines(pilot_account, pilot_positions, pilot_fills, pilot_plans)),
         div("**熊市防御候选反事实回放（仅研究）**\n" + counterfactual_lines(replay)),
         div(f"说明：估值口径 {payload.get('valuation_basis') or '-'}，状态 {payload.get('valuation_status') or '-'}。估值不完整时本复盘会 fail-closed，不会推送误导性盈亏。"),
     ]
     return card_payload("review", "Chan520 本地模拟盘｜每日账户复盘", elements)
+
+
+def bear_pilot_review_lines(
+    account: dict[str, Any],
+    positions: list[dict[str, Any]],
+    fills: list[dict[str, Any]],
+    plans: list[dict[str, Any]],
+) -> str:
+    if not account:
+        return "研究小仓尚未初始化；核心账户不受影响。"
+    lines = [
+        f"总资产 {yuan(account.get('total_equity'))}，盈亏 {pnl_text(account.get('total_pnl'), account.get('total_pnl_pct'))}，"
+        f"仓位 {pct(account.get('gross_exposure_pct'))}，当日成交 {len(fills)} 笔，待触发 {sum(str(row.get('status') or '') in {'WATCH_TRIGGER', 'CONFIRMED_TRIGGER'} for row in plans)} 只。",
+        "持仓：" + position_lines(positions),
+        "成交：" + fill_lines(fills),
+    ]
+    return "\n".join(lines)
+
+
+def research_pilot(payload: dict[str, Any]) -> dict[str, Any]:
+    pilot = payload.get("research_pilot")
+    return pilot if isinstance(pilot, dict) and pilot.get("status") == "ACTIVE" else {}
 
 
 def counterfactual_lines(replay: dict[str, Any]) -> str:
