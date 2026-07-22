@@ -186,6 +186,7 @@ function renderCorePlanAlert(payload) {
   if (!core.status) return "";
   const quality = core.scan_quality || {};
   const supplemental = core.supplemental_market_context || {};
+  const style = core.candidate_style_diagnostic || {};
   const coverage = Number(quality.coverage);
   const coverageText = Number.isFinite(coverage) ? `${(coverage * 100).toFixed(2)}%` : "未知";
   const kind = core.status === "PASS" && Number(core.executable_buy_count || 0) > 0 ? "ok" : core.status === "PASS" ? "warning" : "danger";
@@ -195,7 +196,8 @@ function renderCorePlanAlert(payload) {
       ? `仅 ${intText(core.executable_buy_count)} 只严格候选可进入盘中二阶段确认。`
       : "没有通过全部执行门槛的可执行买入，观察池不会自动成交。";
   const supplementalText = supplemental.emotion_label ? `｜同花顺旁路 ${supplemental.emotion_label}` : "";
-  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜扫描覆盖率 ${escapeHtml(coverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}｜${escapeHtml(boundary)}</div>`;
+  const styleText = style.status ? `｜风格偏离 ${style.mismatch_alert ? "预警" : "正常"}` : "";
+  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜扫描覆盖率 ${escapeHtml(coverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}｜${escapeHtml(boundary)}</div>`;
 }
 
 function renderReadinessAlert(payload) {
@@ -213,6 +215,9 @@ function renderReadinessAlert(payload) {
 function renderCounterfactualReplay(replay) {
   if (!replay.status) return "";
   const failed = replay.status === "FAIL_CLOSED";
+  const independent = replay.individual_candidate_results || [];
+  const individuallyTriggered = independent.filter((row) => Number(row.filled_count || 0) > 0).length;
+  const sensitivity = replay.ordering_sensitivity || {};
   const fills = (replay.fills || []).map((row) =>
     `${stockText(row)} ${escapeHtml(row.fill_minute || "-")} @ ${price(row.fill_price)} → ${price(row.close_price)}，净盯市 <span class="${pnlClass(row.net_mark_pnl)}">${signedMoney(row.net_mark_pnl)}</span>`
   ).join("<br>") || "无模拟触发";
@@ -227,6 +232,8 @@ function renderCounterfactualReplay(replay) {
         <span>候选 ${intText(replay.candidate_count)} 只</span>
         <span>模拟触发 ${intText(replay.filled_count)} 只</span>
         <span class="${pnlClass(replay.net_mark_pnl)}">净盯市 ${signedMoney(replay.net_mark_pnl)} / ${signedPct(replay.net_mark_return_on_equity)}</span>
+        <span>逐票独立 ${intText(individuallyTriggered)}/${intText(independent.length)}</span>
+        <span>排序极差 ${signedMoney(sensitivity.spread_net_mark_pnl || 0)}</span>
       </div>
       <div class="research-fills">${failed ? escapeHtml(replay.error || "数据不完整") : fills}</div>
     </section>

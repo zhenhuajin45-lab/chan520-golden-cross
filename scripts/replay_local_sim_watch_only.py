@@ -18,6 +18,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.execute_local_sim_triggers import CORE_PLAN_POLICY_ID, evaluate_plan, plan_rank
+from scripts.generate_local_sim_core_plan import resolve_market_regime
+from chan520_skill.market_store import (
+    DEFAULT_PATH as MARKET_STORE,
+    load_minute_day,
+    upsert_minute_day,
+)
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -42,7 +48,7 @@ def main() -> int:
     trade_date = date.fromisoformat(args.trade_date)
     plan_path = Path(args.plan) if args.plan else ROOT / "reports" / "local_sim_plan" / trade_date.strftime("%Y%m%d") / "core_plan.json"
     output = Path(args.output) if args.output else ROOT / "reports" / "local_sim_counterfactual" / trade_date.strftime("%Y%m%d") / "watch_only_replay.json"
-    core_plan = read_json(plan_path, {})
+    core_plan = prepare_research_plan(read_json(plan_path, {}))
     candidates = research_candidates(core_plan)
     if not candidates:
         payload = run_replay(
@@ -60,11 +66,11 @@ def main() -> int:
         return 0
     try:
         market_data = {
-            str(row.get("symbol") or ""): fetch_tencent_day(str(row.get("symbol") or ""), trade_date, is_index=False)
+            str(row.get("symbol") or ""): fetch_market_day(str(row.get("symbol") or ""), trade_date, is_index=False)
             for row in candidates
         }
         market_data.update(
-            {index_data_key(symbol): fetch_tencent_day(symbol, trade_date, is_index=True) for symbol in INDEX_SYMBOLS}
+            {index_data_key(symbol): fetch_market_day(symbol, trade_date, is_index=True) for symbol in INDEX_SYMBOLS}
         )
         payload = run_replay(
             core_plan,
@@ -86,18 +92,67 @@ def main() -> int:
 
 
 def research_candidates(core_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    regime = str((core_plan.get("research_regime") or core_plan.get("market_regime") or {}).get("state") or "UNKNOWN").upper()
+    if regime != "BEAR":
+        return []
     plans = core_plan.get("plans") if isinstance(core_plan.get("plans"), list) else []
     return sorted(
         [
             row
             for row in plans
             if isinstance(row, dict)
-            and row.get("research_only") is True
-            and row.get("research_cohort") == "BEAR_DEFENSIVE_WATCH"
+            and (
+                (row.get("research_only") is True and row.get("research_cohort") == "BEAR_DEFENSIVE_WATCH")
+                or "BEAR_DEFENSIVE_WATCH" in list(row.get("research_conditional_cohorts") or [])
+                or legacy_research_shape(row)
+            )
             and str(row.get("status") or "").upper() == "WATCH_ONLY"
         ],
         key=plan_rank,
     )
+
+
+def legacy_research_shape(row: dict[str, Any]) -> bool:
+    code = str(row.get("symbol") or "")
+    try:
+        score = float(row.get("score") or 0)
+        ma5 = float(row.get("ma5") or 0)
+        ma20 = float(row.get("ma20") or 0)
+        rsi = float(row.get("rsi14") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        str(row.get("status") or "").upper() == "WATCH_ONLY"
+        and row.get("geometry_valid") is not False
+        and not code.startswith(("3", "688", "689"))
+        and score >= 18
+        and ma5 > ma20 > 0
+        and 0 < rsi <= 70
+    )
+
+
+def prepare_research_plan(core_plan: dict[str, Any]) -> dict[str, Any]:
+    prepared = copy.deepcopy(core_plan)
+    original = str((prepared.get("market_regime") or {}).get("state") or "UNKNOWN").upper()
+    if original != "UNKNOWN":
+        prepared["research_regime"] = {
+            **(prepared.get("market_regime") or {}),
+            "original_state": original,
+            "reconstructed": False,
+        }
+        return prepared
+    try:
+        signal_date = date.fromisoformat(str(prepared.get("signal_date") or ""))
+        reconstructed = resolve_market_regime(signal_date)
+    except Exception as exc:  # noqa: BLE001 - research remains visibly unavailable, never silently empty.
+        reconstructed = {"state": "UNKNOWN", "source": "unavailable", "detail": f"{type(exc).__name__}: {exc}"}
+    prepared["research_regime"] = {
+        **reconstructed,
+        "original_state": original,
+        "reconstructed": True,
+        "live_execution_changed": False,
+    }
+    return prepared
 
 
 def run_replay(
@@ -111,7 +166,13 @@ def run_replay(
 ) -> dict[str, Any]:
     candidates = research_candidates(core_plan)
     if not candidates:
-        return base_payload(core_plan, trade_date, candidates, status="NO_CANDIDATES")
+        regime = str((core_plan.get("research_regime") or {}).get("state") or "UNKNOWN").upper()
+        return base_payload(
+            core_plan,
+            trade_date,
+            candidates,
+            status="REGIME_UNAVAILABLE" if regime == "UNKNOWN" else "NO_CANDIDATES",
+        )
     required = {
         *(str(row.get("symbol") or "") for row in candidates),
         *(index_data_key(symbol) for symbol in INDEX_SYMBOLS),
@@ -121,6 +182,79 @@ def run_replay(
         return failure_payload(core_plan, trade_date, candidates, f"minute_data_missing:{','.join(missing)}")
 
     effective_equity = float(core_plan.get("account_equity") or initial_equity)
+    orders = {
+        "risk_priority": sorted(candidates, key=plan_rank),
+        "reverse_risk_priority": sorted(candidates, key=plan_rank, reverse=True),
+        "score_desc": sorted(candidates, key=lambda row: (-float(row.get("score") or 0), str(row.get("symbol") or ""))),
+        "symbol_asc": sorted(candidates, key=lambda row: str(row.get("symbol") or "")),
+    }
+    variants = {
+        name: simulate_portfolio(
+            ordered,
+            market_data,
+            trade_date,
+            effective_equity,
+            max_fills=max_fills,
+            max_exposure_pct=max_exposure_pct,
+        )
+        for name, ordered in orders.items()
+    }
+    ranked = variants["risk_priority"]
+    independent = [
+        {
+            "symbol": str(candidate.get("symbol") or ""),
+            "stock_name": str(candidate.get("stock_name") or ""),
+            **simulate_portfolio(
+                [candidate], market_data, trade_date, effective_equity, max_fills=1, max_exposure_pct=max_exposure_pct
+            ),
+        }
+        for candidate in sorted(candidates, key=plan_rank)
+    ]
+    sensitivity_rows = [
+        {
+            "ordering": name,
+            "symbols": [str(row.get("symbol") or "") for row in orders[name]],
+            "filled_count": result["filled_count"],
+            "filled_symbols": [str(row.get("symbol") or "") for row in result["fills"]],
+            "net_mark_pnl": result["net_mark_pnl"],
+            "net_mark_return_on_equity": result["net_mark_return_on_equity"],
+        }
+        for name, result in variants.items()
+    ]
+    pnl_values = [float(row["net_mark_pnl"]) for row in sensitivity_rows]
+    payload = base_payload(core_plan, trade_date, candidates, status="PASS")
+    payload.update(ranked)
+    payload.update(
+        {
+            "minute_data_source": sorted({str(item.get("source") or "tencent") for item in market_data.values()}),
+            "historical_date_integrity": "PASS",
+            "historical_price_fields_source": "matched_day.prec_and_first_minute",
+            "data_complete": True,
+            "max_fills": max_fills,
+            "max_exposure_pct": max_exposure_pct,
+            "replay_equity": round(effective_equity, 2),
+            "ranked_portfolio": {"ordering": "risk_priority", **ranked},
+            "individual_candidate_results": independent,
+            "ordering_sensitivity": {
+                "variants": sensitivity_rows,
+                "best_net_mark_pnl": max(pnl_values) if pnl_values else 0.0,
+                "worst_net_mark_pnl": min(pnl_values) if pnl_values else 0.0,
+                "spread_net_mark_pnl": round(max(pnl_values) - min(pnl_values), 2) if pnl_values else 0.0,
+            },
+        }
+    )
+    return payload
+
+
+def simulate_portfolio(
+    candidates: list[dict[str, Any]],
+    market_data: dict[str, dict[str, Any]],
+    trade_date: date,
+    effective_equity: float,
+    *,
+    max_fills: int,
+    max_exposure_pct: float,
+) -> dict[str, Any]:
     plans = [replay_plan(row, effective_equity) for row in candidates]
     minute_keys = list(REPLAY_MINUTES)
     filled_count = 0
@@ -133,7 +267,7 @@ def run_replay(
     for minute in minute_keys:
         now = datetime.combine(trade_date, datetime.strptime(minute, "%H%M").time(), tzinfo=TZ)
         context = market_context_at(market_data, minute, trade_date)
-        for plan in sorted(plans, key=plan_rank):
+        for plan in plans:
             symbol = str(plan.get("symbol") or "")
             if any(row["symbol"] == symbol for row in fills):
                 continue
@@ -185,14 +319,7 @@ def run_replay(
 
     gross_mark_pnl = sum(float(row["gross_mark_pnl"]) for row in fills)
     commissions = sum(float(row["buy_commission"]) for row in fills)
-    payload = base_payload(core_plan, trade_date, candidates, status="PASS")
-    payload.update(
-        {
-            "minute_data_source": "Tencent appstock day/query",
-            "data_complete": True,
-            "max_fills": max_fills,
-            "max_exposure_pct": max_exposure_pct,
-            "replay_equity": round(effective_equity, 2),
+    return {
             "filled_count": len(fills),
             "used_exposure": round(used_exposure, 2),
             "fills": fills,
@@ -203,9 +330,7 @@ def run_replay(
             "latest_decisions": latest_decisions,
             "decision_reason_counts": dict(sorted(reason_counts.items())),
             "events": events,
-        }
-    )
-    return payload
+    }
 
 
 def replay_plan(source: dict[str, Any], equity: float) -> dict[str, Any]:
@@ -296,9 +421,15 @@ def fetch_tencent_day(symbol: str, trade_date: date, *, is_index: bool) -> dict[
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310 - fixed Tencent market-data endpoint.
         payload = json.loads(response.read().decode("utf-8"))
+    return parse_tencent_day_payload(payload, market_symbol, symbol, trade_date)
+
+
+def parse_tencent_day_payload(
+    payload: dict[str, Any], market_symbol: str, symbol: str, trade_date: date
+) -> dict[str, Any]:
     root = payload["data"][market_symbol]
     day = next(item for item in root["data"] if str(item.get("date")) == trade_date.strftime("%Y%m%d"))
-    quote = root["qt"][market_symbol]
+    quote = (root.get("qt") or {}).get(market_symbol) or []
     minutes = {}
     for line in day["data"]:
         parts = str(line).split()
@@ -306,13 +437,39 @@ def fetch_tencent_day(symbol: str, trade_date: date, *, is_index: bool) -> dict[
             minutes[parts[0]] = float(parts[1])
     if not minutes:
         raise ValueError(f"empty minute data for {symbol} {trade_date}")
+    prev_close = float(day.get("prec") or 0)
+    if prev_close <= 0:
+        raise ValueError(f"historical prev_close missing for {symbol} {trade_date}")
+    first_minute = min(minutes)
     return {
         "symbol": symbol,
-        "name": str(quote[1]),
-        "prev_close": float(quote[4]),
-        "open": float(quote[5]),
+        "name": str(quote[1]) if len(quote) > 1 else symbol,
+        "prev_close": prev_close,
+        "open": float(minutes[first_minute]),
         "minutes": minutes,
+        "source": "tencent_appstock_day_query",
+        "historical_price_fields_source": "matched_day.prec_and_first_minute",
     }
+
+
+def fetch_market_day(symbol: str, trade_date: date, *, is_index: bool) -> dict[str, Any]:
+    try:
+        payload = fetch_tencent_day(symbol, trade_date, is_index=is_index)
+        upsert_minute_day(
+            symbol,
+            trade_date,
+            payload,
+            is_index=is_index,
+            source="tencent_appstock_day_query",
+            path=MARKET_STORE,
+        )
+        return payload
+    except Exception as network_error:  # noqa: BLE001 - exact-date local cache is an audited fallback.
+        cached = load_minute_day(symbol, trade_date, is_index=is_index, path=MARKET_STORE)
+        if cached is not None:
+            cached["network_error"] = f"{type(network_error).__name__}: {network_error}"
+            return cached
+        raise
 
 
 def tencent_symbol(symbol: str, *, is_index: bool) -> str:
@@ -339,6 +496,8 @@ def base_payload(
         "live_execution_enabled": False,
         "core_plan_policy_id": core_plan.get("policy_id"),
         "core_market_regime": (core_plan.get("market_regime") or {}).get("state"),
+        "research_market_regime": (core_plan.get("research_regime") or {}).get("state"),
+        "research_regime": core_plan.get("research_regime"),
         "actual_executable_buy_count": int(core_plan.get("executable_buy_count") or 0),
         "candidate_count": len(candidates),
         "candidate_symbols": [str(row.get("symbol") or "") for row in candidates],

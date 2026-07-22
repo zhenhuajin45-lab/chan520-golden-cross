@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import sys
+from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -16,8 +17,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from chan520_skill.broker_adapter import LocalSimBrokerAdapter, LocalSimBrokerConfig  # noqa: E402
-from chan520_skill.data import auto_history, trim_to_date  # noqa: E402
-from chan520_skill.regime import fetch_regime, index_history  # noqa: E402
+from chan520_skill.data import eastmoney_history, tencent_history, trim_to_date  # noqa: E402
+from chan520_skill.market_store import (  # noqa: E402
+    DEFAULT_PATH as MARKET_STORE,
+    initialize as initialize_market_store,
+    latest_bar_date_before,
+    load_history as load_stored_history,
+    load_scan as load_stored_scan,
+    load_sectors,
+    upsert_history,
+    upsert_scan,
+    upsert_sectors,
+)
+from chan520_skill.regime import evaluate_regime, index_history, tencent_index_history  # noqa: E402
 from chan520_skill.scanner import scan_market  # noqa: E402
 
 
@@ -49,10 +61,14 @@ def main() -> int:
     args = parser.parse_args()
 
     trade_date = date.fromisoformat(args.trade_date)
+    initialize_market_store(MARKET_STORE)
     signal_date = resolve_signal_date(trade_date, args.signal_date)
     verify_trade_date(trade_date, signal_date)
     scan_path = ROOT / "reports" / f"scan_{signal_date.isoformat()}" / f"market_scan_{signal_date.isoformat()}.csv"
     scan_stats = None
+    restored_scan = None if scan_path.exists() else load_stored_scan(signal_date, path=MARKET_STORE)
+    if restored_scan is not None:
+        restore_scan_files(scan_path, signal_date, *restored_scan)
     if not scan_path.exists() and args.refresh_scan_if_missing:
         _csv_path, _md_path, scan_stats = scan_market(signal_date, scan_path.parent, max_workers=16)
     if not scan_path.exists():
@@ -62,9 +78,11 @@ def main() -> int:
         LocalSimBrokerConfig(account_id=args.account_id, initial_cash=args.initial_cash, ledger_path=args.ledger)
     )
     adapter.initialize_account()
-    regime = resolve_market_regime(signal_date, offline=args.offline_regime)
     rows = read_scan(scan_path)
     scan_quality = resolve_scan_quality(scan_path, scan_stats)
+    upsert_scan(signal_date, rows, scan_quality, source="qualified_scan_csv", path=MARKET_STORE)
+    sector_map = resolve_sector_map(rows)
+    regime = resolve_market_regime(signal_date, offline=args.offline_regime)
     payload = generate_plan(
         adapter=adapter,
         ledger=Path(args.ledger),
@@ -75,6 +93,7 @@ def main() -> int:
         scan_rows=rows,
         regime=regime,
         scan_quality=scan_quality,
+        sector_map=sector_map,
         max_candidates=args.max_candidates,
         max_buy_plans=args.max_buy_plans,
         max_new_exposure_pct=args.max_new_exposure_pct,
@@ -93,11 +112,19 @@ def resolve_signal_date(trade_date: date, supplied: str = "") -> date:
         if signal_date >= trade_date:
             raise ValueError("signal_date must be earlier than trade_date")
         return signal_date
-    rows = index_history("000001", trade_date)
-    prior = [row.date for row in rows if row.date < trade_date]
-    if not prior:
-        raise RuntimeError(f"FAIL_CLOSED: no prior trading session before {trade_date}")
-    return max(prior)
+    errors = []
+    for loader in (tencent_index_history, index_history):
+        try:
+            rows = loader("000001", trade_date)
+            prior = [row.date for row in rows if row.date < trade_date]
+            if prior:
+                return max(prior)
+        except Exception as exc:  # noqa: BLE001 - exact-date local evidence is the final fallback.
+            errors.append(f"{type(exc).__name__}:{exc}")
+    cached = latest_bar_date_before("000001", trade_date, is_index=True, path=MARKET_STORE)
+    if cached is not None:
+        return cached
+    raise RuntimeError(f"FAIL_CLOSED: no prior trading session before {trade_date}: {' | '.join(errors)}")
 
 
 def verify_trade_date(trade_date: date, signal_date: date) -> None:
@@ -122,18 +149,157 @@ def verify_trade_date(trade_date: date, signal_date: date) -> None:
 
 def resolve_market_regime(signal_date: date, *, offline: bool = False) -> dict[str, Any]:
     if offline:
-        return {"state": "UNKNOWN", "regime_ok": False, "detail": "offline_regime: index data fetch skipped; buy entries fail closed"}
-    try:
-        state = fetch_regime("000001", signal_date, adjust=0)
-    except Exception as exc:  # noqa: BLE001 - plan generation must record an unavailable regime.
-        return {"state": "UNKNOWN", "regime_ok": False, "detail": f"{type(exc).__name__}: {exc}"}
+        cached = load_stored_history("000001", signal_date, is_index=True, path=MARKET_STORE)
+        if cached is None:
+            return {"state": "UNKNOWN", "regime_ok": False, "source": "unavailable", "detail": "offline_regime: exact-date local index data unavailable; buy entries fail closed"}
+        _meta, rows, source = cached
+        state = evaluate_regime("000001", rows, signal_date)
+        return mapped_regime(state, source)
+    errors = []
+    for source, loader in (("tencent", tencent_index_history), ("eastmoney_or_tencent_fallback", index_history)):
+        try:
+            rows = loader("000001", signal_date)
+            state = evaluate_regime("000001", rows, signal_date)
+            upsert_history("000001", "上证指数", 1, rows, source=source, is_index=True, path=MARKET_STORE)
+            return mapped_regime(state, source)
+        except Exception as exc:  # noqa: BLE001 - try the next audited source.
+            errors.append(f"{source}:{type(exc).__name__}:{exc}")
+    cached = load_stored_history("000001", signal_date, is_index=True, path=MARKET_STORE)
+    if cached is not None:
+        _meta, rows, source = cached
+        return mapped_regime(evaluate_regime("000001", rows, signal_date), source)
+    return {"state": "UNKNOWN", "regime_ok": False, "source": "unavailable", "detail": " | ".join(errors)}
+
+
+def mapped_regime(state: Any, source: str) -> dict[str, Any]:
     mapped = {"trend_up": "BULL", "range": "NORMAL", "down": "BEAR"}.get(state.regime, "UNKNOWN")
-    return {"state": mapped, "regime_ok": mapped in {"BULL", "NORMAL"}, "detail": state.detail}
+    return {"state": mapped, "regime_ok": mapped in {"BULL", "NORMAL"}, "source": source, "detail": state.detail}
 
 
 def read_scan(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as fh:
         return list(csv.DictReader(fh))
+
+
+def restore_scan_files(
+    scan_path: Path,
+    target: date,
+    rows: list[dict[str, Any]],
+    quality: dict[str, Any],
+) -> None:
+    if not rows:
+        return
+    scan_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(dict.fromkeys(key for row in rows for key in row))
+    with scan_path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    quality_path = scan_path.with_name(f"scan_quality_{target.isoformat()}.json")
+    quality_path.write_text(json.dumps(quality, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def load_candidate_history(code: str, target: date, *, offline: bool) -> tuple[Any, list[Any], str] | None:
+    if not offline:
+        errors = []
+        for source, loader, kwargs in (
+            ("tencent", tencent_history, {"adjust": "qfq"}),
+            ("eastmoney", eastmoney_history, {"adjust": 1}),
+        ):
+            try:
+                meta, rows = loader(code, target, **kwargs)
+                rows = trim_to_date(rows, target)
+                upsert_history(code, meta.name, meta.market, rows, source=source, path=MARKET_STORE)
+                return meta, rows, source
+            except Exception as exc:  # noqa: BLE001 - try every bounded source before local fallback.
+                errors.append(exc)
+    return load_stored_history(code, target, path=MARKET_STORE)
+
+
+def resolve_sector_map(scan_rows: list[dict[str, Any]]) -> dict[str, str]:
+    mapping = load_sectors(path=MARKET_STORE)
+    embedded = {
+        str(row.get("code") or ""): str(row.get("industry") or "")
+        for row in scan_rows
+        if row.get("code") and row.get("industry")
+    }
+    mapping.update(embedded)
+    sources = sorted(ROOT.glob("reports/backtest/**/candidate_symbols*.csv"), reverse=True)
+    for path in sources:
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    code = str(row.get("code") or "")
+                    sector = str(row.get("industry") or row.get("sector") or "")
+                    if code and sector and code not in mapping:
+                        mapping[code] = sector
+        except (OSError, csv.Error):
+            continue
+        if len(mapping) >= 1000:
+            break
+    if mapping:
+        upsert_sectors(mapping, source="local_research_sector_snapshot", path=MARKET_STORE)
+    return mapping
+
+
+def build_style_diagnostic(
+    signal_date: date,
+    scan_rows: list[dict[str, Any]],
+    plans: list[dict[str, Any]],
+    sector_map: dict[str, str],
+) -> dict[str, Any]:
+    usable = [row for row in scan_rows if safe_float(row.get("close")) > 0]
+    plan_codes = {str(row.get("symbol") or "") for row in plans}
+    candidates = [row for row in usable if str(row.get("code") or "") in plan_codes]
+
+    def breadth(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        count = len(rows)
+        up = sum(safe_float(row.get("pct_chg")) > 0 for row in rows)
+        above20 = sum(safe_float(row.get("close")) > safe_float(row.get("ma20")) > 0 for row in rows)
+        return {
+            "count": count,
+            "up_ratio": round(up / count, 4) if count else 0.0,
+            "average_pct_chg": round(sum(safe_float(row.get("pct_chg")) for row in rows) / count, 4) if count else 0.0,
+            "above_ma20_ratio": round(above20 / count, 4) if count else 0.0,
+        }
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in usable:
+        sector = sector_map.get(str(row.get("code") or ""), str(row.get("industry") or "UNMAPPED"))
+        grouped.setdefault(sector or "UNMAPPED", []).append(row)
+    sectors = [
+        {"sector": sector, **breadth(rows)}
+        for sector, rows in grouped.items()
+        if sector != "UNMAPPED" and len(rows) >= 10
+    ]
+    sectors.sort(key=lambda item: (item["average_pct_chg"], item["up_ratio"], item["count"]), reverse=True)
+    top_sectors = sectors[:8]
+    top_names = {str(item["sector"]) for item in top_sectors[:3]}
+    candidate_sectors = [sector_map.get(str(row.get("code") or ""), "UNMAPPED") for row in candidates]
+    overlap = sum(sector in top_names for sector in candidate_sectors)
+    market = breadth(usable)
+    candidate = breadth(candidates)
+    overlap_ratio = overlap / len(candidates) if candidates else 0.0
+    mismatch = bool(candidates and market["up_ratio"] >= 0.60 and (overlap_ratio < 0.20 or candidate["up_ratio"] + 0.15 < market["up_ratio"]))
+    boards = {
+        "main": sum(not str(row.get("code") or "").startswith(("3", "688", "689")) for row in candidates),
+        "chinext": sum(str(row.get("code") or "").startswith("3") for row in candidates),
+        "star": sum(str(row.get("code") or "").startswith(("688", "689")) for row in candidates),
+    }
+    return {
+        "status": "PASS" if usable else "UNAVAILABLE",
+        "signal_date": signal_date.isoformat(),
+        "role": "completed_session_diagnostic_only",
+        "used_for_execution_gate": False,
+        "market_breadth": market,
+        "candidate_breadth": candidate,
+        "top_industries": top_sectors,
+        "candidate_industries": dict(sorted(Counter(candidate_sectors).items())),
+        "candidate_board_distribution": boards,
+        "top3_industry_overlap_ratio": round(overlap_ratio, 4),
+        "mismatch_alert": mismatch,
+        "diagnosis": "候选与强势行业/市场宽度存在偏离，仅作观察池诊断，不放宽入场门槛" if mismatch else "候选风格未见显著宽度偏离",
+    }
 
 
 def generate_plan(
@@ -147,6 +313,7 @@ def generate_plan(
     scan_rows: list[dict[str, str]],
     regime: dict[str, Any],
     scan_quality: dict[str, Any] | None = None,
+    sector_map: dict[str, str] | None = None,
     max_candidates: int,
     max_buy_plans: int,
     max_new_exposure_pct: float,
@@ -157,7 +324,11 @@ def generate_plan(
     equity = float(account["cash"]) + sum(float(row["shares"]) * float(row["average_price"]) for row in account["positions"])
     # Alpha-score ranking remains disabled. Risk evidence only decides which
     # already-qualified plan gets scarce execution capacity first.
-    ordered = sorted(scan_rows, key=lambda row: str(row.get("code") or ""))
+    sector_map = sector_map or {}
+    ordered = sorted(
+        [{**row, "industry": sector_map.get(str(row.get("code") or ""), str(row.get("industry") or "UNMAPPED"))} for row in scan_rows],
+        key=lambda row: str(row.get("code") or ""),
+    )
     strict_candidates = [
         (row, candidate_levels(row, signal_date, offline=str(regime.get("state") or "").upper() == "UNKNOWN"))
         for row in ordered
@@ -235,17 +406,21 @@ def generate_plan(
             regime,
             ["SCAN_WATCH_ONLY", "STRICT_ENTRY_REQUIRED", *zone["reason_codes"]],
         )
+        if bear_defensive_shape_eligible(row, zone):
+            plan["research_conditional_cohorts"] = ["BEAR_DEFENSIVE_WATCH"]
+            plan["research_policy_id"] = "bear_defensive_watch_v2"
+            plan["execution_priority_basis"] = "geometry_then_t1_then_score_tiebreak_v1"
         if bear_defensive_eligible(row, zone, regime):
             plan["research_only"] = True
             plan["research_cohort"] = "BEAR_DEFENSIVE_WATCH"
-            plan["research_policy_id"] = "bear_defensive_watch_v1"
-            plan["execution_priority_basis"] = "geometry_then_t1_then_score_tiebreak_v1"
+            plan["research_policy_id"] = "bear_defensive_watch_v2"
             plan["reason_codes"] = [*plan["reason_codes"], "BEAR_DEFENSIVE_RESEARCH_ONLY"]
             bear_defensive_symbols.append(str(row.get("code") or ""))
         adapter.record_planned_order(plan)
         audits.append(plan)
 
     status = "PASS" if regime.get("state") != "UNKNOWN" and scan_quality.get("coverage_pass") else "FAIL_CLOSED"
+    style_diagnostic = build_style_diagnostic(signal_date, ordered, audits, sector_map)
     return {
         "schema_version": "chan520_local_sim_core_plan_v2",
         "policy_id": POLICY_ID,
@@ -259,6 +434,7 @@ def generate_plan(
         "scan_path": str(scan_path),
         "market_regime": regime,
         "supplemental_market_context": load_supplemental_market_context(signal_date),
+        "candidate_style_diagnostic": style_diagnostic,
         "scan_quality": scan_quality,
         "expired_plan_count": expired,
         "strict_scan_count": len(strict_rows),
@@ -271,7 +447,7 @@ def generate_plan(
         "account_equity": equity,
         "research_cohorts": {
             "bear_defensive": {
-                "policy_id": "bear_defensive_watch_v1",
+                "policy_id": "bear_defensive_watch_v2",
                 "status": "RESEARCH_ONLY",
                 "eligible_count": len(bear_defensive_symbols),
                 "symbols": bear_defensive_symbols,
@@ -285,7 +461,16 @@ def generate_plan(
                     "rsi14<=70",
                 ],
                 "live_execution_enabled": False,
-            }
+            },
+            "conditional_bear_defensive": {
+                "policy_id": "bear_defensive_watch_v2",
+                "status": "CONDITIONAL_RESEARCH_ONLY",
+                "eligible_count": sum(
+                    "BEAR_DEFENSIVE_WATCH" in list(row.get("research_conditional_cohorts") or []) for row in audits
+                ),
+                "activation": "reconstruct signal-date regime and require BEAR",
+                "live_execution_enabled": False,
+            },
         },
         "research_warnings": [
             "V11 conditional randomization did not validate ranked alpha selection; ranking is disabled for automatic orders.",
@@ -408,10 +593,13 @@ def research_priority_key(
 
 
 def bear_defensive_eligible(row: dict[str, str], zone: dict[str, Any], regime: dict[str, Any]) -> bool:
+    return str(regime.get("state") or "").upper() == "BEAR" and bear_defensive_shape_eligible(row, zone)
+
+
+def bear_defensive_shape_eligible(row: dict[str, str], zone: dict[str, Any]) -> bool:
     code = str(row.get("code") or "")
     return (
-        str(regime.get("state") or "").upper() == "BEAR"
-        and bool(zone.get("geometry_valid"))
+        bool(zone.get("geometry_valid"))
         and not code.startswith(("3", "688", "689"))
         and safe_float(row.get("score")) >= 18
         and safe_float(row.get("ma5")) > safe_float(row.get("ma20")) > 0
@@ -429,12 +617,14 @@ def candidate_levels(row: dict[str, str], signal_date: date, *, offline: bool = 
     t1_loss_buffer_pct = board_t1_floor_pct(str(row.get("code") or ""))
     reason_codes: list[str] = []
     evidence_status = "COMPLETE"
-    if offline:
-        reason_codes.append("PRESSURE_DATA_UNAVAILABLE:OFFLINE")
-        evidence_status = "UNAVAILABLE"
-    else:
+    evidence_source = "unavailable"
+    try:
+        code = str(row.get("code") or "")
+        loaded = load_candidate_history(code, signal_date, offline=offline)
+        if loaded is None:
+            raise RuntimeError("exact-date history unavailable")
+        _meta, history, evidence_source = loaded
         try:
-            _meta, history = auto_history(str(row.get("code") or ""), signal_date, adjust=1)
             history = trim_to_date(history, signal_date)
             prior_highs = [item.high for item in history[-81:-1]]
             target = max(prior_highs) if prior_highs else 0.0
@@ -443,9 +633,11 @@ def candidate_levels(row: dict[str, str], signal_date: date, *, offline: bool = 
             average_amplitude_pct = sum(amplitudes) / len(amplitudes) if amplitudes else 0.0
             atr_pct = atr14 / close if close > 0 else 0.0
             t1_loss_buffer_pct = max(t1_loss_buffer_pct, atr_pct * 2.0, average_amplitude_pct * 1.25)
-        except Exception as exc:  # noqa: BLE001 - missing pressure must fail closed for executable entries.
-            reason_codes.append(f"PRESSURE_DATA_UNAVAILABLE:{type(exc).__name__}")
-            evidence_status = "UNAVAILABLE"
+        except Exception:
+            raise
+    except Exception as exc:  # noqa: BLE001 - missing pressure must fail closed for executable entries.
+        reason_codes.append(f"PRESSURE_DATA_UNAVAILABLE:{type(exc).__name__}")
+        evidence_status = "UNAVAILABLE"
     rr = (target - close) / (close - stop) if target > close > stop else 0.0
     if target <= close:
         reason_codes.append("NO_UPSIDE_PRESSURE_SPACE")
@@ -459,6 +651,7 @@ def candidate_levels(row: dict[str, str], signal_date: date, *, offline: bool = 
         "reason_codes": reason_codes,
         "level_evidence_status": evidence_status,
         "target_price_available": target > 0,
+        "level_evidence_source": evidence_source,
     }
 
 
@@ -475,6 +668,7 @@ def fallback_levels(row: dict[str, str]) -> dict[str, Any]:
         "t1_loss_buffer_pct": board_t1_floor_pct(str(row.get("code") or "")),
         "reason_codes": [],
         "level_evidence_status": "NOT_COMPUTED_WATCH_ONLY",
+        "level_evidence_source": "scan_snapshot",
         "target_price_available": False,
     }
 
@@ -581,6 +775,7 @@ def plan_payload(
         "signal_date": signal_date.isoformat(),
         "symbol": code,
         "stock_name": str(row.get("name") or ""),
+        "industry": str(row.get("industry") or "UNMAPPED"),
         "side": "BUY",
         "volume": shares,
         "status": status,
@@ -595,6 +790,7 @@ def plan_payload(
         "atr14": levels.get("atr14", 0.0),
         "average_amplitude_pct": levels.get("average_amplitude_pct", 0.0),
         "level_evidence_status": levels.get("level_evidence_status", "UNKNOWN"),
+        "level_evidence_source": levels.get("level_evidence_source", "unknown"),
         "target_price_available": bool(levels.get("target_price_available")),
         "t1_loss_buffer_pct": levels.get("t1_loss_buffer_pct", board_t1_floor_pct(code)),
         "t1_risk_budget_amount": safe_float(row.get("close")) * shares * safe_float(levels.get("t1_loss_buffer_pct")),

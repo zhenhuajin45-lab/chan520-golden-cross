@@ -15,7 +15,8 @@ def test_launchd_agents_cover_dashboard_and_daily_phases(tmp_path):
     }
     assert agents["com.tonyyu.chan520.dashboard"]["KeepAlive"] is True
     assert "8768" in agents["com.tonyyu.chan520.dashboard"]["ProgramArguments"]
-    assert len(agents["com.tonyyu.chan520.plan"]["StartCalendarInterval"]) == 5
+    assert len(agents["com.tonyyu.chan520.plan"]["StartCalendarInterval"]) == 10
+    assert "--skip-if-plan-ready" in agents["com.tonyyu.chan520.plan"]["ProgramArguments"]
     assert len(agents["com.tonyyu.chan520.intraday"]["StartCalendarInterval"]) == 75
     opening = {
         (item["Hour"], item["Minute"])

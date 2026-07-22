@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from datetime import date
 
-from scripts.replay_local_sim_watch_only import INDEX_SYMBOLS, index_data_key, run_replay
+from scripts.replay_local_sim_watch_only import (
+    INDEX_SYMBOLS,
+    index_data_key,
+    parse_tencent_day_payload,
+    research_candidates,
+    run_replay,
+)
 
 
 def candidate(symbol: str, priority: int, trigger: float) -> dict:
@@ -69,6 +75,9 @@ def test_replay_uses_explicit_risk_priority_and_never_changes_actual_execution_c
     assert payload["filled_count"] == 1
     assert payload["fills"][0]["symbol"] == "000001"
     assert payload["fills"][0]["volume"] == 1200
+    assert len(payload["individual_candidate_results"]) == 2
+    assert len(payload["ordering_sensitivity"]["variants"]) == 4
+    assert payload["ranked_portfolio"]["ordering"] == "risk_priority"
 
 
 def test_replay_fails_closed_when_index_minutes_are_missing():
@@ -90,3 +99,32 @@ def test_replay_fails_closed_when_index_minutes_are_missing():
     assert payload["status"] == "FAIL_CLOSED"
     assert payload["filled_count"] == 0
     assert payload["data_complete"] is False
+
+
+def test_historical_day_uses_matched_day_prec_and_first_minute_not_realtime_quote():
+    payload = {
+        "data": {
+            "sh600001": {
+                "data": [
+                    {"date": "20260720", "prec": "10.20", "data": ["0930 10.15", "0932 10.30"]}
+                ],
+                "qt": {"sh600001": ["", "示例股票", "", "", "99.00", "98.00"]},
+            }
+        }
+    }
+
+    result = parse_tencent_day_payload(payload, "sh600001", "600001", date(2026, 7, 20))
+
+    assert result["prev_close"] == 10.20
+    assert result["open"] == 10.15
+    assert result["historical_price_fields_source"] == "matched_day.prec_and_first_minute"
+
+
+def test_bear_reconstruction_can_activate_legacy_unknown_watch_sample():
+    row = candidate("600001", 1, 10.0)
+    row.pop("research_only")
+    row.pop("research_cohort")
+    row.update({"geometry_valid": True, "score": 20, "rsi14": 60})
+    core = {"market_regime": {"state": "UNKNOWN"}, "research_regime": {"state": "BEAR"}, "plans": [row]}
+
+    assert [item["symbol"] for item in research_candidates(core)] == ["600001"]

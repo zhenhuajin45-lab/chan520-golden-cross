@@ -30,6 +30,7 @@ data/local_sim/*.sqlite*
 data/local_sim/*.sqlite-wal
 data/local_sim/*.sqlite-shm
 data/local_sim/*.json
+data/market.db*
 web_dashboard/data/local_sim/*.json
 
 # Local scratch files

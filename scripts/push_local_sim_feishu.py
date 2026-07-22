@@ -296,6 +296,7 @@ def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
     readiness = payload.get("readiness") if isinstance(payload.get("readiness"), dict) else {}
     quality = core.get("scan_quality") if isinstance(core.get("scan_quality"), dict) else {}
     supplemental = core.get("supplemental_market_context") if isinstance(core.get("supplemental_market_context"), dict) else {}
+    style = core.get("candidate_style_diagnostic") if isinstance(core.get("candidate_style_diagnostic"), dict) else {}
     elements = [
         div(f"**盘前核心交易计划**\n{trade_date}"),
         fields_block(
@@ -313,6 +314,7 @@ def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
             ]
         ),
         div("**执行边界**\n" + core_plan_boundary(core)),
+        div("**市场宽度与候选风格（诊断，不参与放宽入场）**\n" + style_diagnostic_lines(style)),
         {"tag": "hr"},
         div("**T+1/风控优先**\n" + planned_order_lines(risks)),
         div("**严格待触发**\n" + planned_order_lines(executable)),
@@ -332,6 +334,19 @@ def core_plan_boundary(core: dict[str, Any]) -> str:
     if safe_int(core.get("executable_buy_count")) <= 0:
         return "没有通过严格门槛的可执行买入；观察池不会自动成交。"
     return f"仅 {safe_int(core.get('executable_buy_count'))} 只严格候选可进入盘中二阶段确认。"
+
+
+def style_diagnostic_lines(style: dict[str, Any]) -> str:
+    if not style or style.get("status") == "UNAVAILABLE":
+        return "本次未取得完整风格诊断。"
+    market = style.get("market_breadth") or {}
+    candidate = style.get("candidate_breadth") or {}
+    top = "、".join(str(row.get("sector")) for row in (style.get("top_industries") or [])[:3]) or "-"
+    return (
+        f"全市场上涨占比 {pct(market.get('up_ratio'))}，候选上涨占比 {pct(candidate.get('up_ratio'))}；"
+        f"强势行业 {top}；Top3 行业重合 {pct(style.get('top3_industry_overlap_ratio'))}；"
+        f"偏离预警 {'是' if style.get('mismatch_alert') else '否'}。"
+    )
 
 
 def build_review_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
@@ -380,9 +395,17 @@ def counterfactual_lines(replay: dict[str, Any]) -> str:
     if replay.get("status") == "FAIL_CLOSED":
         return f"数据不完整，回放已关闭：{replay.get('error') or '-'}"
     lines = [
-        f"状态 {replay.get('status') or '-'}，候选 {safe_int(replay.get('candidate_count'))} 只，模拟触发 {safe_int(replay.get('filled_count'))} 只，收盘净盯市 {pnl_text(replay.get('net_mark_pnl'), replay.get('net_mark_return_on_equity'))}。",
+        f"状态 {replay.get('status') or '-'}，研究市场状态 {replay.get('research_market_regime') or '-'}，候选 {safe_int(replay.get('candidate_count'))} 只，排序前两笔触发 {safe_int(replay.get('filled_count'))} 只，收盘净盯市 {pnl_text(replay.get('net_mark_pnl'), replay.get('net_mark_return_on_equity'))}。",
         "该结果不写入模拟盘账本，不代表应当放宽熊市禁买门槛。",
     ]
+    independent = replay.get("individual_candidate_results") or []
+    triggered = sum(safe_int(row.get("filled_count")) > 0 for row in independent)
+    sensitivity = replay.get("ordering_sensitivity") or {}
+    lines.append(
+        f"逐票独立触发 {triggered}/{len(independent)}；排序敏感性净盈亏区间 "
+        f"{yuan(sensitivity.get('worst_net_mark_pnl'))} 至 {yuan(sensitivity.get('best_net_mark_pnl'))}，"
+        f"极差 {yuan(sensitivity.get('spread_net_mark_pnl'))}。"
+    )
     for row in (replay.get("fills") or [])[:4]:
         lines.append(
             f"- {stock_label(row)} {row.get('fill_minute') or '-'} @ {price(row.get('fill_price'))}，收盘 {price(row.get('close_price'))}，净盯市 {pnl_text(row.get('net_mark_pnl'))}"

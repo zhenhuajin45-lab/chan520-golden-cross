@@ -37,6 +37,7 @@ def main() -> int:
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dedupe-window-seconds", type=int, default=90)
     parser.add_argument("--force-run", action="store_true")
+    parser.add_argument("--skip-if-plan-ready", action="store_true", help="Skip a retry when today's PASS plan already exists")
     args = parser.parse_args()
 
     trade_date = resolve_trade_date(args.trade_date)
@@ -44,6 +45,11 @@ def main() -> int:
     run_dir = ROOT / "reports" / "local_sim_daily" / trade_date.replace("-", "")
     run_stamp = now.strftime("%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
+    if args.phase == "plan" and args.skip_if_plan_ready:
+        ready = ready_plan_payload(trade_date)
+        if ready is not None:
+            print(json.dumps(ready, ensure_ascii=False, sort_keys=True), flush=True)
+            return 0
     guard, skip = acquire_run_guard(
         run_dir,
         args.phase,
@@ -93,6 +99,8 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
             step(
                 "generate_core_plan",
                 script("generate_local_sim_core_plan.py", *plan_args),
+                timeout_seconds=600,
+                sla_seconds=300,
             )
         )
         steps.append(export_dashboard_step(trade_date, args.initial_cash))
@@ -181,6 +189,14 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
         )
         steps.append(export_dashboard_step(trade_date, args.initial_cash))
         steps.append(feishu_step(args, trade_date, "review"))
+        steps.append(
+            step(
+                "refresh_local_market_store",
+                script("refresh_local_market_store.py", "--trade-date", trade_date, "--scan-if-missing"),
+                timeout_seconds=3600,
+                sla_seconds=2700,
+            )
+        )
     return [item for item in steps if item]
 
 
@@ -211,8 +227,14 @@ def feishu_step(args: argparse.Namespace, trade_date: str, mode: str) -> dict[st
     return step(f"feishu_{mode}", cmd)
 
 
-def step(name: str, cmd: list[str]) -> dict[str, Any]:
-    return {"name": name, "cmd": cmd}
+def step(
+    name: str,
+    cmd: list[str],
+    *,
+    timeout_seconds: int = 1800,
+    sla_seconds: int | None = None,
+) -> dict[str, Any]:
+    return {"name": name, "cmd": cmd, "timeout_seconds": timeout_seconds, "sla_seconds": sla_seconds}
 
 
 def run_step(step_payload: dict[str, Any], index: int, log_dir: Path) -> dict[str, Any]:
@@ -228,7 +250,8 @@ def run_step(step_payload: dict[str, Any], index: int, log_dir: Path) -> dict[st
         start_new_session=True,
     )
     try:
-        stdout, stderr = proc.communicate(timeout=1800)
+        timeout_seconds = int(step_payload.get("timeout_seconds") or 1800)
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
         returncode = proc.returncode
     except subprocess.TimeoutExpired as exc:
         # Kill the whole step process group: network clients can leave child
@@ -244,7 +267,7 @@ def run_step(step_payload: dict[str, Any], index: int, log_dir: Path) -> dict[st
             stdout, stderr = proc.communicate()
         stdout = stdout or exc.stdout or ""
         stderr = stderr or exc.stderr or ""
-        stderr += "\nstep timed out after 1800 seconds; process group terminated\n"
+        stderr += f"\nstep timed out after {timeout_seconds} seconds; process group terminated\n"
         returncode = 124
     ended = datetime.now(SHANGHAI_TZ)
     prefix = f"{index:02d}_{safe_name(name)}"
@@ -252,12 +275,18 @@ def run_step(step_payload: dict[str, Any], index: int, log_dir: Path) -> dict[st
     stderr_path = log_dir / f"{prefix}.stderr.log"
     stdout_path.write_text(stdout, encoding="utf-8")
     stderr_path.write_text(stderr, encoding="utf-8")
+    duration = (ended - started).total_seconds()
+    sla_seconds = step_payload.get("sla_seconds")
     return {
         "name": name,
         "cmd": redact_cmd(step_payload["cmd"]),
         "returncode": returncode,
         "started_at": started.isoformat(timespec="seconds"),
         "ended_at": ended.isoformat(timespec="seconds"),
+        "duration_seconds": round(duration, 3),
+        "timeout_seconds": int(step_payload.get("timeout_seconds") or 1800),
+        "sla_seconds": sla_seconds,
+        "sla_pass": sla_seconds is None or (returncode == 0 and duration <= float(sla_seconds)),
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
         "stdout_tail": stdout[-2000:],
@@ -266,6 +295,7 @@ def run_step(step_payload: dict[str, Any], index: int, log_dir: Path) -> dict[st
 
 
 def summarize(args: argparse.Namespace, trade_date: str, started_at: datetime, results: list[dict[str, Any]]) -> dict[str, Any]:
+    sla_steps = [item for item in results if item.get("sla_seconds") is not None]
     return {
         "schema_version": "chan520_local_sim_daily_run_v0",
         "generated_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
@@ -275,7 +305,30 @@ def summarize(args: argparse.Namespace, trade_date: str, started_at: datetime, r
         "feishu": args.feishu,
         "dry_run_triggers": bool(args.dry_run_triggers),
         "status": "PASS" if all(item["returncode"] == 0 for item in results) else "FAIL",
+        "operational_sla": {
+            "status": "PASS" if all(item.get("sla_pass") for item in sla_steps) else "FAIL",
+            "measured_step_count": len(sla_steps),
+            "failed_steps": [item["name"] for item in sla_steps if not item.get("sla_pass")],
+        },
         "steps": results,
+    }
+
+
+def ready_plan_payload(trade_date: str) -> dict[str, Any] | None:
+    path = ROOT / "reports" / "local_sim_plan" / trade_date.replace("-", "") / "core_plan.json"
+    payload = read_json(path, {})
+    if payload.get("trade_date") != trade_date or payload.get("status") != "PASS":
+        return None
+    generated = parse_iso_datetime(payload.get("generated_at"))
+    if generated is None or generated.astimezone(SHANGHAI_TZ).date().isoformat() != trade_date:
+        return None
+    return {
+        "phase": "plan",
+        "trade_date": trade_date,
+        "status": "SKIPPED_PLAN_READY",
+        "reason": "CURRENT_PASS_PLAN_ALREADY_EXISTS",
+        "plan_path": str(path),
+        "generated_at": payload.get("generated_at"),
     }
 
 

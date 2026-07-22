@@ -59,7 +59,9 @@ def build_agents(root: Path, log_dir: Path) -> dict[str, dict[str, Any]]:
         },
     }
 
-    def scheduled(label: str, phase: str, times: list[tuple[int, int]], feishu: str) -> dict[str, Any]:
+    def scheduled(
+        label: str, phase: str, times: list[tuple[int, int]], feishu: str, extra_args: list[str] | None = None
+    ) -> dict[str, Any]:
         return {
             "Label": label,
             "ProgramArguments": [
@@ -72,6 +74,7 @@ def build_agents(root: Path, log_dir: Path) -> dict[str, dict[str, Any]]:
                 "--feishu",
                 feishu,
                 "--continue-on-error",
+                *(extra_args or []),
             ],
             "StartCalendarInterval": weekday_intervals(times),
             "StandardOutPath": str(log_dir / f"{label}.stdout.log"),
@@ -104,7 +107,7 @@ def build_agents(root: Path, log_dir: Path) -> dict[str, dict[str, Any]]:
             "StandardErrorPath": str(log_dir / f"{dashboard_label}.stderr.log"),
             **common,
         },
-        plan_label: scheduled(plan_label, "plan", [(8, 0)], "send"),
+        plan_label: scheduled(plan_label, "plan", [(8, 0), (8, 15)], "send", ["--skip-if-plan-ready"]),
         preopen_label: scheduled(preopen_label, "preopen", [(9, 20)], "off"),
         intraday_label: scheduled(
             intraday_label,

@@ -499,6 +499,7 @@ def load_core_plan(trade_date: str) -> dict[str, Any]:
         "scan_quality": payload.get("scan_quality") or {},
         "market_regime": payload.get("market_regime") or {},
         "supplemental_market_context": payload.get("supplemental_market_context") or {},
+        "candidate_style_diagnostic": payload.get("candidate_style_diagnostic") or {},
         "research_warnings": payload.get("research_warnings") or [],
         "research_cohorts": payload.get("research_cohorts") or {},
         "geometry_blocked_count": geometry_blocked_count,
@@ -527,6 +528,7 @@ def load_core_plan_failure(trade_date: str) -> dict[str, Any]:
         "scan_quality": {},
         "market_regime": {},
         "supplemental_market_context": {},
+        "candidate_style_diagnostic": {},
         "research_warnings": [],
         "research_cohorts": {},
         "geometry_blocked_count": 0,
@@ -558,6 +560,12 @@ def load_counterfactual_replay(trade_date: str) -> dict[str, Any]:
         "data_complete": payload.get("data_complete"),
         "error": payload.get("error", ""),
         "generated_at": payload.get("generated_at"),
+        "research_market_regime": payload.get("research_market_regime"),
+        "research_regime": payload.get("research_regime") or {},
+        "historical_date_integrity": payload.get("historical_date_integrity"),
+        "ranked_portfolio": payload.get("ranked_portfolio") or {},
+        "individual_candidate_results": payload.get("individual_candidate_results") or [],
+        "ordering_sensitivity": payload.get("ordering_sensitivity") or {},
     }
 
 
