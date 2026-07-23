@@ -340,7 +340,8 @@ def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
                 ("仅观察", f"{len(watches)} 只"),
                 ("风控候选", f"{len(risks)} 只"),
                 ("计划状态", core.get("status") or "-"),
-                ("扫描覆盖率", pct(quality.get("coverage"))),
+                ("研究覆盖率", pct(quality.get("coverage"))),
+                ("执行级覆盖率", pct(quality.get("execution_coverage"))),
                 ("市场状态", (core.get("market_regime") or {}).get("state") or "-"),
                 ("同花顺旁路", supplemental.get("emotion_label") or supplemental.get("status") or "-"),
                 ("风险闭环", ready_label(readiness.get("local_sim_risk_loop_ready"))),
@@ -495,6 +496,14 @@ def counterfactual_lines(replay: dict[str, Any]) -> str:
         lines.append(
             f"- {stock_label(row)} {row.get('fill_minute') or '-'} @ {price(row.get('fill_price'))}，收盘 {price(row.get('close_price'))}，净盯市 {pnl_text(row.get('net_mark_pnl'))}"
         )
+    all_summary = replay.get("all_candidate_close_summary") or {}
+    if all_summary:
+        lines.append(
+            f"全观察池收盘覆盖 {safe_int(all_summary.get('available_count'))}/{safe_int(all_summary.get('candidate_count'))}，"
+            f"平均 {pct_points(all_summary.get('mean_close_return_pct'))}，中位 {pct_points(all_summary.get('median_close_return_pct'))}；"
+            f"几何有效平均 {pct_points(all_summary.get('geometry_valid_mean_close_return_pct'))}，"
+            f"几何无效平均 {pct_points(all_summary.get('invalid_geometry_mean_close_return_pct'))}。"
+        )
     return "\n".join(lines)
 
 
@@ -618,7 +627,25 @@ def pick_reason(row: dict[str, Any], order: dict[str, Any], key: str) -> Any:
     return value if str(value or "").strip() else order.get(key)
 
 
-def send_card(webhook: str, payload: dict[str, Any], *, timeout: int = 8) -> dict[str, Any]:
+def send_card(
+    webhook: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int = 8,
+    attempts: int = 4,
+    backoff_seconds: float = 1.0,
+) -> dict[str, Any]:
+    last_result: dict[str, Any] = {"ok": False, "error": "not_attempted"}
+    for attempt in range(1, max(attempts, 1) + 1):
+        last_result = _send_card_once(webhook, payload, timeout=timeout)
+        last_result["attempts"] = attempt
+        if last_result.get("ok") or not retryable_feishu_result(last_result) or attempt >= attempts:
+            return last_result
+        time.sleep(backoff_seconds * (2 ** (attempt - 1)))
+    return last_result
+
+
+def _send_card_once(webhook: str, payload: dict[str, Any], *, timeout: int) -> dict[str, Any]:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})
     try:
@@ -634,6 +661,18 @@ def send_card(webhook: str, payload: dict[str, Any], *, timeout: int = 8) -> dic
     if str(response.get("msg", "")).lower() not in {"", "success", "ok"}:
         ok = ok and response.get("code") in (0, "0")
     return {"ok": bool(ok), "response": response}
+
+
+def retryable_feishu_result(result: dict[str, Any]) -> bool:
+    if result.get("error"):
+        return True
+    response = result.get("response") if isinstance(result.get("response"), dict) else {}
+    try:
+        code = int(response.get("code"))
+    except (TypeError, ValueError):
+        code = 0
+    message = str(response.get("msg") or "").lower()
+    return code in {11232, 99991663} or "frequency" in message or "rate" in message
 
 
 def resolve_webhook() -> tuple[str, str]:
@@ -829,6 +868,11 @@ def price(value: Any) -> str:
 def pct(value: Any) -> str:
     num = safe_float(value, float("nan"))
     return "-" if num != num else f"{num * 100:.2f}%"
+
+
+def pct_points(value: Any) -> str:
+    num = safe_float(value, float("nan"))
+    return "-" if num != num else f"{num:+.2f}%"
 
 
 def short_time(value: Any) -> str:
