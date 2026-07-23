@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from chan520_skill.broker_adapter import BrokerOrderRequest, BrokerSide, LocalSimBrokerAdapter, LocalSimBrokerConfig
@@ -205,3 +206,33 @@ def test_core_dashboard_embeds_isolated_bear_pilot_account(tmp_path):
     assert research["core_account_affected"] is False
     assert research["gm_submit_enabled"] is False
     assert research["planned_orders"][0]["stock_name"] == "天目药业"
+
+
+def test_counterfactual_export_includes_sampling_and_full_pool_metrics(tmp_path, monkeypatch):
+    report_dir = tmp_path / "reports" / "local_sim_counterfactual" / "20260723"
+    report_dir.mkdir(parents=True)
+    (report_dir / "watch_only_replay.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "position_cap_pct": 0.025,
+                "max_exposure_pct": 0.05,
+                "sampling_interval_minutes": 2,
+                "all_candidate_independent_results": [{"symbol": "600012"}],
+                "all_candidate_close_summary": {
+                    "candidate_count": 21,
+                    "mean_close_return_pct": -0.341039,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exporter, "ROOT", tmp_path)
+
+    replay = exporter.load_counterfactual_replay("2026-07-23")
+
+    assert replay["position_cap_pct"] == 0.025
+    assert replay["max_exposure_pct"] == 0.05
+    assert replay["sampling_interval_minutes"] == 2
+    assert replay["all_candidate_independent_results"][0]["symbol"] == "600012"
+    assert replay["all_candidate_close_summary"]["candidate_count"] == 21
