@@ -10,6 +10,7 @@ import urllib.request
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
+from statistics import mean, median
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -19,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.execute_local_sim_triggers import CORE_PLAN_POLICY_ID, evaluate_plan, plan_rank
 from scripts.generate_local_sim_core_plan import resolve_market_regime
+from chan520_skill.execution_policy import BEAR_PILOT_POSITION_PCT
 from chan520_skill.market_store import (
     DEFAULT_PATH as MARKET_STORE,
     load_minute_day,
@@ -29,9 +31,10 @@ from chan520_skill.market_store import (
 TZ = ZoneInfo("Asia/Shanghai")
 INDEX_SYMBOLS = ("000001", "399001", "399006", "000688")
 POLICY_ID = "watch_only_counterfactual_v1"
-REPLAY_MINUTES = (
-    "0930", "0932", "0934", "0936", "0938", "0940", "0942", "0944", "0951",
-    "1031", "1115", "1311", "1401", "1431", "1451",
+REPLAY_MINUTES = tuple(
+    f"{hour:02d}{minute:02d}"
+    for start, end in ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
+    for hour, minute in (divmod(total_minutes, 60) for total_minutes in range(start, end, 2))
 )
 
 
@@ -65,10 +68,14 @@ def main() -> int:
         print(json.dumps(summary(payload), ensure_ascii=False, sort_keys=True), flush=True)
         return 0
     try:
-        market_data = {
-            str(row.get("symbol") or ""): fetch_market_day(str(row.get("symbol") or ""), trade_date, is_index=False)
-            for row in candidates
-        }
+        market_data: dict[str, dict[str, Any]] = {}
+        market_data_errors: dict[str, str] = {}
+        for row in all_plan_candidates(core_plan):
+            symbol = str(row.get("symbol") or "")
+            try:
+                market_data[symbol] = fetch_market_day(symbol, trade_date, is_index=False)
+            except Exception as exc:  # noqa: BLE001 - optional full-candidate evidence is best effort.
+                market_data_errors[symbol] = f"{type(exc).__name__}: {exc}"
         market_data.update(
             {index_data_key(symbol): fetch_market_day(symbol, trade_date, is_index=True) for symbol in INDEX_SYMBOLS}
         )
@@ -80,6 +87,7 @@ def main() -> int:
             max_fills=args.max_fills,
             max_exposure_pct=args.max_exposure_pct,
         )
+        payload["minute_data_errors"] = market_data_errors
     except (KeyError, ValueError, TimeoutError, OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         payload = failure_payload(core_plan, trade_date, candidates, f"{type(exc).__name__}: {exc}")
     payload["plan_path"] = str(plan_path)
@@ -107,6 +115,20 @@ def research_candidates(core_plan: dict[str, Any]) -> list[dict[str, Any]]:
                 or legacy_research_shape(row)
             )
             and str(row.get("status") or "").upper() == "WATCH_ONLY"
+        ],
+        key=plan_rank,
+    )
+
+
+def all_plan_candidates(core_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    plans = core_plan.get("plans") if isinstance(core_plan.get("plans"), list) else []
+    return sorted(
+        [
+            row
+            for row in plans
+            if isinstance(row, dict)
+            and str(row.get("status") or "").upper() == "WATCH_ONLY"
+            and str(row.get("symbol") or "")
         ],
         key=plan_rank,
     )
@@ -232,6 +254,8 @@ def run_replay(
             "data_complete": True,
             "max_fills": max_fills,
             "max_exposure_pct": max_exposure_pct,
+            "position_cap_pct": BEAR_PILOT_POSITION_PCT,
+            "sampling_interval_minutes": 2,
             "replay_equity": round(effective_equity, 2),
             "ranked_portfolio": {"ordering": "risk_priority", **ranked},
             "individual_candidate_results": independent,
@@ -243,6 +267,9 @@ def run_replay(
             },
         }
     )
+    all_results, all_summary = all_candidate_performance(core_plan, market_data, trade_date, effective_equity)
+    payload["all_candidate_independent_results"] = all_results
+    payload["all_candidate_close_summary"] = all_summary
     return payload
 
 
@@ -336,7 +363,7 @@ def simulate_portfolio(
 def replay_plan(source: dict[str, Any], equity: float) -> dict[str, Any]:
     plan = copy.deepcopy(source)
     reference = float(plan.get("signal_close") or plan.get("trigger_price") or plan.get("upper_price") or 0)
-    volume = int((equity * 0.05 / reference) // 100) * 100 if reference > 0 else 0
+    volume = int((equity * BEAR_PILOT_POSITION_PCT / reference) // 100) * 100 if reference > 0 else 0
     payload = copy.deepcopy(plan)
     payload["market_regime"] = "NORMAL"
     payload["local_sim_execution_policy_id"] = CORE_PLAN_POLICY_ID
@@ -351,6 +378,69 @@ def replay_plan(source: dict[str, Any], equity: float) -> dict[str, Any]:
         }
     )
     return plan
+
+
+def all_candidate_performance(
+    core_plan: dict[str, Any],
+    market_data: dict[str, dict[str, Any]],
+    trade_date: date,
+    equity: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    candidates = all_plan_candidates(core_plan)
+    rows: list[dict[str, Any]] = []
+    indices_ready = all(index_data_key(symbol) in market_data for symbol in INDEX_SYMBOLS)
+    for candidate in candidates:
+        symbol = str(candidate.get("symbol") or "")
+        day = market_data.get(symbol) or {}
+        minutes = day.get("minutes") if isinstance(day.get("minutes"), dict) else {}
+        if not minutes:
+            continue
+        close = float(minutes[max(minutes)])
+        prev_close = float(day.get("prev_close") or 0)
+        prices = [float(value) for value in minutes.values()]
+        replay = (
+            simulate_portfolio([candidate], market_data, trade_date, equity, max_fills=1, max_exposure_pct=0.05)
+            if indices_ready
+            else {}
+        )
+        rows.append(
+            {
+                "symbol": symbol,
+                "stock_name": str(candidate.get("stock_name") or day.get("name") or ""),
+                "execution_priority": candidate.get("execution_priority"),
+                "score": candidate.get("score"),
+                "geometry_valid": candidate.get("geometry_valid") is True,
+                "signal_history_source": candidate.get("signal_history_source"),
+                "prev_close": prev_close,
+                "open": float(day.get("open") or prices[0]),
+                "high": max(prices),
+                "low": min(prices),
+                "close": close,
+                "close_return_pct": round((close / prev_close - 1) * 100, 6) if prev_close else 0.0,
+                "independent_filled_count": int(replay.get("filled_count") or 0),
+                "independent_net_mark_pnl": float(replay.get("net_mark_pnl") or 0),
+                "latest_decisions": replay.get("latest_decisions") or {},
+            }
+        )
+    returns = [float(row["close_return_pct"]) for row in rows]
+    valid_returns = [float(row["close_return_pct"]) for row in rows if row["geometry_valid"]]
+    invalid_returns = [float(row["close_return_pct"]) for row in rows if not row["geometry_valid"]]
+    return rows, {
+        "candidate_count": len(candidates),
+        "available_count": len(rows),
+        "coverage": len(rows) / len(candidates) if candidates else 0.0,
+        "mean_close_return_pct": round(mean(returns), 6) if returns else 0.0,
+        "median_close_return_pct": round(median(returns), 6) if returns else 0.0,
+        "positive_count": sum(value > 0 for value in returns),
+        "negative_count": sum(value < 0 for value in returns),
+        "geometry_valid_count": len(valid_returns),
+        "geometry_valid_mean_close_return_pct": round(mean(valid_returns), 6) if valid_returns else 0.0,
+        "invalid_geometry_count": len(invalid_returns),
+        "invalid_geometry_mean_close_return_pct": round(mean(invalid_returns), 6) if invalid_returns else 0.0,
+        "independent_triggered_count": sum(row["independent_filled_count"] > 0 for row in rows),
+        "best": max(rows, key=lambda row: row["close_return_pct"]) if rows else {},
+        "worst": min(rows, key=lambda row: row["close_return_pct"]) if rows else {},
+    }
 
 
 def market_context_at(market_data: dict[str, dict[str, Any]], minute: str, trade_date: date) -> dict[str, Any]:
