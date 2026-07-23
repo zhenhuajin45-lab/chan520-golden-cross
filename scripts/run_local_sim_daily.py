@@ -206,7 +206,13 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
         steps.append(
             step(
                 "refresh_local_market_store",
-                script("refresh_local_market_store.py", "--trade-date", trade_date, "--scan-if-missing"),
+                script(
+                    "refresh_local_market_store.py",
+                    "--trade-date",
+                    trade_date,
+                    "--scan-if-missing",
+                    "--rescan-unqualified",
+                ),
                 timeout_seconds=3600,
                 sla_seconds=2700,
             )
