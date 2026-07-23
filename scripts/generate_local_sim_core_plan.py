@@ -40,6 +40,8 @@ from chan520_skill.market_store import (  # noqa: E402
     upsert_sectors,
 )
 from chan520_skill.regime import evaluate_regime, index_history, tencent_index_history  # noqa: E402
+from chan520_skill.scan_quality import execution_history_adjusted as source_is_adjusted  # noqa: E402
+from chan520_skill.scan_quality import normalize_scan_quality  # noqa: E402
 from chan520_skill.scanner import scan_market  # noqa: E402
 
 
@@ -82,7 +84,7 @@ def main() -> int:
     if restored_scan is not None:
         restore_scan_files(scan_path, signal_date, *restored_scan)
     if not scan_path.exists() and args.refresh_scan_if_missing:
-        _csv_path, _md_path, scan_stats = scan_market(signal_date, scan_path.parent, max_workers=16)
+        _csv_path, _md_path, scan_stats = scan_market(signal_date, scan_path.parent, max_workers=8)
     if not scan_path.exists():
         raise SystemExit(f"FAIL_CLOSED: prior-session scan missing: {scan_path}")
 
@@ -203,7 +205,7 @@ def resolve_market_regime(signal_date: date, *, offline: bool = False) -> dict[s
 
 def mapped_regime(state: Any, source: str) -> dict[str, Any]:
     mapped = {"trend_up": "BULL", "range": "NORMAL", "down": "BEAR"}.get(state.regime, "UNKNOWN")
-    return {"state": mapped, "regime_ok": mapped in {"BULL", "NORMAL"}, "source": source, "detail": state.detail}
+    return {"state": mapped, "regime_ok": bool(state.regime_ok), "source": source, "detail": state.detail}
 
 
 def read_scan(path: Path) -> list[dict[str, str]]:
@@ -248,8 +250,8 @@ def load_candidate_history(code: str, target: date, *, offline: bool) -> tuple[A
         errors = []
         for source, loader, kwargs in (
             ("tencent", tencent_history, {"adjust": "qfq"}),
-            ("sina_unadjusted", sina_history, {}),
             ("eastmoney", eastmoney_history, {"adjust": 1}),
+            ("sina_unadjusted", sina_history, {}),
         ):
             try:
                 meta, rows = loader(code, target, **kwargs)
@@ -394,8 +396,12 @@ def generate_plan(
     pilot_plans: list[dict[str, Any]] = []
     pilot_planned_gross = 0.0
     pilot_equity = account_equity(pilot_adapter) if pilot_adapter else 0.0
-    scan_quality = scan_quality or {"coverage_pass": True, "coverage": 1.0, "minimum_coverage": 0.85}
-    strict_enabled = bool(regime.get("regime_ok")) and bool(scan_quality.get("coverage_pass"))
+    scan_quality = normalize_scan_quality(scan_quality, rows=scan_rows)
+    strict_enabled = (
+        bool(regime.get("regime_ok"))
+        and bool(scan_quality.get("coverage_pass"))
+        and bool(scan_quality.get("execution_coverage_pass"))
+    )
 
     for rank, (row, levels) in enumerate(strict_candidates, start=1):
         zone = entry_zone(row, levels)
@@ -415,6 +421,8 @@ def generate_plan(
                 reasons.append("MARKET_REGIME_BLOCKED")
             if not scan_quality.get("coverage_pass"):
                 reasons.append("SCAN_COVERAGE_BLOCKED")
+            if not scan_quality.get("execution_coverage_pass"):
+                reasons.append("SCAN_EXECUTION_COVERAGE_BLOCKED")
         if levels["rr"] < 2.0:
             reasons.append("RR_TOO_LOW")
         if not adjusted_history:
@@ -479,6 +487,7 @@ def generate_plan(
                 close = safe_float(row.get("close"))
                 pilot_eligible = (
                     scan_quality.get("coverage_pass") is True
+                    and scan_quality.get("execution_coverage_pass") is True
                     and execution_history_adjusted(row)
                     and pilot_zone.get("geometry_valid") is True
                     and safe_float(pilot_levels.get("rr")) >= BEAR_PILOT_MIN_RR
@@ -514,7 +523,13 @@ def generate_plan(
         adapter.record_planned_order(plan)
         audits.append(plan)
 
-    status = "PASS" if regime.get("state") != "UNKNOWN" and scan_quality.get("coverage_pass") else "FAIL_CLOSED"
+    status = (
+        "PASS"
+        if regime.get("state") != "UNKNOWN"
+        and scan_quality.get("coverage_pass")
+        and scan_quality.get("execution_coverage_pass")
+        else "FAIL_CLOSED"
+    )
     style_diagnostic = build_style_diagnostic(signal_date, ordered, audits, sector_map)
     return {
         "schema_version": "chan520_local_sim_core_plan_v2",
@@ -638,43 +653,31 @@ def load_supplemental_market_context(signal_date: date) -> dict[str, Any]:
 
 def resolve_scan_quality(scan_path: Path, supplied: dict[str, Any] | None = None) -> dict[str, Any]:
     if supplied is not None:
-        universe = safe_int(supplied.get("universe"))
-        success = safe_int(supplied.get("success", supplied.get("rows")))
-        coverage = success / universe if universe else 0.0
-        return {
-            **supplied,
-            "coverage": coverage,
-            "minimum_coverage": 0.85,
-            "coverage_pass": coverage >= 0.85,
-        }
+        return normalize_scan_quality(supplied)
     scan_date = scan_path.stem.removeprefix("market_scan_")
     quality_path = scan_path.parent / f"scan_quality_{scan_date}.json"
     if quality_path.exists():
         try:
             payload = json.loads(quality_path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
-                return payload
+                return normalize_scan_quality(payload)
         except (OSError, json.JSONDecodeError):
             pass
     markdown_path = scan_path.with_suffix(".md")
     try:
         text = markdown_path.read_text(encoding="utf-8")
     except OSError:
-        return {"coverage": 0.0, "minimum_coverage": 0.85, "coverage_pass": False, "reason": "scan_quality_missing"}
+        return normalize_scan_quality({"reason": "scan_quality_missing"})
     universe_match = re.search(r"合计\s*(\d+)\s*只", text)
     success_match = re.search(r"成功输出[：:]\s*(\d+)\s*只", text)
     universe = int(universe_match.group(1)) if universe_match else 0
     success = int(success_match.group(1)) if success_match else 0
-    coverage = success / universe if universe else 0.0
-    return {
+    return normalize_scan_quality({
         "universe": universe,
         "success": success,
         "failures": max(universe - success, 0),
-        "coverage": coverage,
-        "minimum_coverage": 0.85,
-        "coverage_pass": coverage >= 0.85,
         "source": "markdown_fallback",
-    }
+    })
 
 
 def strict_scan_pass(row: dict[str, str]) -> bool:
@@ -689,7 +692,7 @@ def strict_scan_pass(row: dict[str, str]) -> bool:
 
 
 def execution_history_adjusted(row: dict[str, Any]) -> bool:
-    return str(row.get("history_source") or "legacy_adjusted_unknown") != "sina_unadjusted"
+    return source_is_adjusted(row.get("history_source"))
 
 
 def watch_scan_pass(row: dict[str, str]) -> bool:
