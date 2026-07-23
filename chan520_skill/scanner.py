@@ -18,6 +18,7 @@ import requests
 
 from .data import DataError, eastmoney_history, normalize_code, sina_history, tencent_kline_payload, trim_to_date
 from .models import KLine, StockMeta
+from .scan_quality import normalize_scan_quality
 from .strategy import analyze
 from .indicators import fmt
 
@@ -310,8 +311,9 @@ def _fetch_akshare_universe() -> list[UniverseStock]:
 def scan_market(
     target: date,
     output_dir: Path,
-    max_workers: int = 16,
+    max_workers: int = 8,
     include_observe: bool = True,
+    recovery_attempts: int = 1,
 ) -> tuple[Path, Path, dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     universe, universe_metadata = resolve_hs_universe(target=target, reports_root=output_dir.parent)
@@ -321,32 +323,50 @@ def scan_market(
         flush=True,
     )
     rows: list[ScanRow] = []
-    failures = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {pool.submit(_scan_one, stock, target): stock for stock in universe}
-        completed = 0
-        for future in as_completed(future_map):
-            completed += 1
-            result = future.result()
-            if result is None:
-                failures += 1
-            elif include_observe or result.verdict != "不入选":
-                rows.append(result)
-            if completed % 10 == 0:
-                print(f"scan progress: {completed}/{len(universe)}, rows={len(rows)}, failures={failures}", flush=True)
+    failed_stocks = _scan_batch(
+        universe,
+        target,
+        rows,
+        max_workers=max_workers,
+        include_observe=include_observe,
+        label="scan",
+    )
+    initial_failures = len(failed_stocks)
+    for attempt in range(1, max(recovery_attempts, 0) + 1):
+        if not failed_stocks:
+            break
+        time.sleep(float(attempt))
+        retry_rows: list[ScanRow] = []
+        failed_stocks = _scan_batch(
+            failed_stocks,
+            target,
+            retry_rows,
+            max_workers=max(2, min(max_workers, 4)),
+            include_observe=include_observe,
+            label=f"recovery-{attempt}",
+        )
+        rows.extend(retry_rows)
+    failures = len(failed_stocks)
 
     rows.sort(key=lambda row: (row.verdict != "入选", -row.score, -row.satisfied_count, row.code))
     csv_path = output_dir / f"market_scan_{target.isoformat()}.csv"
     md_path = output_dir / f"market_scan_{target.isoformat()}.md"
     _write_csv(csv_path, rows)
     _write_markdown(md_path, rows, len(universe), failures, target)
-    stats = {
+    raw_stats = {
         **universe_metadata,
-        "history_source_policy": ["tencent_qfq", "sina_unadjusted", "eastmoney_qfq"],
+        "history_source_policy": [
+            "tencent_qfq",
+            "tencent_qfq_plus_sina_exact",
+            "eastmoney_qfq",
+            "sina_unadjusted",
+        ],
         "history_source_counts": dict(Counter(row.history_source for row in rows)),
         "universe": len(universe),
         "rows": len(rows),
         "failures": failures,
+        "initial_failures": initial_failures,
+        "recovered": max(initial_failures - failures, 0),
         "selected": sum(1 for row in rows if row.verdict == "入选"),
         "watch": sum(1 for row in rows if row.verdict.startswith("观察")),
         "not_selected": sum(1 for row in rows if row.verdict == "不入选"),
@@ -355,10 +375,16 @@ def scan_market(
         "suspended": 0,
         "insufficient": 0,
     }
-    success_rate = len(rows) / len(universe) if universe else 0.0
-    stats["coverage_below_threshold"] = success_rate < 0.85
-    if stats["coverage_below_threshold"]:
-        print(f"WARNING: scan coverage {success_rate:.2%} below 85% threshold", flush=True)
+    stats = normalize_scan_quality(raw_stats)
+    stats["coverage_below_threshold"] = not stats["coverage_pass"]
+    if not stats["coverage_pass"]:
+        print(f"WARNING: research scan coverage {stats['coverage']:.2%} below 85% threshold", flush=True)
+    if not stats["execution_coverage_pass"]:
+        print(
+            f"WARNING: adjusted execution coverage {stats['execution_coverage']:.2%} below "
+            f"{stats['minimum_execution_coverage']:.0%} threshold",
+            flush=True,
+        )
     quality_path = output_dir / f"scan_quality_{target.isoformat()}.json"
     quality_path.write_text(
         json.dumps(
@@ -366,9 +392,6 @@ def scan_market(
                 "schema_version": "chan520_open_source_scan_quality_v1",
                 "target_date": target.isoformat(),
                 **stats,
-                "coverage": success_rate,
-                "minimum_coverage": 0.85,
-                "coverage_pass": success_rate >= 0.85,
             },
             ensure_ascii=False,
             indent=2,
@@ -379,30 +402,59 @@ def scan_market(
     return csv_path, md_path, stats
 
 
+def _scan_batch(
+    stocks: list[UniverseStock],
+    target: date,
+    rows: list[ScanRow],
+    *,
+    max_workers: int,
+    include_observe: bool,
+    label: str,
+) -> list[UniverseStock]:
+    failed: list[UniverseStock] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {pool.submit(_scan_one, stock, target): stock for stock in stocks}
+        for completed, future in enumerate(as_completed(future_map), 1):
+            stock = future_map[future]
+            result = future.result()
+            if result is None:
+                failed.append(stock)
+            elif include_observe or result.verdict != "不入选":
+                rows.append(result)
+            if completed % 10 == 0:
+                print(
+                    f"{label} progress: {completed}/{len(stocks)}, rows={len(rows)}, failures={len(failed)}",
+                    flush=True,
+                )
+    return failed
+
+
 def _scan_one(stock: UniverseStock, target: date) -> ScanRow | None:
     try:
         klines = _tencent_kline(stock, target)
-        rows = trim_to_date(klines, target)
+        if klines and klines[-1].date == target:
+            rows = trim_to_date(klines, target)
+            history_source = "tencent_qfq"
+        else:
+            rows = _append_sina_exact_to_qfq(stock, klines, target)
+            history_source = "tencent_qfq_plus_sina_exact"
         report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
-        history_source = "tencent_qfq"
     except Exception:
         try:
-            _meta, rows = sina_history(stock.code, target, timeout=5)
+            meta, rows = eastmoney_history(stock.code, target, timeout=5)
             rows = trim_to_date(rows, target)
-            report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
-            history_source = "sina_unadjusted"
+            report = analyze(
+                StockMeta(code=stock.code, name=meta.name or stock.name, market=stock.market),
+                rows,
+                target,
+            )
+            history_source = "eastmoney_qfq"
         except Exception:
             try:
-                # Keep the final fallback bounded. auto_history retries
-                # Tencent again with larger defaults when Eastmoney fails.
-                meta, rows = eastmoney_history(stock.code, target, timeout=5)
+                _meta, rows = sina_history(stock.code, target, timeout=5)
                 rows = trim_to_date(rows, target)
-                report = analyze(
-                    StockMeta(code=stock.code, name=meta.name or stock.name, market=stock.market),
-                    rows,
-                    target,
-                )
-                history_source = "eastmoney_qfq"
+                report = analyze(StockMeta(code=stock.code, name=stock.name, market=stock.market), rows, target)
+                history_source = "sina_unadjusted"
             except Exception:
                 return None
     score = sum(
@@ -435,6 +487,46 @@ def _scan_one(stock: UniverseStock, target: date) -> ScanRow | None:
         volume_ratio=fmt(report.indicator.volume_ratio),
         ma5_slope=fmt(report.indicator.slope5_deg),
     )
+
+
+def _append_sina_exact_to_qfq(
+    stock: UniverseStock,
+    qfq_rows: list[KLine],
+    target: date,
+    *,
+    boundary_tolerance: float = 0.002,
+) -> list[KLine]:
+    if not qfq_rows or qfq_rows[-1].date >= target:
+        raise DataError(f"Tencent qfq history is not appendable for {stock.code} on {target}")
+    _meta, raw_rows = sina_history(stock.code, target, timeout=5)
+    raw_target = next((row for row in reversed(raw_rows) if row.date == target), None)
+    raw_previous = next((row for row in reversed(raw_rows) if row.date < target), None)
+    qfq_previous = qfq_rows[-1]
+    if raw_target is None or raw_previous is None or qfq_previous.date != raw_previous.date:
+        raise DataError(f"hybrid history date boundary mismatch for {stock.code} on {target}")
+    relative_gap = abs(qfq_previous.close - raw_previous.close) / raw_previous.close if raw_previous.close else 1.0
+    if relative_gap > boundary_tolerance:
+        raise DataError(
+            f"hybrid history price boundary mismatch for {stock.code}: "
+            f"qfq={qfq_previous.close:.4f} raw={raw_previous.close:.4f}"
+        )
+    change = raw_target.close - qfq_previous.close
+    pct_chg = change / qfq_previous.close * 100 if qfq_previous.close else 0.0
+    amplitude = (raw_target.high - raw_target.low) / qfq_previous.close * 100 if qfq_previous.close else 0.0
+    target_row = KLine(
+        date=target,
+        open=raw_target.open,
+        close=raw_target.close,
+        high=raw_target.high,
+        low=raw_target.low,
+        volume=raw_target.volume,
+        amount=raw_target.amount,
+        amplitude=amplitude,
+        pct_chg=pct_chg,
+        change=change,
+        turnover=raw_target.turnover,
+    )
+    return [*qfq_rows, target_row]
 
 
 def _tencent_kline(stock: UniverseStock, end: date, timeout: int = 5) -> list[KLine]:
