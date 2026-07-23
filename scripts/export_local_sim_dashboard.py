@@ -24,6 +24,7 @@ from chan520_skill.execution_policy import (
     BEAR_PILOT_POSITION_PCT,
     CORE_ACCOUNT_ID,
 )
+from chan520_skill.scan_quality import normalize_scan_quality
 from chan520_skill.microstructure import price_limit
 
 
@@ -559,7 +560,7 @@ def load_core_plan(trade_date: str) -> dict[str, Any]:
         "executable_buy_count": payload.get("executable_buy_count", 0),
         "strict_scan_count": payload.get("strict_scan_count", 0),
         "watch_scan_count": payload.get("watch_scan_count", 0),
-        "scan_quality": payload.get("scan_quality") or {},
+        "scan_quality": normalize_scan_quality(payload.get("scan_quality") or {}),
         "market_regime": payload.get("market_regime") or {},
         "supplemental_market_context": payload.get("supplemental_market_context") or {},
         "candidate_style_diagnostic": payload.get("candidate_style_diagnostic") or {},
@@ -618,6 +619,9 @@ def load_counterfactual_replay(trade_date: str) -> dict[str, Any]:
         "candidate_symbols": payload.get("candidate_symbols") or [],
         "filled_count": payload.get("filled_count", 0),
         "fills": payload.get("fills") or [],
+        "position_cap_pct": payload.get("position_cap_pct"),
+        "max_exposure_pct": payload.get("max_exposure_pct"),
+        "sampling_interval_minutes": payload.get("sampling_interval_minutes"),
         "net_mark_pnl": payload.get("net_mark_pnl", 0),
         "net_mark_return_on_equity": payload.get("net_mark_return_on_equity", 0),
         "replay_equity": payload.get("replay_equity", 0),
@@ -630,6 +634,8 @@ def load_counterfactual_replay(trade_date: str) -> dict[str, Any]:
         "ranked_portfolio": payload.get("ranked_portfolio") or {},
         "individual_candidate_results": payload.get("individual_candidate_results") or [],
         "ordering_sensitivity": payload.get("ordering_sensitivity") or {},
+        "all_candidate_independent_results": payload.get("all_candidate_independent_results") or [],
+        "all_candidate_close_summary": payload.get("all_candidate_close_summary") or {},
     }
 
 
