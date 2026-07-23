@@ -263,6 +263,7 @@ def core_plan_check(ledger: Path, account_id: str, trade_date: str) -> tuple[boo
         report.get("status") == "PASS"
         and report.get("policy_id") == CORE_PLAN_POLICY_ID
         and quality.get("coverage_pass") is True
+        and quality.get("execution_coverage_pass") is True
         and int(report.get("executable_buy_count") or 0) > 0
     )
     return executable_approved > 0 and report_ok, {
@@ -274,6 +275,8 @@ def core_plan_check(ledger: Path, account_id: str, trade_date: str) -> tuple[boo
         "report_status": report.get("status"),
         "coverage": quality.get("coverage"),
         "coverage_pass": quality.get("coverage_pass"),
+        "execution_coverage": quality.get("execution_coverage"),
+        "execution_coverage_pass": quality.get("execution_coverage_pass"),
     }
 
 

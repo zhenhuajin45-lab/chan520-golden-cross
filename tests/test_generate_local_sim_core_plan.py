@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 from chan520_skill.broker_adapter import LocalSimBrokerAdapter, LocalSimBrokerConfig
 from chan520_skill.models import KLine
@@ -468,3 +469,68 @@ def test_unadjusted_scan_history_is_not_execution_eligible():
     assert core_plan.execution_history_adjusted({"history_source": "tencent_qfq"}) is True
     assert core_plan.execution_history_adjusted({"history_source": "eastmoney_qfq"}) is True
     assert core_plan.execution_history_adjusted({"history_source": "sina_unadjusted"}) is False
+
+
+def test_range_regime_mapping_preserves_fail_closed_decision():
+    state = SimpleNamespace(regime="range", regime_ok=False, detail="below MA20 and MA60")
+
+    mapped = core_plan.mapped_regime(state, "test")
+
+    assert mapped["state"] == "NORMAL"
+    assert mapped["regime_ok"] is False
+
+
+def test_low_adjusted_execution_coverage_blocks_strict_candidate(tmp_path, monkeypatch):
+    ledger = tmp_path / "local_sim.sqlite"
+    adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id="plan-test", initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    monkeypatch.setattr(
+        core_plan,
+        "candidate_levels",
+        lambda _row, _signal_date, **_kwargs: {
+            "stop": 9.5,
+            "target": 12.0,
+            "rr": 4.0,
+            "t1_loss_buffer_pct": 0.075,
+            "reason_codes": [],
+        },
+    )
+    rows = [
+        {
+            "code": "600288",
+            "name": "大恒科技",
+            "history_source": "tencent_qfq",
+            "verdict": "入选",
+            "defect_count": "0",
+            "score": "25",
+            "close": "10.00",
+            "ma5": "9.80",
+            "ma20": "9.50",
+        }
+    ]
+
+    payload = core_plan.generate_plan(
+        adapter=adapter,
+        ledger=Path(ledger),
+        account_id="plan-test",
+        trade_date=date(2026, 7, 24),
+        signal_date=date(2026, 7, 23),
+        scan_path=tmp_path / "scan.csv",
+        scan_rows=rows,
+        regime={"state": "BULL", "regime_ok": True, "detail": "trend"},
+        scan_quality={
+            "universe": 100,
+            "success": 90,
+            "history_source_counts": {"tencent_qfq": 1, "sina_unadjusted": 89},
+        },
+        max_candidates=20,
+        max_buy_plans=2,
+        max_new_exposure_pct=0.15,
+        risk_per_plan_pct=0.005,
+    )
+
+    plan = payload["plans"][0]
+    assert payload["status"] == "FAIL_CLOSED"
+    assert plan["status"] == "WATCH_ONLY"
+    assert "SCAN_EXECUTION_COVERAGE_BLOCKED" in plan["blocking_reason_codes"]

@@ -112,13 +112,10 @@ def build_agents(root: Path, log_dir: Path) -> dict[str, dict[str, Any]]:
         intraday_label: scheduled(
             intraday_label,
             "intraday",
-            [
-                (9, 30), (9, 32), (9, 34), (9, 36), (9, 38), (9, 40), (9, 42), (9, 44),
-                (9, 51), (10, 31), (11, 15), (13, 11), (14, 1), (14, 31), (14, 51),
-            ],
+            intraday_times(),
             "send",
         ),
-        eod_label: scheduled(eod_label, "eod", [(15, 20)], "send"),
+        eod_label: scheduled(eod_label, "eod", [(15, 20), (18, 0)], "send"),
     }
 
 
@@ -127,6 +124,15 @@ def weekday_intervals(times: list[tuple[int, int]]) -> list[dict[str, int]]:
         {"Weekday": weekday, "Hour": hour, "Minute": minute}
         for weekday in range(1, 6)
         for hour, minute in times
+    ]
+
+
+def intraday_times(step_minutes: int = 2) -> list[tuple[int, int]]:
+    sessions = ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
+    return [
+        divmod(total_minutes, 60)
+        for start, end in sessions
+        for total_minutes in range(start, end, step_minutes)
     ]
 
 

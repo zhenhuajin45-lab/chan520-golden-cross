@@ -191,6 +191,10 @@ function renderCorePlanAlert(payload) {
   const funnel = core.execution_funnel || {};
   const coverage = Number(quality.coverage);
   const coverageText = Number.isFinite(coverage) ? `${(coverage * 100).toFixed(2)}%` : "未知";
+  const executionCoverage = Number(quality.execution_coverage);
+  const executionCoverageText = Number.isFinite(executionCoverage)
+    ? `${(executionCoverage * 100).toFixed(2)}%`
+    : "未知";
   const kind = core.status === "PASS" && Number(core.executable_buy_count || 0) > 0 ? "ok" : core.status === "PASS" ? "warning" : "danger";
   const boundary = core.status !== "PASS"
     ? `自动新增买入已关闭，仅保留现有持仓风控。${core.failure_reason ? ` 原因：${core.failure_reason}` : ""}`
@@ -202,7 +206,7 @@ function renderCorePlanAlert(payload) {
   const funnelText = funnel.scanned_count != null
     ? `｜执行漏斗 ${intText(funnel.scanned_count)} 扫描 → ${intText(funnel.strict_count)} 严格 → ${intText(funnel.core_executable_count)} 核心 → ${intText(funnel.bear_pilot_count)} 熊市小仓`
     : "";
-  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜扫描覆盖率 ${escapeHtml(coverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}${escapeHtml(funnelText)}｜${escapeHtml(boundary)}</div>`;
+  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜研究覆盖率 ${escapeHtml(coverageText)}｜执行级覆盖率 ${escapeHtml(executionCoverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}${escapeHtml(funnelText)}｜${escapeHtml(boundary)}</div>`;
 }
 
 function renderResearchPilot(pilot, core) {
@@ -294,6 +298,7 @@ function renderCounterfactualReplay(replay) {
   const independent = replay.individual_candidate_results || [];
   const individuallyTriggered = independent.filter((row) => Number(row.filled_count || 0) > 0).length;
   const sensitivity = replay.ordering_sensitivity || {};
+  const allPool = replay.all_candidate_close_summary || {};
   const fills = (replay.fills || []).map((row) =>
     `${stockText(row)} ${escapeHtml(row.fill_minute || "-")} @ ${price(row.fill_price)} → ${price(row.close_price)}，净盯市 <span class="${pnlClass(row.net_mark_pnl)}">${signedMoney(row.net_mark_pnl)}</span>`
   ).join("<br>") || "无模拟触发";
@@ -310,6 +315,11 @@ function renderCounterfactualReplay(replay) {
         <span class="${pnlClass(replay.net_mark_pnl)}">净盯市 ${signedMoney(replay.net_mark_pnl)} / ${signedPct(replay.net_mark_return_on_equity)}</span>
         <span>逐票独立 ${intText(individuallyTriggered)}/${intText(independent.length)}</span>
         <span>排序极差 ${signedMoney(sensitivity.spread_net_mark_pnl || 0)}</span>
+        <span>采样 ${intText(replay.sampling_interval_minutes)} 分钟</span>
+        <span>单票/总仓 ${pct(replay.position_cap_pct)} / ${pct(replay.max_exposure_pct)}</span>
+        <span class="${pnlClass(allPool.mean_close_return_pct)}">全池均值 ${signedPct(Number(allPool.mean_close_return_pct || 0) / 100)}</span>
+        <span>全池涨跌 ${intText(allPool.positive_count)}/${intText(allPool.negative_count)}</span>
+        <span class="${pnlClass(allPool.geometry_valid_mean_close_return_pct)}">几何有效均值 ${signedPct(Number(allPool.geometry_valid_mean_close_return_pct || 0) / 100)}</span>
       </div>
       <div class="research-fills">${failed ? escapeHtml(replay.error || "数据不完整") : fills}</div>
     </section>

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+
+from scripts import push_local_sim_feishu as feishu
 from scripts.push_local_sim_feishu import (
     build_plan_card,
     build_review_card,
@@ -7,6 +10,7 @@ from scripts.push_local_sim_feishu import (
     push_plan_card,
     push_review_card,
     push_trade_cards,
+    send_card,
     write_audit_files,
 )
 
@@ -359,3 +363,33 @@ def test_audit_files_preserve_latest_run_for_each_message_type(tmp_path):
     assert (tmp_path / "feishu_push_audit_plan.json").exists()
     assert (tmp_path / "feishu_push_audit_review.json").exists()
     assert len(list((tmp_path / "runs").glob("*.json"))) == 2
+
+
+def test_send_card_retries_feishu_frequency_limit(monkeypatch):
+    responses = [
+        {"code": 11232, "msg": "frequency limited"},
+        {"code": 0, "msg": "success"},
+    ]
+    sleeps = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps(self.payload).encode()
+
+    monkeypatch.setattr(feishu.urllib.request, "urlopen", lambda *_args, **_kwargs: Response(responses.pop(0)))
+    monkeypatch.setattr(feishu.time, "sleep", sleeps.append)
+
+    result = send_card("https://example.invalid/hook", {"msg_type": "interactive"}, timeout=1)
+
+    assert result["ok"] is True
+    assert result["attempts"] == 2
+    assert sleeps == [1.0]

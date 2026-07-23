@@ -30,6 +30,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh the exact-date local market-data fallback store")
     parser.add_argument("--trade-date", required=True)
     parser.add_argument("--scan-if-missing", action="store_true")
+    parser.add_argument("--rescan-unqualified", action="store_true")
     parser.add_argument("--scan-output-dir", default="", help="Write a recovery scan outside the standard scan directory")
     args = parser.parse_args()
 
@@ -42,8 +43,28 @@ def main() -> int:
     )
     scan_path = scan_dir / f"market_scan_{target.isoformat()}.csv"
     scan_stats = None
-    if not scan_path.exists() and args.scan_if_missing:
-        _csv, _markdown, scan_stats = scan_market(target, scan_path.parent, max_workers=16)
+    existing_quality = resolve_scan_quality(scan_path) if scan_path.exists() else {}
+    should_recover = bool(
+        args.rescan_unqualified
+        and scan_path.exists()
+        and (
+            existing_quality.get("coverage_pass") is not True
+            or existing_quality.get("execution_coverage_pass") is not True
+        )
+    )
+    if args.scan_if_missing and (not scan_path.exists() or should_recover):
+        output_dir = scan_path.parent
+        if should_recover:
+            output_dir = (
+                ROOT
+                / "reports"
+                / f"scan_recovery_{target.isoformat()}"
+                / datetime.now(TZ).strftime("%H%M%S")
+            )
+        recovered_path, _markdown, recovered_stats = scan_market(target, output_dir, max_workers=8)
+        if not scan_path.exists() or quality_rank(recovered_stats) > quality_rank(existing_quality):
+            scan_path = recovered_path
+            scan_stats = recovered_stats
     if not scan_path.exists():
         raise SystemExit(f"scan missing: {scan_path}")
     rows = read_scan(scan_path)
@@ -61,7 +82,13 @@ def main() -> int:
         "schema_version": "chan520_local_market_refresh_v1",
         "generated_at": datetime.now(TZ).isoformat(timespec="seconds"),
         "trade_date": target.isoformat(),
-        "status": "PASS" if quality.get("coverage_pass") and regime.get("state") != "UNKNOWN" else "DEGRADED",
+        "status": (
+            "PASS"
+            if quality.get("coverage_pass")
+            and quality.get("execution_coverage_pass")
+            and regime.get("state") != "UNKNOWN"
+            else "DEGRADED"
+        ),
         "scan_rows": len(rows),
         "scan_evidence_path": str(evidence_path),
         "scan_quality": quality,
@@ -74,6 +101,15 @@ def main() -> int:
     report.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
     return 0 if payload["status"] == "PASS" else 2
+
+
+def quality_rank(quality: dict[str, object]) -> tuple[bool, float, bool, float]:
+    return (
+        quality.get("execution_coverage_pass") is True,
+        float(quality.get("execution_coverage") or 0),
+        quality.get("coverage_pass") is True,
+        float(quality.get("coverage") or 0),
+    )
 
 
 if __name__ == "__main__":
