@@ -192,6 +192,7 @@ def build_payload(
         "valuation_status": valuation["status"],
         "valuation_complete": valuation["complete"],
         "core_plan": load_core_plan(selected_trade_date),
+        "session_market_snapshot": load_session_market_snapshot(selected_trade_date),
         "readiness": load_readiness(selected_trade_date),
         "counterfactual_replay": load_counterfactual_replay(selected_trade_date),
         "account": {
@@ -557,6 +558,8 @@ def load_core_plan(trade_date: str) -> dict[str, Any]:
         "policy_id": payload.get("policy_id"),
         "selection_policy": payload.get("selection_policy"),
         "signal_date": payload.get("signal_date"),
+        "execution_readiness": payload.get("execution_readiness"),
+        "buy_entry_ready": payload.get("buy_entry_ready"),
         "executable_buy_count": payload.get("executable_buy_count", 0),
         "strict_scan_count": payload.get("strict_scan_count", 0),
         "watch_scan_count": payload.get("watch_scan_count", 0),
@@ -636,6 +639,25 @@ def load_counterfactual_replay(trade_date: str) -> dict[str, Any]:
         "ordering_sensitivity": payload.get("ordering_sensitivity") or {},
         "all_candidate_independent_results": payload.get("all_candidate_independent_results") or [],
         "all_candidate_close_summary": payload.get("all_candidate_close_summary") or {},
+        "all_candidate_ranked_portfolio": payload.get("all_candidate_ranked_portfolio") or {},
+    }
+
+
+def load_session_market_snapshot(trade_date: str) -> dict[str, Any]:
+    if not trade_date:
+        return {}
+    path = ROOT / "reports" / "market_store" / trade_date.replace("-", "") / "refresh.json"
+    payload = read_json(path, {})
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    return {
+        "status": payload.get("status"),
+        "generated_at": payload.get("generated_at"),
+        "trade_date": payload.get("trade_date"),
+        "market_regime": payload.get("market_regime") or {},
+        "scan_quality": normalize_scan_quality(payload.get("scan_quality") or {}),
+        "scan_rows": payload.get("scan_rows", 0),
+        "scan_evidence_path": payload.get("scan_evidence_path"),
     }
 
 
@@ -652,6 +674,7 @@ def load_readiness(trade_date: str) -> dict[str, Any]:
         "local_sim_buy_entry_ready": payload.get("local_sim_buy_entry_ready"),
         "risk_blocking_checks": payload.get("risk_blocking_checks") or [],
         "buy_entry_blocking_checks": payload.get("buy_entry_blocking_checks") or payload.get("blocking_checks") or [],
+        "buy_entry_blocking_reasons": payload.get("buy_entry_blocking_reasons") or [],
         "auto_open_close_kernel_ready": False,
         "shadow_readiness": False,
     }

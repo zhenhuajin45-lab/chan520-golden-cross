@@ -113,6 +113,17 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
     risk_loop_ready = local_bridge_ready
     buy_entry_ready = risk_loop_ready and plan_ok
     daily_loop_blocking = [item for item in checks if not item["passed"]]
+    buy_entry_blocking_reasons = sorted(
+        {
+            str(reason)
+            for item in daily_loop_blocking
+            for reason in (
+                item.get("details", {}).get("blocking_reason_codes")
+                or [str(item.get("name") or "UNKNOWN_CHECK").upper()]
+            )
+            if str(reason)
+        }
+    )
     risk_blocking = [item for item in manual_blocking]
     if not executors_ok:
         risk_blocking.append(next(item for item in checks if item["name"] == "local_execution_scripts"))
@@ -140,6 +151,7 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
         "manual_blocking_checks": [item["name"] for item in manual_blocking],
         "risk_blocking_checks": [item["name"] for item in risk_blocking],
         "buy_entry_blocking_checks": [item["name"] for item in daily_loop_blocking],
+        "buy_entry_blocking_reasons": buy_entry_blocking_reasons,
         "blocking_checks": [item["name"] for item in daily_loop_blocking],
         "checks": checks,
         "notes": [
@@ -259,6 +271,19 @@ def core_plan_check(ledger: Path, account_id: str, trade_date: str) -> tuple[boo
         except (OSError, json.JSONDecodeError):
             report = {}
     quality = report.get("scan_quality") if isinstance(report.get("scan_quality"), dict) else {}
+    blocking_reason_codes: list[str] = []
+    if not report:
+        blocking_reason_codes.append("PLAN_REPORT_MISSING")
+    elif report.get("status") != "PASS":
+        blocking_reason_codes.append("PLAN_STATUS_BLOCKED")
+    if report and quality.get("coverage_pass") is not True:
+        blocking_reason_codes.append("SCAN_RESEARCH_COVERAGE_BLOCKED")
+    if report and quality.get("execution_coverage_pass") is not True:
+        blocking_reason_codes.append("SCAN_EXECUTION_COVERAGE_BLOCKED")
+    if report and (report.get("market_regime") or {}).get("regime_ok") is not True:
+        blocking_reason_codes.append("MARKET_REGIME_BLOCKED")
+    if report and int(report.get("executable_buy_count") or 0) <= 0:
+        blocking_reason_codes.append("NO_EXECUTABLE_BUY")
     report_ok = (
         report.get("status") == "PASS"
         and report.get("policy_id") == CORE_PLAN_POLICY_ID
@@ -277,6 +302,7 @@ def core_plan_check(ledger: Path, account_id: str, trade_date: str) -> tuple[boo
         "coverage_pass": quality.get("coverage_pass"),
         "execution_coverage": quality.get("execution_coverage"),
         "execution_coverage_pass": quality.get("execution_coverage_pass"),
+        "blocking_reason_codes": blocking_reason_codes,
     }
 
 

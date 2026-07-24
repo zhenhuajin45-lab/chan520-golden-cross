@@ -29,6 +29,7 @@ def test_local_sim_readiness_passes_manual_mode_with_fix(tmp_path):
     assert payload["manual_blocking_checks"] == []
     assert payload["risk_blocking_checks"] == []
     assert payload["buy_entry_blocking_checks"] == ["daily_core_plan"]
+    assert payload["buy_entry_blocking_reasons"] == ["PLAN_REPORT_MISSING"]
     assert payload["blocking_checks"] == ["daily_core_plan"]
     assert payload["status"] == "PASS_LOCAL_SIM_RISK_LOOP_ONLY"
     assert (tmp_path / "latest_account.json").exists()

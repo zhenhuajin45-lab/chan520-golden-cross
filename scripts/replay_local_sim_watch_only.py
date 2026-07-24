@@ -52,8 +52,8 @@ def main() -> int:
     plan_path = Path(args.plan) if args.plan else ROOT / "reports" / "local_sim_plan" / trade_date.strftime("%Y%m%d") / "core_plan.json"
     output = Path(args.output) if args.output else ROOT / "reports" / "local_sim_counterfactual" / trade_date.strftime("%Y%m%d") / "watch_only_replay.json"
     core_plan = prepare_research_plan(read_json(plan_path, {}))
-    candidates = research_candidates(core_plan)
-    if not candidates:
+    plan_candidates = all_plan_candidates(core_plan)
+    if not plan_candidates:
         payload = run_replay(
             core_plan,
             trade_date,
@@ -70,7 +70,7 @@ def main() -> int:
     try:
         market_data: dict[str, dict[str, Any]] = {}
         market_data_errors: dict[str, str] = {}
-        for row in all_plan_candidates(core_plan):
+        for row in plan_candidates:
             symbol = str(row.get("symbol") or "")
             try:
                 market_data[symbol] = fetch_market_day(symbol, trade_date, is_index=False)
@@ -89,7 +89,12 @@ def main() -> int:
         )
         payload["minute_data_errors"] = market_data_errors
     except (KeyError, ValueError, TimeoutError, OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-        payload = failure_payload(core_plan, trade_date, candidates, f"{type(exc).__name__}: {exc}")
+        payload = failure_payload(
+            core_plan,
+            trade_date,
+            research_candidates(core_plan),
+            f"{type(exc).__name__}: {exc}",
+        )
     payload["plan_path"] = str(plan_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
@@ -187,7 +192,8 @@ def run_replay(
     max_exposure_pct: float,
 ) -> dict[str, Any]:
     candidates = research_candidates(core_plan)
-    if not candidates:
+    all_candidates = all_plan_candidates(core_plan)
+    if not all_candidates:
         regime = str((core_plan.get("research_regime") or {}).get("state") or "UNKNOWN").upper()
         return base_payload(
             core_plan,
@@ -196,7 +202,7 @@ def run_replay(
             status="REGIME_UNAVAILABLE" if regime == "UNKNOWN" else "NO_CANDIDATES",
         )
     required = {
-        *(str(row.get("symbol") or "") for row in candidates),
+        *(str(row.get("symbol") or "") for row in all_candidates),
         *(index_data_key(symbol) for symbol in INDEX_SYMBOLS),
     }
     missing = sorted(symbol for symbol in required if symbol not in market_data or not market_data[symbol].get("minutes"))
@@ -204,6 +210,55 @@ def run_replay(
         return failure_payload(core_plan, trade_date, candidates, f"minute_data_missing:{','.join(missing)}")
 
     effective_equity = float(core_plan.get("account_equity") or initial_equity)
+    full_pool_ranked = simulate_portfolio(
+        [row for row in all_candidates if row.get("geometry_valid") is True],
+        market_data,
+        trade_date,
+        effective_equity,
+        max_fills=max_fills,
+        max_exposure_pct=max_exposure_pct,
+    )
+    all_results, all_summary = all_candidate_performance(core_plan, market_data, trade_date, effective_equity)
+    common = {
+        "minute_data_source": sorted({str(item.get("source") or "tencent") for item in market_data.values()}),
+        "historical_date_integrity": "PASS",
+        "historical_price_fields_source": "matched_day.prec_and_first_minute",
+        "data_complete": True,
+        "max_fills": max_fills,
+        "max_exposure_pct": max_exposure_pct,
+        "position_cap_pct": BEAR_PILOT_POSITION_PCT,
+        "sampling_interval_minutes": 2,
+        "replay_equity": round(effective_equity, 2),
+        "all_candidate_independent_results": all_results,
+        "all_candidate_close_summary": all_summary,
+        "all_candidate_ranked_portfolio": {
+            "ordering": "geometry_valid_risk_priority",
+            "candidate_count": sum(row.get("geometry_valid") is True for row in all_candidates),
+            **full_pool_ranked,
+        },
+    }
+    if not candidates:
+        regime = str((core_plan.get("research_regime") or {}).get("state") or "UNKNOWN").upper()
+        payload = base_payload(
+            core_plan,
+            trade_date,
+            candidates,
+            status="REGIME_UNAVAILABLE" if regime == "UNKNOWN" else "NO_RESEARCH_CANDIDATES",
+        )
+        payload.update(
+            {
+                "filled_count": 0,
+                "fills": [],
+                "net_mark_pnl": 0.0,
+                "net_mark_return_on_equity": 0.0,
+                "ranked_portfolio": {},
+                "individual_candidate_results": [],
+                "ordering_sensitivity": {},
+                **common,
+            }
+        )
+        return payload
+
     orders = {
         "risk_priority": sorted(candidates, key=plan_rank),
         "reverse_risk_priority": sorted(candidates, key=plan_rank, reverse=True),
@@ -248,15 +303,6 @@ def run_replay(
     payload.update(ranked)
     payload.update(
         {
-            "minute_data_source": sorted({str(item.get("source") or "tencent") for item in market_data.values()}),
-            "historical_date_integrity": "PASS",
-            "historical_price_fields_source": "matched_day.prec_and_first_minute",
-            "data_complete": True,
-            "max_fills": max_fills,
-            "max_exposure_pct": max_exposure_pct,
-            "position_cap_pct": BEAR_PILOT_POSITION_PCT,
-            "sampling_interval_minutes": 2,
-            "replay_equity": round(effective_equity, 2),
             "ranked_portfolio": {"ordering": "risk_priority", **ranked},
             "individual_candidate_results": independent,
             "ordering_sensitivity": {
@@ -265,11 +311,9 @@ def run_replay(
                 "worst_net_mark_pnl": min(pnl_values) if pnl_values else 0.0,
                 "spread_net_mark_pnl": round(max(pnl_values) - min(pnl_values), 2) if pnl_values else 0.0,
             },
+            **common,
         }
     )
-    all_results, all_summary = all_candidate_performance(core_plan, market_data, trade_date, effective_equity)
-    payload["all_candidate_independent_results"] = all_results
-    payload["all_candidate_close_summary"] = all_summary
     return payload
 
 

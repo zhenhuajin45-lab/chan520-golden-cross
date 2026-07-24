@@ -219,6 +219,11 @@ def test_counterfactual_export_includes_sampling_and_full_pool_metrics(tmp_path,
                 "max_exposure_pct": 0.05,
                 "sampling_interval_minutes": 2,
                 "all_candidate_independent_results": [{"symbol": "600012"}],
+                "all_candidate_ranked_portfolio": {
+                    "candidate_count": 16,
+                    "filled_count": 2,
+                    "net_mark_pnl": -403.88,
+                },
                 "all_candidate_close_summary": {
                     "candidate_count": 21,
                     "mean_close_return_pct": -0.341039,
@@ -236,3 +241,40 @@ def test_counterfactual_export_includes_sampling_and_full_pool_metrics(tmp_path,
     assert replay["sampling_interval_minutes"] == 2
     assert replay["all_candidate_independent_results"][0]["symbol"] == "600012"
     assert replay["all_candidate_close_summary"]["candidate_count"] == 21
+    assert replay["all_candidate_ranked_portfolio"]["net_mark_pnl"] == -403.88
+
+
+def test_session_market_snapshot_uses_completed_trade_date_refresh(tmp_path, monkeypatch):
+    report_dir = tmp_path / "reports" / "market_store" / "20260724"
+    report_dir.mkdir(parents=True)
+    (report_dir / "refresh.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "generated_at": "2026-07-24T15:38:15+08:00",
+                "trade_date": "2026-07-24",
+                "market_regime": {"state": "BEAR", "regime_ok": False, "detail": "close below MA20/MA60"},
+                    "scan_quality": {
+                        "universe": 4995,
+                        "success": 4977,
+                        "adjusted_success": 4959,
+                        "history_source_counts": {
+                            "tencent_qfq_plus_sina_exact": 4959,
+                            "sina_unadjusted": 18,
+                        },
+                        "minimum_coverage": 0.85,
+                    "minimum_execution_coverage": 0.85,
+                },
+                "scan_rows": 4977,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exporter, "ROOT", tmp_path)
+
+    snapshot = exporter.load_session_market_snapshot("2026-07-24")
+
+    assert snapshot["market_regime"]["state"] == "BEAR"
+    assert snapshot["scan_rows"] == 4977
+    assert snapshot["scan_quality"]["research_coverage_pass"] is True
+    assert snapshot["scan_quality"]["execution_coverage_pass"] is True

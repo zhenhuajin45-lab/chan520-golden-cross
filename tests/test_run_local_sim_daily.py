@@ -54,9 +54,15 @@ def test_eod_records_review_not_trade_push():
     assert any(item["name"] == "feishu_review" for item in steps)
     assert not any(item["name"] == "feishu_trades" for item in steps)
     names = [item["name"] for item in steps]
+    assert names.index("refresh_local_market_store") < names.index("replay_watch_only")
     assert names.index("risk_scan") < names.index("replay_watch_only") < names.index("feishu_review")
+    final_dashboard = max(index for index, name in enumerate(names) if name == "export_dashboard")
+    assert names.index("replay_watch_only") < final_dashboard < names.index("feishu_review")
     refresh = next(item for item in steps if item["name"] == "refresh_local_market_store")
     assert "--rescan-unqualified" in refresh["cmd"]
+    replay = next(item for item in steps if item["name"] == "replay_watch_only")
+    exposure_index = replay["cmd"].index("--max-exposure-pct")
+    assert replay["cmd"][exposure_index + 1] == "0.05"
 
 
 def test_plan_phase_generates_core_plan_before_dashboard_and_feishu():

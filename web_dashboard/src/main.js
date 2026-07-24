@@ -89,6 +89,7 @@ function render() {
       <div class="content">
         ${renderValuationAlert(payload)}
         ${renderReadinessAlert(payload)}
+        ${renderSessionMarketAlert(payload)}
         ${renderCorePlanAlert(payload)}
         ${renderResearchPilot(payload.research_pilot || {}, payload.core_plan || {})}
         ${renderCounterfactualReplay(payload.counterfactual_replay || {})}
@@ -209,6 +210,16 @@ function renderCorePlanAlert(payload) {
   return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜研究覆盖率 ${escapeHtml(coverageText)}｜执行级覆盖率 ${escapeHtml(executionCoverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}${escapeHtml(funnelText)}｜${escapeHtml(boundary)}</div>`;
 }
 
+function renderSessionMarketAlert(payload) {
+  const snapshot = payload.session_market_snapshot || {};
+  if (!snapshot.status) return "";
+  const regime = snapshot.market_regime || {};
+  const quality = snapshot.scan_quality || {};
+  const stateText = String(regime.state || "UNKNOWN").toUpperCase();
+  const kind = regime.regime_ok === true ? "ok" : stateText === "BEAR" ? "danger" : "warning";
+  return `<div class="valuation-alert ${kind}">交易日收盘市场 ${escapeHtml(stateText)}｜门控 ${regime.regime_ok === true ? "通过" : "阻断"}｜研究覆盖 ${pct(quality.research_coverage ?? quality.coverage)}｜执行级覆盖 ${pct(quality.execution_coverage)}｜扫描 ${intText(snapshot.scan_rows)} 只｜${escapeHtml(regime.detail || "收盘状态明细不可用")}</div>`;
+}
+
 function renderResearchPilot(pilot, core) {
   if (!pilot.status) return "";
   const account = pilot.account || {};
@@ -288,7 +299,7 @@ function renderReadinessAlert(payload) {
   const kind = !riskReady ? "danger" : buyReady ? "ok" : "warning";
   const riskText = riskReady ? "风险闭环 READY" : "风险闭环 BLOCKED";
   const buyText = buyReady ? "新增买入 READY" : "新增买入 BLOCKED";
-  const blockers = (readiness.buy_entry_blocking_checks || []).join(", ") || "无";
+  const blockers = (readiness.buy_entry_blocking_reasons || readiness.buy_entry_blocking_checks || []).join(", ") || "无";
   return `<div class="valuation-alert ${kind}">${escapeHtml(readiness.status)}｜${escapeHtml(riskText)}｜${escapeHtml(buyText)}｜买入阻断 ${escapeHtml(blockers)}</div>`;
 }
 
@@ -299,27 +310,39 @@ function renderCounterfactualReplay(replay) {
   const individuallyTriggered = independent.filter((row) => Number(row.filled_count || 0) > 0).length;
   const sensitivity = replay.ordering_sensitivity || {};
   const allPool = replay.all_candidate_close_summary || {};
-  const fills = (replay.fills || []).map((row) =>
+  const fullPoolPortfolio = replay.all_candidate_ranked_portfolio || {};
+  const researchFills = (replay.fills || []).map((row) =>
     `${stockText(row)} ${escapeHtml(row.fill_minute || "-")} @ ${price(row.fill_price)} → ${price(row.close_price)}，净盯市 <span class="${pnlClass(row.net_mark_pnl)}">${signedMoney(row.net_mark_pnl)}</span>`
-  ).join("<br>") || "无模拟触发";
+  ).join("<br>");
+  const fullPoolFills = (fullPoolPortfolio.fills || []).map((row) =>
+    `${stockText(row)} ${escapeHtml(row.fill_minute || "-")} @ ${price(row.fill_price)} → ${price(row.close_price)}，净盯市 <span class="${pnlClass(row.net_mark_pnl)}">${signedMoney(row.net_mark_pnl)}</span>`
+  ).join("<br>");
+  const fills = researchFills
+    ? `熊市子集：${researchFills}`
+    : fullPoolFills
+      ? `全池优先组合：${fullPoolFills}`
+      : "无模拟触发";
   return `
     <section class="research-strip ${failed ? "danger" : ""}">
       <div>
-        <strong>熊市防御候选反事实回放</strong>
+        <strong>观察池与熊市子集反事实回放</strong>
         <p class="meta">仅研究，不写入模拟盘账本，不放宽实际禁买门槛</p>
       </div>
       <div class="research-metrics">
         <span>状态 ${escapeHtml(replay.status)}</span>
-        <span>候选 ${intText(replay.candidate_count)} 只</span>
-        <span>模拟触发 ${intText(replay.filled_count)} 只</span>
+        <span>熊市子集 ${intText(replay.candidate_count)} 只</span>
+        <span>子集触发 ${intText(replay.filled_count)} 只</span>
         <span class="${pnlClass(replay.net_mark_pnl)}">净盯市 ${signedMoney(replay.net_mark_pnl)} / ${signedPct(replay.net_mark_return_on_equity)}</span>
         <span>逐票独立 ${intText(individuallyTriggered)}/${intText(independent.length)}</span>
         <span>排序极差 ${signedMoney(sensitivity.spread_net_mark_pnl || 0)}</span>
         <span>采样 ${intText(replay.sampling_interval_minutes)} 分钟</span>
         <span>单票/总仓 ${pct(replay.position_cap_pct)} / ${pct(replay.max_exposure_pct)}</span>
+        <span>全观察池 ${intText(allPool.available_count)}/${intText(allPool.candidate_count)}</span>
         <span class="${pnlClass(allPool.mean_close_return_pct)}">全池均值 ${signedPct(Number(allPool.mean_close_return_pct || 0) / 100)}</span>
         <span>全池涨跌 ${intText(allPool.positive_count)}/${intText(allPool.negative_count)}</span>
         <span class="${pnlClass(allPool.geometry_valid_mean_close_return_pct)}">几何有效均值 ${signedPct(Number(allPool.geometry_valid_mean_close_return_pct || 0) / 100)}</span>
+        <span>全池优先触发 ${intText(fullPoolPortfolio.filled_count)}/${intText(fullPoolPortfolio.candidate_count)}</span>
+        <span class="${pnlClass(fullPoolPortfolio.net_mark_pnl)}">全池优先组合 ${signedMoney(fullPoolPortfolio.net_mark_pnl)} / ${signedPct(fullPoolPortfolio.net_mark_return_on_equity)}</span>
       </div>
       <div class="research-fills">${failed ? escapeHtml(replay.error || "数据不完整") : fills}</div>
     </section>

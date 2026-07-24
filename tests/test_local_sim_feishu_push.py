@@ -122,13 +122,31 @@ def test_build_trade_card_uses_interactive_card():
 
 def test_build_review_card_contains_account_summary():
     payload = sample_payload()
-    payload["counterfactual_replay"] = {
+    payload["session_market_snapshot"] = {
         "status": "PASS",
+        "scan_rows": 4977,
+        "market_regime": {"state": "BEAR", "regime_ok": False, "detail": "上证跌破 MA20/MA60"},
+        "scan_quality": {"research_coverage": 0.9964, "execution_coverage": 0.9928},
+    }
+    payload["counterfactual_replay"] = {
+        "status": "NO_RESEARCH_CANDIDATES",
         "candidate_count": 2,
         "filled_count": 1,
         "net_mark_pnl": 128.0,
         "net_mark_return_on_equity": 0.000128,
         "fills": [],
+        "all_candidate_close_summary": {
+            "candidate_count": 21,
+            "available_count": 21,
+            "mean_close_return_pct": -1.77,
+            "median_close_return_pct": -1.24,
+        },
+        "all_candidate_ranked_portfolio": {
+            "candidate_count": 16,
+            "filled_count": 2,
+            "net_mark_pnl": -403.88,
+            "net_mark_return_on_equity": -0.00040852,
+        },
     }
     card = build_review_card(payload, "2026-07-15")
 
@@ -146,6 +164,10 @@ def test_build_review_card_contains_account_summary():
     assert "趋势回踩计划入场" in content
     assert "反事实回放" in content
     assert "不写入模拟盘账本" in content
+    assert "交易日收盘市场状态" in content
+    assert "BEAR" in content
+    assert "全池几何有效优先组合" in content
+    assert "403.88" in content
 
 
 def test_build_plan_card_separates_executable_and_watch_only_orders():
@@ -317,6 +339,40 @@ def test_push_review_card_skips_existing_key():
     assert audit["sent_count"] == 0
     assert audit["skipped_count"] == 1
     assert audit["error_count"] == 0
+
+
+def test_push_review_card_allows_corrected_evidence_after_material_change():
+    state = {
+        "pushed_keys": {
+            "review:2026-07-15": {
+                "pushed_at": "x",
+                "evidence_fingerprint": "stale-evidence",
+            }
+        }
+    }
+    payload = sample_payload()
+    payload["session_market_snapshot"] = {
+        "status": "PASS",
+        "market_regime": {"state": "BEAR", "regime_ok": False},
+        "scan_quality": {
+            "research_coverage_pass": True,
+            "execution_coverage_pass": True,
+        },
+        "scan_rows": 4977,
+    }
+
+    audit = push_review_card(
+        payload=payload,
+        state=state,
+        trade_date="2026-07-15",
+        dry_run=True,
+        force=False,
+        timeout=1,
+    )
+
+    assert audit["sent_count"] == 0
+    assert audit["skipped"][0]["reason"] == "dry_run"
+    assert audit["evidence_fingerprint"] != "stale-evidence"
 
 
 def test_push_review_card_fails_closed_when_valuation_is_incomplete():

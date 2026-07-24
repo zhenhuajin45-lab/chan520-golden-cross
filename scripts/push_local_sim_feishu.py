@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -187,6 +188,8 @@ def push_review_card(
     pushed = state.setdefault("pushed_keys", {})
     webhook = "" if dry_run else resolve_webhook()[0]
     key = f"review:{trade_date}"
+    evidence_fingerprint = review_evidence_fingerprint(payload, trade_date)
+    previous = pushed.get(key) if isinstance(pushed.get(key), dict) else {}
     sent: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -195,7 +198,14 @@ def push_review_card(
     pilot_valuation_incomplete = bool(pilot.get("positions")) and pilot.get("valuation_complete") is False
     if payload.get("valuation_complete") is False or pilot_valuation_incomplete:
         errors.append({"key": key, "error": "valuation_incomplete", "valuation_status": payload.get("valuation_status")})
-    elif not force and key in pushed:
+    elif (
+        not force
+        and key in pushed
+        and (
+            not previous.get("evidence_fingerprint")
+            or previous.get("evidence_fingerprint") == evidence_fingerprint
+        )
+    ):
         skipped.append({"key": key, "reason": "already_pushed"})
     elif dry_run:
         skipped.append({"key": key, "reason": "dry_run"})
@@ -204,7 +214,11 @@ def push_review_card(
     else:
         result = send_card(webhook, card, timeout=timeout)
         if result.get("ok"):
-            pushed[key] = {"pushed_at": now_str(), "trade_date": trade_date}
+            pushed[key] = {
+                "pushed_at": now_str(),
+                "trade_date": trade_date,
+                "evidence_fingerprint": evidence_fingerprint,
+            }
             sent.append({"key": key})
         else:
             errors.append({"key": key, "error": "feishu_response_not_ok", "response": result.get("response")})
@@ -217,11 +231,49 @@ def push_review_card(
         "error_count": len(errors),
         "dry_run": dry_run,
         "force": force,
+        "evidence_fingerprint": evidence_fingerprint,
         "sent": sent,
         "skipped": skipped,
         "errors": errors,
         "card_title": card["card"]["header"]["title"]["content"],
     }
+
+
+def review_evidence_fingerprint(payload: dict[str, Any], trade_date: str) -> str:
+    account = payload.get("account") or {}
+    snapshot = payload.get("session_market_snapshot") or {}
+    market = snapshot.get("market_regime") or {}
+    quality = snapshot.get("scan_quality") or {}
+    replay = payload.get("counterfactual_replay") or {}
+    all_summary = replay.get("all_candidate_close_summary") or {}
+    ranked = replay.get("all_candidate_ranked_portfolio") or {}
+    evidence = {
+        "trade_date": trade_date,
+        "account": {
+            "total_equity": account.get("total_equity"),
+            "fill_count": account.get("fill_count"),
+            "open_position_count": account.get("open_position_count"),
+            "valuation_status": payload.get("valuation_status"),
+        },
+        "session_market": {
+            "status": snapshot.get("status"),
+            "state": market.get("state"),
+            "regime_ok": market.get("regime_ok"),
+            "scan_rows": snapshot.get("scan_rows"),
+            "research_coverage_pass": quality.get("research_coverage_pass"),
+            "execution_coverage_pass": quality.get("execution_coverage_pass"),
+        },
+        "replay": {
+            "status": replay.get("status"),
+            "candidate_count": all_summary.get("candidate_count"),
+            "available_count": all_summary.get("available_count"),
+            "mean_close_return_pct": all_summary.get("mean_close_return_pct"),
+            "ranked_filled_count": ranked.get("filled_count"),
+            "ranked_net_mark_pnl": ranked.get("net_mark_pnl"),
+        },
+    }
+    encoded = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def push_plan_card(
@@ -414,6 +466,11 @@ def build_review_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any
     positions = list(payload.get("positions") or [])
     plans = [row for row in payload.get("planned_orders", []) if str(row.get("trade_date") or "") in {"", trade_date}]
     replay = payload.get("counterfactual_replay") if isinstance(payload.get("counterfactual_replay"), dict) else {}
+    session_market = (
+        payload.get("session_market_snapshot")
+        if isinstance(payload.get("session_market_snapshot"), dict)
+        else {}
+    )
     pilot = research_pilot(payload)
     pilot_account = pilot.get("account") or {}
     pilot_positions = list(pilot.get("positions") or [])
@@ -442,15 +499,30 @@ def build_review_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any
             ]
         ),
         {"tag": "hr"},
+        div("**交易日收盘市场状态**\n" + session_market_lines(session_market)),
         div("**待触发/计划订单**\n" + planned_order_lines(plans)),
         div("**持仓明细**\n" + position_lines(positions)),
         div("**当日成交明细**\n" + fill_lines(fills)),
         div("**当日理由分布**\n" + reason_summary_lines(fills)),
         div("**熊市研究小仓账户（独立于核心）**\n" + bear_pilot_review_lines(pilot_account, pilot_positions, pilot_fills, pilot_plans)),
-        div("**熊市防御候选反事实回放（仅研究）**\n" + counterfactual_lines(replay)),
+        div("**观察池与熊市子集反事实回放（仅研究）**\n" + counterfactual_lines(replay)),
         div(f"说明：估值口径 {payload.get('valuation_basis') or '-'}，状态 {payload.get('valuation_status') or '-'}。估值不完整时本复盘会 fail-closed，不会推送误导性盈亏。"),
     ]
     return card_payload("review", "Chan520 本地模拟盘｜每日账户复盘", elements)
+
+
+def session_market_lines(snapshot: dict[str, Any]) -> str:
+    if not snapshot:
+        return "收盘行情快照尚未生成；复盘证据不完整。"
+    regime = snapshot.get("market_regime") or {}
+    quality = snapshot.get("scan_quality") or {}
+    return (
+        f"状态 {regime.get('state') or 'UNKNOWN'}，门控 {'通过' if regime.get('regime_ok') else '阻断'}；"
+        f"{regime.get('detail') or '-'}\n"
+        f"研究覆盖 {pct(quality.get('research_coverage', quality.get('coverage')))}，"
+        f"执行级覆盖 {pct(quality.get('execution_coverage'))}，"
+        f"收盘扫描 {safe_int(snapshot.get('scan_rows'))} 只，证据状态 {snapshot.get('status') or '-'}。"
+    )
 
 
 def bear_pilot_review_lines(
@@ -481,7 +553,9 @@ def counterfactual_lines(replay: dict[str, Any]) -> str:
     if replay.get("status") == "FAIL_CLOSED":
         return f"数据不完整，回放已关闭：{replay.get('error') or '-'}"
     lines = [
-        f"状态 {replay.get('status') or '-'}，研究市场状态 {replay.get('research_market_regime') or '-'}，候选 {safe_int(replay.get('candidate_count'))} 只，排序前两笔触发 {safe_int(replay.get('filled_count'))} 只，收盘净盯市 {pnl_text(replay.get('net_mark_pnl'), replay.get('net_mark_return_on_equity'))}。",
+        f"状态 {replay.get('status') or '-'}，研究市场状态 {replay.get('research_market_regime') or '-'}，"
+        f"熊市子集 {safe_int(replay.get('candidate_count'))} 只，子集排序前两笔触发 {safe_int(replay.get('filled_count'))} 只，"
+        f"收盘净盯市 {pnl_text(replay.get('net_mark_pnl'), replay.get('net_mark_return_on_equity'))}。",
         "该结果不写入模拟盘账本，不代表应当放宽熊市禁买门槛。",
     ]
     independent = replay.get("individual_candidate_results") or []
@@ -503,6 +577,13 @@ def counterfactual_lines(replay: dict[str, Any]) -> str:
             f"平均 {pct_points(all_summary.get('mean_close_return_pct'))}，中位 {pct_points(all_summary.get('median_close_return_pct'))}；"
             f"几何有效平均 {pct_points(all_summary.get('geometry_valid_mean_close_return_pct'))}，"
             f"几何无效平均 {pct_points(all_summary.get('invalid_geometry_mean_close_return_pct'))}。"
+        )
+    full_pool = replay.get("all_candidate_ranked_portfolio") or {}
+    if full_pool:
+        lines.append(
+            f"全池几何有效优先组合：候选 {safe_int(full_pool.get('candidate_count'))} 只，"
+            f"前两笔触发 {safe_int(full_pool.get('filled_count'))} 只，"
+            f"净盯市 {pnl_text(full_pool.get('net_mark_pnl'), full_pool.get('net_mark_return_on_equity'))}。"
         )
     return "\n".join(lines)
 
