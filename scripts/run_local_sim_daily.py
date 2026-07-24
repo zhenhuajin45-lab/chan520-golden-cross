@@ -181,28 +181,6 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
         steps.append(export_dashboard_step(trade_date, args.initial_cash))
         steps.append(feishu_step(args, trade_date, "trades"))
     else:
-        steps.append(export_dashboard_step(trade_date, args.initial_cash))
-        steps.append(step("risk_scan", script("local_sim_risk_scan.py", "--trade-date", trade_date)))
-        steps.append(
-            step(
-                "replay_watch_only",
-                script(
-                    "replay_local_sim_watch_only.py",
-                    "--trade-date",
-                    trade_date,
-                    "--initial-equity",
-                    str(args.initial_cash),
-                    "--max-fills",
-                    str(args.max_fills),
-                    "--max-exposure-pct",
-                    str(args.max_exposure_pct),
-                ),
-            )
-        )
-        steps.append(export_pilot_dashboard_step(trade_date, args.initial_cash))
-        steps.append(pilot_risk_scan_step(args, trade_date))
-        steps.append(export_dashboard_step(trade_date, args.initial_cash))
-        steps.append(feishu_step(args, trade_date, "review"))
         steps.append(
             step(
                 "refresh_local_market_store",
@@ -217,6 +195,28 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
                 sla_seconds=2700,
             )
         )
+        steps.append(export_dashboard_step(trade_date, args.initial_cash))
+        steps.append(step("risk_scan", script("local_sim_risk_scan.py", "--trade-date", trade_date)))
+        steps.append(
+            step(
+                "replay_watch_only",
+                script(
+                    "replay_local_sim_watch_only.py",
+                    "--trade-date",
+                    trade_date,
+                    "--initial-equity",
+                    str(args.initial_cash),
+                    "--max-fills",
+                    str(args.max_fills),
+                    "--max-exposure-pct",
+                    str(min(args.max_exposure_pct, BEAR_PILOT_MAX_EXPOSURE_PCT)),
+                ),
+            )
+        )
+        steps.append(export_pilot_dashboard_step(trade_date, args.initial_cash))
+        steps.append(pilot_risk_scan_step(args, trade_date))
+        steps.append(export_dashboard_step(trade_date, args.initial_cash))
+        steps.append(feishu_step(args, trade_date, "review"))
     return [item for item in steps if item]
 
 
