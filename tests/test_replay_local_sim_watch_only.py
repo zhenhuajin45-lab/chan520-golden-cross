@@ -105,6 +105,44 @@ def test_replay_fails_closed_when_index_minutes_are_missing():
     assert payload["data_complete"] is False
 
 
+def test_replay_keeps_full_pool_evidence_without_bear_research_candidates():
+    rows = [candidate("600001", 2, 10.0), candidate("000001", 1, 20.0)]
+    for row in rows:
+        row["geometry_valid"] = True
+        row.pop("research_only")
+        row.pop("research_cohort")
+    core = {
+        "policy_id": "local_sim_core_plan_v2",
+        "market_regime": {"state": "NORMAL", "regime_ok": False},
+        "research_regime": {"state": "NORMAL", "regime_ok": False},
+        "executable_buy_count": 0,
+        "plans": rows,
+    }
+    market_data = {
+        "600001": series("A", 10.0, 10.0, 10.1),
+        "000001": series("B", 20.0, 20.0, 20.2),
+    }
+    market_data.update({index_data_key(symbol): series(symbol, 100.0, 100.0, 100.0) for symbol in INDEX_SYMBOLS})
+
+    payload = run_replay(
+        core,
+        date(2026, 7, 20),
+        market_data,
+        initial_equity=1_000_000.0,
+        max_fills=1,
+        max_exposure_pct=0.05,
+    )
+
+    assert payload["status"] == "NO_RESEARCH_CANDIDATES"
+    assert payload["candidate_count"] == 0
+    assert payload["all_candidate_close_summary"]["candidate_count"] == 2
+    assert payload["all_candidate_close_summary"]["available_count"] == 2
+    assert len(payload["all_candidate_independent_results"]) == 2
+    assert payload["all_candidate_ranked_portfolio"]["candidate_count"] == 2
+    assert payload["all_candidate_ranked_portfolio"]["filled_count"] == 1
+    assert payload["data_complete"] is True
+
+
 def test_historical_day_uses_matched_day_prec_and_first_minute_not_realtime_quote():
     payload = {
         "data": {
