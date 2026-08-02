@@ -73,8 +73,13 @@ def test_weekly_review_aggregates_exact_cohort_and_t1_without_touching_ledger(tm
 
     assert payload["status"] == "PASS"
     assert payload["trade_dates"] == trade_dates
-    assert payload["alerts"] == ["SIGNAL_STARVATION"]
+    assert payload["alerts"] == ["SIGNAL_STARVATION", "RESEARCH_ACTIVITY_BELOW_TARGET"]
+    assert payload["candidate_day_count"] == 5
+    assert payload["candidate_sample_count"] == 5
     assert payload["exact_research_same_day_mark"]["net_mark_pnl"] == 10.0
+    assert payload["trade_activity"]["research_trade_day_count"] == 1
+    assert payload["trade_activity"]["status"] == "ALERT"
+    assert payload["trade_activity"]["no_trade_days"][0]["dominant_reason"] == "NO_TRIGGER_EVIDENCE"
     assert payload["t1_next_close_observation"]["completed_count"] == 1
     assert payload["t1_next_close_observation"]["net_pnl"] > 0
     assert payload["risk_boundary"]["shadow_readiness"] is False

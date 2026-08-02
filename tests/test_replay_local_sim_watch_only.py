@@ -74,8 +74,8 @@ def test_replay_uses_explicit_risk_priority_and_never_changes_actual_execution_c
     assert payload["replay_equity"] == 500_000.0
     assert payload["filled_count"] == 1
     assert payload["fills"][0]["symbol"] == "000001"
-    assert payload["fills"][0]["volume"] == 600
-    assert payload["position_cap_pct"] == 0.025
+    assert payload["fills"][0]["volume"] == 200
+    assert payload["position_cap_pct"] == 0.01
     assert payload["sampling_interval_minutes"] == 2
     assert len(payload["individual_candidate_results"]) == 2
     assert len(payload["all_candidate_independent_results"]) == 2

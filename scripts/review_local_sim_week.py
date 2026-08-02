@@ -4,6 +4,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,7 @@ def build_weekly_review(end_date: date, *, sessions: int, ledger: Path) -> dict[
     daily_rows = [daily_evidence(row) for row in plans]
     actual = actual_ledger_summary(ledger, dates[0], dates[-1])
     t1_rows = t1_next_close_rows(daily_rows)
+    activity = build_activity_summary(daily_rows)
     alerts = []
     if all(row["core_executable_count"] + row["pilot_count"] == 0 for row in daily_rows):
         alerts.append("SIGNAL_STARVATION")
@@ -77,6 +79,8 @@ def build_weekly_review(end_date: date, *, sessions: int, ledger: Path) -> dict[
         alerts.append("LEGACY_REPLAY_FALLBACK_USED")
     if any(not row["task_health_pass"] for row in daily_rows):
         alerts.append("DAILY_TASK_INCOMPLETE")
+    if activity["status"] != "PASS":
+        alerts.append("RESEARCH_ACTIVITY_BELOW_TARGET")
     return {
         "schema_version": "chan520_local_sim_weekly_review_v1",
         "generated_at": now(),
@@ -88,9 +92,11 @@ def build_weekly_review(end_date: date, *, sessions: int, ledger: Path) -> dict[
         "alerts": alerts,
         "actual_account": actual,
         "daily": daily_rows,
-        "candidate_day_count": sum(row["candidate_count"] for row in daily_rows),
+        "candidate_day_count": sum(row["candidate_count"] > 0 for row in daily_rows),
+        "candidate_sample_count": sum(row["candidate_count"] for row in daily_rows),
         "core_executable_count": sum(row["core_executable_count"] for row in daily_rows),
         "pilot_plan_count": sum(row["pilot_count"] for row in daily_rows),
+        "trade_activity": activity,
         "exact_research_same_day_mark": {
             "filled_count": sum(row["research_filled_count"] for row in daily_rows),
             "net_mark_pnl": round(sum(row["research_net_mark_pnl"] for row in daily_rows), 2),
@@ -123,6 +129,11 @@ def daily_evidence(plan: dict[str, Any]) -> dict[str, Any]:
     eod_summary = read_json(ROOT / "reports" / "local_sim_daily" / key / "eod_summary.json", {})
     funnel = plan.get("execution_funnel") or {}
     full_pool = replay.get("all_candidate_ranked_portfolio") or {}
+    decision_reasons: Counter[str] = Counter()
+    for row in replay.get("individual_candidate_results") or []:
+        decision_reasons.update(
+            {str(key): int(value or 0) for key, value in (row.get("decision_reason_counts") or {}).items()}
+        )
     return {
         "trade_date": trade_date,
         "signal_date": plan.get("signal_date"),
@@ -138,11 +149,41 @@ def daily_evidence(plan: dict[str, Any]) -> dict[str, Any]:
         "research_filled_count": int(replay.get("filled_count") or 0),
         "research_net_mark_pnl": float(replay.get("net_mark_pnl") or 0),
         "research_fills": list(replay.get("fills") or []),
+        "decision_reason_counts": dict(decision_reasons.most_common()),
         "full_pool_filled_count": int(full_pool.get("filled_count") or 0),
         "full_pool_net_mark_pnl": float(full_pool.get("net_mark_pnl") or 0),
         "task_health_pass": plan_summary.get("status") == "PASS" and eod_summary.get("status") == "PASS",
         "trigger_cycle_count": count_json(ROOT / "reports" / "local_sim_trigger" / key),
         "risk_cycle_count": count_json(ROOT / "reports" / "local_sim_risk_exit" / key),
+    }
+
+
+def build_activity_summary(daily_rows: list[dict[str, Any]], target_trade_days: int = 3) -> dict[str, Any]:
+    trade_days = [row["trade_date"] for row in daily_rows if row["research_filled_count"] > 0]
+    no_trade = []
+    for row in daily_rows:
+        if row["research_filled_count"] > 0:
+            continue
+        reasons = row.get("decision_reason_counts") or {}
+        dominant = max(reasons, key=reasons.get) if reasons else "NO_TRIGGER_EVIDENCE"
+        no_trade.append(
+            {
+                "trade_date": row["trade_date"],
+                "candidate_count": row["research_candidate_count"],
+                "dominant_reason": dominant,
+                "reason_counts": reasons,
+            }
+        )
+    return {
+        "status": "PASS" if len(trade_days) >= min(target_trade_days, len(daily_rows)) else "ALERT",
+        "session_count": len(daily_rows),
+        "target_trade_days": min(target_trade_days, len(daily_rows)),
+        "research_trade_day_count": len(trade_days),
+        "research_trade_day_ratio": round(len(trade_days) / len(daily_rows), 4) if daily_rows else 0.0,
+        "research_trade_dates": trade_days,
+        "no_trade_days": no_trade,
+        "forced_trade_enabled": False,
+        "policy": "eligible_queue_then_intraday_confirmation_v1",
     }
 
 
@@ -268,8 +309,10 @@ def markdown_report(payload: dict[str, Any]) -> str:
         "",
         f"- 区间：{payload['start_date']} 至 {payload['end_date']}（{payload['session_count']} 个交易日）",
         f"- 实际订单/成交：{actual['order_count']}/{actual['fill_count']}",
-        f"- 候选日样本：{payload['candidate_day_count']}",
+        f"- 有候选交易日：{payload['candidate_day_count']}/{payload['session_count']}",
+        f"- 全池候选样本：{payload['candidate_sample_count']}",
         f"- 核心可执行/独立 probe：{payload['core_executable_count']}/{payload['pilot_plan_count']}",
+        f"- 研究触发日：{payload['trade_activity']['research_trade_day_count']}/{payload['trade_activity']['session_count']}",
         f"- 精确研究子集当日收盘盯市：{same_day['filled_count']} 笔，{same_day['net_mark_pnl']:.2f} 元",
         f"- T+1 下一交易日收盘观察：{t1['completed_count']} 笔，{t1['net_pnl']:.2f} 元",
         f"- 告警：{', '.join(payload['alerts']) or '无'}",
