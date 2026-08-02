@@ -692,6 +692,8 @@ def load_readiness(trade_date: str) -> dict[str, Any]:
         "status": payload.get("status"),
         "local_sim_risk_loop_ready": payload.get("local_sim_risk_loop_ready"),
         "local_sim_buy_entry_ready": payload.get("local_sim_buy_entry_ready"),
+        "local_sim_research_entry_ready": payload.get("local_sim_research_entry_ready"),
+        "local_sim_any_entry_ready": payload.get("local_sim_any_entry_ready"),
         "risk_blocking_checks": payload.get("risk_blocking_checks") or [],
         "buy_entry_blocking_checks": payload.get("buy_entry_blocking_checks") or payload.get("blocking_checks") or [],
         "buy_entry_blocking_reasons": payload.get("buy_entry_blocking_reasons") or [],
