@@ -247,6 +247,10 @@ def review_evidence_fingerprint(payload: dict[str, Any], trade_date: str) -> str
     replay = payload.get("counterfactual_replay") or {}
     all_summary = replay.get("all_candidate_close_summary") or {}
     ranked = replay.get("all_candidate_ranked_portfolio") or {}
+    core = payload.get("core_plan") or {}
+    pilot = (core.get("research_cohorts") or {}).get("bear_pilot") or {}
+    weekly = payload.get("weekly_review") or {}
+    weekly_t1 = weekly.get("t1_next_close_observation") or {}
     evidence = {
         "trade_date": trade_date,
         "account": {
@@ -270,6 +274,21 @@ def review_evidence_fingerprint(payload: dict[str, Any], trade_date: str) -> str
             "mean_close_return_pct": all_summary.get("mean_close_return_pct"),
             "ranked_filled_count": ranked.get("filled_count"),
             "ranked_net_mark_pnl": ranked.get("net_mark_pnl"),
+        },
+        "execution": {
+            "starvation_status": (core.get("signal_starvation") or {}).get("status"),
+            "pilot_policy_id": pilot.get("policy_id"),
+            "pilot_eligible_count": pilot.get("eligible_count"),
+        },
+        "weekly_review": {
+            "status": weekly.get("status"),
+            "start_date": weekly.get("start_date"),
+            "end_date": weekly.get("end_date"),
+            "alerts": weekly.get("alerts"),
+            "research_mark_pnl": (weekly.get("exact_research_same_day_mark") or {}).get("net_mark_pnl"),
+            "t1_completed_count": weekly_t1.get("completed_count"),
+            "t1_missing_count": weekly_t1.get("missing_count"),
+            "t1_net_pnl": weekly_t1.get("net_pnl"),
         },
     }
     encoded = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -372,6 +391,7 @@ def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
     supplemental = core.get("supplemental_market_context") if isinstance(core.get("supplemental_market_context"), dict) else {}
     style = core.get("candidate_style_diagnostic") if isinstance(core.get("candidate_style_diagnostic"), dict) else {}
     funnel = core.get("execution_funnel") if isinstance(core.get("execution_funnel"), dict) else {}
+    starvation = core.get("signal_starvation") if isinstance(core.get("signal_starvation"), dict) else {}
     pilot = research_pilot(payload)
     pilot_plans = [
         row for row in pilot.get("planned_orders", [])
@@ -400,9 +420,11 @@ def build_plan_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any]:
                 ("新增买入", ready_label(readiness.get("local_sim_buy_entry_ready"))),
                 ("几何拦截", f"{safe_int(core.get('geometry_blocked_count'))} 只"),
                 ("熊市研究小仓", f"{len(pilot_plans)} 只"),
+                ("连续无执行", starvation_label(starvation)),
             ]
         ),
         div("**执行漏斗**\n" + execution_funnel_lines(funnel)),
+        div("**信号饥饿监控**\n" + starvation_lines(starvation)),
         div("**执行边界**\n" + core_plan_boundary(core)),
         div("**市场宽度与候选风格（诊断，不参与放宽入场）**\n" + style_diagnostic_lines(style)),
         {"tag": "hr"},
@@ -431,19 +453,64 @@ def execution_funnel_lines(funnel: dict[str, Any]) -> str:
     if not funnel:
         return "本次未记录执行漏斗。"
     return (
-        f"扫描 {safe_int(funnel.get('scanned_count'))} → 严格 {safe_int(funnel.get('strict_count'))} → "
+        f"扫描 {safe_int(funnel.get('scanned_count'))} → 基础严格 {safe_int(funnel.get('strict_count'))} → "
+        f"完整严格 {safe_int(funnel.get('strict_full_gate_count'))} → "
         f"观察 {safe_int(funnel.get('watch_count'))} → 核心可执行 {safe_int(funnel.get('core_executable_count'))} → "
-        f"熊市研究小仓 {safe_int(funnel.get('bear_pilot_count'))}。"
+        f"熊市 probe {safe_int(funnel.get('bear_pilot_count'))}。"
     )
 
 
 def bear_pilot_plan_lines(rows: list[dict[str, Any]], cohort: dict[str, Any]) -> str:
     boundary = (
-        f"状态 {cohort.get('status') or '-'}；单票上限 {pct(cohort.get('position_cap_pct'))}，"
+        f"状态 {cohort.get('status') or '-'}；策略 {cohort.get('policy_id') or '-'}；单票上限 {pct(cohort.get('position_cap_pct'))}，"
         f"账户总仓上限 {pct(cohort.get('account_exposure_cap_pct'))}，最多 {safe_int(cohort.get('max_positions'))} 只，"
         "仅本地模拟研究，不连接 GM。"
     )
-    return boundary + "\n" + planned_order_lines(rows)
+    audits = cohort.get("eligibility_audit") if isinstance(cohort.get("eligibility_audit"), list) else []
+    selected_symbols = {str(row.get("symbol") or "") for row in rows}
+    audit_lines = [
+        f"- {stock_label(row)}：v1 R:R {safe_float(row.get('control_risk_reward')):.2f}，"
+        f"probe R:R {safe_float(row.get('probe_risk_reward')):.2f}，"
+        f"{pilot_audit_result(row, selected_symbols)}"
+        for row in audits[:6]
+    ]
+    control_count = safe_int(cohort.get("control_v1_eligible_count"))
+    audit_text = f"旧 v1 对照通过 {control_count} 只；probe 审计 {len(audits)} 只。"
+    if audit_lines:
+        audit_text += "\n" + "\n".join(audit_lines)
+    return boundary + "\n" + planned_order_lines(rows) + "\n" + audit_text
+
+
+def pilot_audit_result(row: dict[str, Any], selected_symbols: set[str]) -> str:
+    if str(row.get("symbol") or "") in selected_symbols:
+        return f"最终入选（{'v1优先' if row.get('control_v1_eligible') else 'v2补位'}）"
+    if row.get("probe_eligible"):
+        return "probe 通过，未入选（名额/优先级）"
+    return "淘汰 " + ",".join(row.get("rejection_codes") or [])
+
+
+def starvation_label(starvation: dict[str, Any]) -> str:
+    if not starvation:
+        return "未记录"
+    count = safe_int(
+        starvation.get("consecutive_zero_execution_sessions")
+        or starvation.get("previous_zero_execution_sessions")
+    )
+    return f"{starvation.get('status') or 'UNKNOWN'} / {count} 日"
+
+
+def starvation_lines(starvation: dict[str, Any]) -> str:
+    if not starvation:
+        return "本次未记录连续无执行监控。"
+    status = str(starvation.get("status") or "UNKNOWN")
+    dates = "、".join(str(item) for item in starvation.get("evidence_dates") or []) or "-"
+    if status == "ALERT":
+        message = "候选持续存在但核心和独立 probe 均无可执行计划，需要审查门槛冲突。"
+    elif status == "RECOVERED":
+        message = "此前连续无执行，本次已恢复产生可执行计划。"
+    else:
+        message = "当前未达到连续五个交易日无执行告警阈值。"
+    return f"状态 {status}；证据日期 {dates}；{message}"
 
 
 def style_diagnostic_lines(style: dict[str, Any]) -> str:
@@ -476,6 +543,7 @@ def build_review_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any
     pilot_positions = list(pilot.get("positions") or [])
     pilot_fills = [row for row in pilot.get("fills", []) if row_date(row) == trade_date]
     pilot_plans = [row for row in pilot.get("planned_orders", []) if str(row.get("trade_date") or "") == trade_date]
+    weekly = payload.get("weekly_review") if isinstance(payload.get("weekly_review"), dict) else {}
     elements = [
         div(f"**每日账户复盘**\n{trade_date}"),
         fields_block(
@@ -506,9 +574,29 @@ def build_review_card(payload: dict[str, Any], trade_date: str) -> dict[str, Any
         div("**当日理由分布**\n" + reason_summary_lines(fills)),
         div("**熊市研究小仓账户（独立于核心）**\n" + bear_pilot_review_lines(pilot_account, pilot_positions, pilot_fills, pilot_plans)),
         div("**观察池与熊市子集反事实回放（仅研究）**\n" + counterfactual_lines(replay)),
+        div("**最近五个交易日审计**\n" + weekly_review_lines(weekly)),
         div(f"说明：估值口径 {payload.get('valuation_basis') or '-'}，状态 {payload.get('valuation_status') or '-'}。估值不完整时本复盘会 fail-closed，不会推送误导性盈亏。"),
     ]
     return card_payload("review", "Chan520 本地模拟盘｜每日账户复盘", elements)
+
+
+def weekly_review_lines(weekly: dict[str, Any]) -> str:
+    if not weekly:
+        return "尚未生成完整五个交易日周报。"
+    if weekly.get("status") != "PASS":
+        return f"状态 {weekly.get('status') or '-'}；原因 {weekly.get('error') or '-'}。"
+    actual = weekly.get("actual_account") or {}
+    same_day = weekly.get("exact_research_same_day_mark") or {}
+    t1 = weekly.get("t1_next_close_observation") or {}
+    alerts = "、".join(str(item) for item in weekly.get("alerts") or []) or "无"
+    return (
+        f"{weekly.get('start_date') or '-'} 至 {weekly.get('end_date') or '-'}；"
+        f"实际订单/成交 {safe_int(actual.get('order_count'))}/{safe_int(actual.get('fill_count'))}；"
+        f"核心/probe {safe_int(weekly.get('core_executable_count'))}/{safe_int(weekly.get('pilot_plan_count'))}。\n"
+        f"精确研究子集当日盯市 {pnl_text(same_day.get('net_mark_pnl'))}；"
+        f"T+1 下一交易日收盘 {safe_int(t1.get('completed_count'))} 笔，{pnl_text(t1.get('net_pnl'))}；"
+        f"告警 {alerts}。"
+    )
 
 
 def session_market_lines(snapshot: dict[str, Any]) -> str:
@@ -699,7 +787,8 @@ def reason_summary_lines(rows: list[dict[str, Any]]) -> str:
 
 
 def compact_text(*parts: Any) -> str:
-    text = "｜".join(str(item).strip() for item in parts if str(item or "").strip())
+    values = list(dict.fromkeys(str(item).strip() for item in parts if str(item or "").strip()))
+    text = "｜".join(values)
     return text or "未记录"
 
 

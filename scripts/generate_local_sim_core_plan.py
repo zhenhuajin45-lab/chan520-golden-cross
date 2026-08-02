@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from chan520_skill.broker_adapter import LocalSimBrokerAdapter, LocalSimBrokerConfig  # noqa: E402
 from chan520_skill.execution_policy import (  # noqa: E402
+    BEAR_PILOT_CONTROL_POLICY_ID,
     BEAR_PILOT_ACCOUNT_ID,
     BEAR_PILOT_EXECUTION_SCOPE,
     BEAR_PILOT_MAX_EXPOSURE_PCT,
@@ -25,6 +26,8 @@ from chan520_skill.execution_policy import (  # noqa: E402
     BEAR_PILOT_MIN_RR,
     BEAR_PILOT_POLICY_ID,
     BEAR_PILOT_POSITION_PCT,
+    BEAR_PROBE_MIN_TARGET_RISK_MULTIPLE,
+    BEAR_PROBE_TARGET_ATR_MULTIPLE,
     CORE_PLAN_POLICY_ID,
 )
 from chan520_skill.data import eastmoney_history, sina_history, tencent_history, trim_to_date  # noqa: E402
@@ -394,6 +397,8 @@ def generate_plan(
     audits: list[dict[str, Any]] = []
     planned_gross = 0.0
     pilot_plans: list[dict[str, Any]] = []
+    pilot_audits: list[dict[str, Any]] = []
+    pilot_eligible_candidates: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]] = []
     pilot_planned_gross = 0.0
     pilot_equity = account_equity(pilot_adapter) if pilot_adapter else 0.0
     scan_quality = normalize_scan_quality(scan_quality, rows=scan_rows)
@@ -481,47 +486,94 @@ def generate_plan(
             plan["research_policy_id"] = "bear_defensive_watch_v2"
             plan["reason_codes"] = [*plan["reason_codes"], "BEAR_DEFENSIVE_RESEARCH_ONLY"]
             bear_defensive_symbols.append(str(row.get("code") or ""))
-            if pilot_adapter is not None and len(pilot_plans) < BEAR_PILOT_MAX_FILLS:
+            if pilot_adapter is not None:
                 pilot_levels = candidate_levels(row, signal_date, offline=False)
                 pilot_zone = entry_zone(row, pilot_levels)
+                probe_levels = bear_probe_levels(row, pilot_levels)
                 close = safe_float(row.get("close"))
-                pilot_eligible = (
-                    scan_quality.get("coverage_pass") is True
-                    and scan_quality.get("execution_coverage_pass") is True
-                    and execution_history_adjusted(row)
-                    and pilot_zone.get("geometry_valid") is True
+                rejection_codes = bear_probe_rejection_codes(
+                    row,
+                    pilot_zone,
+                    probe_levels,
+                    scan_quality,
+                )
+                control_v1_eligible = (
+                    not rejection_codes
                     and safe_float(pilot_levels.get("rr")) >= BEAR_PILOT_MIN_RR
                     and safe_float(pilot_levels.get("target")) > close > 0
                 )
-                if pilot_eligible:
-                    shares = planned_shares(
-                        equity=pilot_equity,
-                        entry=close,
-                        stop=safe_float(pilot_levels.get("stop")),
-                        score=safe_float(row.get("score")),
-                        risk_per_plan_pct=BEAR_PILOT_POSITION_PCT,
-                        t1_loss_buffer_pct=safe_float(pilot_levels.get("t1_loss_buffer_pct")),
-                        value_pct=BEAR_PILOT_POSITION_PCT,
-                    )
-                    remaining = max(pilot_equity * BEAR_PILOT_MAX_EXPOSURE_PCT - pilot_planned_gross, 0.0)
-                    shares = min(shares, int((remaining / close) // 100) * 100 if close > 0 else 0)
-                    if shares > 0:
-                        pilot = bear_pilot_plan(
-                            row,
-                            trade_date,
-                            signal_date,
-                            len(pilot_plans) + 1,
-                            shares,
-                            pilot_levels,
-                            pilot_zone,
-                            regime,
-                            pilot_account_id,
-                        )
-                        pilot_adapter.record_planned_order(pilot)
-                        pilot_plans.append(pilot)
-                        pilot_planned_gross += close * shares
+                probe_eligible = not rejection_codes
+                pilot_audits.append(
+                    {
+                        "symbol": str(row.get("code") or ""),
+                        "stock_name": str(row.get("name") or ""),
+                        "score": safe_float(row.get("score")),
+                        "control_policy_id": BEAR_PILOT_CONTROL_POLICY_ID,
+                        "control_target_price": pilot_levels.get("target", 0.0),
+                        "control_risk_reward": pilot_levels.get("rr", 0.0),
+                        "control_v1_eligible": control_v1_eligible,
+                        "probe_policy_id": BEAR_PILOT_POLICY_ID,
+                        "probe_target_price": probe_levels.get("target", 0.0),
+                        "probe_risk_reward": probe_levels.get("rr", 0.0),
+                        "probe_eligible": probe_eligible,
+                        "geometry_valid": pilot_zone.get("geometry_valid") is True,
+                        "level_evidence_status": probe_levels.get("level_evidence_status"),
+                        "level_evidence_source": probe_levels.get("level_evidence_source"),
+                        "rejection_codes": rejection_codes,
+                    }
+                )
+                if probe_eligible:
+                    pilot_eligible_candidates.append((row, probe_levels, pilot_zone, control_v1_eligible))
         adapter.record_planned_order(plan)
         audits.append(plan)
+
+    pilot_eligible_candidates.sort(
+        key=lambda item: (not item[3], execution_risk_priority_key(item[0], item[1]))
+    )
+    for row, probe_levels, pilot_zone, _control_v1_eligible in pilot_eligible_candidates:
+        if len(pilot_plans) >= BEAR_PILOT_MAX_FILLS:
+            break
+        close = safe_float(row.get("close"))
+        shares = planned_shares(
+            equity=pilot_equity,
+            entry=close,
+            stop=safe_float(probe_levels.get("stop")),
+            score=safe_float(row.get("score")),
+            risk_per_plan_pct=BEAR_PILOT_POSITION_PCT,
+            t1_loss_buffer_pct=safe_float(probe_levels.get("t1_loss_buffer_pct")),
+            value_pct=BEAR_PILOT_POSITION_PCT,
+        )
+        remaining = max(pilot_equity * BEAR_PILOT_MAX_EXPOSURE_PCT - pilot_planned_gross, 0.0)
+        shares = min(shares, int((remaining / close) // 100) * 100 if close > 0 else 0)
+        if shares <= 0:
+            continue
+        pilot = bear_pilot_plan(
+            row,
+            trade_date,
+            signal_date,
+            len(pilot_plans) + 1,
+            shares,
+            probe_levels,
+            pilot_zone,
+            regime,
+            pilot_account_id,
+        )
+        pilot_adapter.record_planned_order(pilot)
+        pilot_plans.append(pilot)
+        pilot_planned_gross += close * shares
+
+    superseded = supersede_unselected_same_date_plans(
+        ledger,
+        account_id,
+        trade_date.isoformat(),
+        {str(row.get("planned_order_id") or "") for row in created},
+    )
+    pilot_superseded = supersede_unselected_same_date_plans(
+        ledger,
+        pilot_account_id,
+        trade_date.isoformat(),
+        {str(row.get("planned_order_id") or "") for row in pilot_plans},
+    ) if pilot_adapter else 0
 
     status = (
         "PASS"
@@ -531,6 +583,19 @@ def generate_plan(
         else "FAIL_CLOSED"
     )
     style_diagnostic = build_style_diagnostic(signal_date, ordered, audits, sector_map)
+    signal_starvation = build_signal_starvation(
+        trade_date,
+        current_candidate_count=len(audits),
+        current_core_count=len(created),
+        current_pilot_count=len(pilot_plans),
+    )
+    strict_full_gate_count = sum(
+        execution_history_adjusted(row)
+        and levels["rr"] >= 2.0
+        and levels["target"] > safe_float(row.get("close"))
+        and entry_zone(row, levels)["geometry_valid"] is True
+        for row, levels in strict_candidates
+    )
     return {
         "schema_version": "chan520_local_sim_core_plan_v2",
         "policy_id": POLICY_ID,
@@ -548,11 +613,14 @@ def generate_plan(
         "scan_quality": scan_quality,
         "expired_plan_count": expired,
         "pilot_expired_plan_count": pilot_expired,
+        "superseded_plan_count": superseded,
+        "pilot_superseded_plan_count": pilot_superseded,
         "strict_scan_count": len(strict_rows),
         "watch_scan_count": len(watch_rows),
         "executable_buy_count": len(created),
         "buy_entry_ready": len(created) > 0,
         "execution_readiness": "TRADE_READY" if created else "RISK_ONLY",
+        "signal_starvation": signal_starvation,
         "planned_new_gross": planned_gross,
         "planned_new_exposure_pct": planned_gross / equity if equity else 0.0,
         "account_equity": equity,
@@ -560,6 +628,7 @@ def generate_plan(
             "scanned_count": int(scan_quality.get("success") or scan_quality.get("successful_count") or scan_quality.get("usable_count") or len(ordered)),
             "universe_count": int(scan_quality.get("universe") or scan_quality.get("universe_count") or scan_quality.get("expected_count") or len(ordered)),
             "strict_count": len(strict_rows),
+            "strict_full_gate_count": strict_full_gate_count,
             "watch_count": len(watch_rows),
             "shortlisted_count": len(audits),
             "geometry_valid_count": sum(row.get("geometry_valid") is True for row in audits),
@@ -595,14 +664,21 @@ def generate_plan(
             },
             "bear_pilot": {
                 "policy_id": BEAR_PILOT_POLICY_ID,
+                "control_policy_id": BEAR_PILOT_CONTROL_POLICY_ID,
                 "status": "ARMED" if pilot_plans else "NO_ELIGIBLE_PLAN",
                 "account_id": pilot_account_id,
                 "eligible_count": len(pilot_plans),
+                "eligible_candidate_count": len(pilot_eligible_candidates),
                 "symbols": [str(row.get("symbol") or "") for row in pilot_plans],
                 "max_positions": BEAR_PILOT_MAX_FILLS,
                 "position_cap_pct": BEAR_PILOT_POSITION_PCT,
                 "account_exposure_cap_pct": BEAR_PILOT_MAX_EXPOSURE_PCT,
-                "minimum_risk_reward": BEAR_PILOT_MIN_RR,
+                "minimum_risk_reward": BEAR_PROBE_MIN_TARGET_RISK_MULTIPLE,
+                "control_v1_minimum_risk_reward": BEAR_PILOT_MIN_RR,
+                "selection_priority": "control_v1_eligible_then_t1_risk_v1",
+                "control_v1_eligible_count": sum(row["control_v1_eligible"] for row in pilot_audits),
+                "probe_target_policy": "atr_1_5_or_1_25_risk_v1",
+                "eligibility_audit": pilot_audits,
                 "planned_gross": round(pilot_planned_gross, 2),
                 "planned_exposure_pct": pilot_planned_gross / pilot_equity if pilot_equity else 0.0,
                 "execution_scope": BEAR_PILOT_EXECUTION_SCOPE,
@@ -784,6 +860,62 @@ def candidate_levels(row: dict[str, str], signal_date: date, *, offline: bool = 
         "target_price_available": target > 0,
         "level_evidence_source": evidence_source,
     }
+
+
+def bear_probe_levels(row: dict[str, Any], control_levels: dict[str, Any]) -> dict[str, Any]:
+    close = safe_float(row.get("close"))
+    stop = safe_float(control_levels.get("stop"))
+    atr14 = safe_float(control_levels.get("atr14"))
+    average_amplitude = safe_float(control_levels.get("average_amplitude_pct"))
+    if atr14 <= 0 and close > 0 and average_amplitude > 0:
+        atr14 = close * average_amplitude
+    risk = max(close - stop, 0.0)
+    target_distance = max(
+        atr14 * BEAR_PROBE_TARGET_ATR_MULTIPLE,
+        risk * BEAR_PROBE_MIN_TARGET_RISK_MULTIPLE,
+    )
+    target = close + target_distance if close > stop > 0 and target_distance > 0 else 0.0
+    rr = (target - close) / risk if target > close and risk > 0 else 0.0
+    source = str(control_levels.get("level_evidence_source") or "unknown")
+    return {
+        **control_levels,
+        "target": round(target, 2),
+        "rr": round(rr, 4),
+        "atr14": round(atr14, 4),
+        "target_price_available": target > close > 0,
+        "level_evidence_source": f"{source}+atr_structure_probe",
+        "reason_codes": [
+            code
+            for code in list(control_levels.get("reason_codes") or [])
+            if code != "NO_UPSIDE_PRESSURE_SPACE"
+        ],
+        "target_policy": "atr_1_5_or_1_25_risk_v1",
+        "control_target": safe_float(control_levels.get("target")),
+        "control_rr": safe_float(control_levels.get("rr")),
+    }
+
+
+def bear_probe_rejection_codes(
+    row: dict[str, Any],
+    zone: dict[str, Any],
+    levels: dict[str, Any],
+    scan_quality: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    if scan_quality.get("coverage_pass") is not True:
+        reasons.append("SCAN_COVERAGE_BLOCKED")
+    if scan_quality.get("execution_coverage_pass") is not True:
+        reasons.append("SCAN_EXECUTION_COVERAGE_BLOCKED")
+    if not execution_history_adjusted(row):
+        reasons.append("UNADJUSTED_HISTORY_BLOCKED")
+    if str(levels.get("level_evidence_status") or "COMPLETE") != "COMPLETE":
+        reasons.append("LEVEL_EVIDENCE_INCOMPLETE")
+    if zone.get("geometry_valid") is not True:
+        reasons.extend(list(zone.get("reason_codes") or ["INVALID_PLAN_GEOMETRY"]))
+    close = safe_float(row.get("close"))
+    if not (safe_float(levels.get("target")) > close > safe_float(levels.get("stop")) > 0):
+        reasons.append("PROBE_TARGET_OR_STOP_INVALID")
+    return list(dict.fromkeys(reasons))
 
 
 def fallback_levels(row: dict[str, str]) -> dict[str, Any]:
@@ -976,30 +1108,94 @@ def bear_pilot_plan(
     code = str(row.get("code") or "")
     payload.update(
         {
-            "planned_order_id": f"BEAR-PILOT:{trade_date.isoformat()}:{code}",
-            "pending_order_id": f"BEAR-PILOT:{trade_date.isoformat()}:{code}",
-            "order_intent_id": f"BEAR-PILOT-{trade_date.isoformat()}-{rank:02d}",
-            "run_id": f"bear-pilot-{trade_date.isoformat()}",
+            "planned_order_id": f"BEAR-PROBE:{trade_date.isoformat()}:{code}",
+            "pending_order_id": f"BEAR-PROBE:{trade_date.isoformat()}:{code}",
+            "order_intent_id": f"BEAR-PROBE-{trade_date.isoformat()}-{rank:02d}",
+            "run_id": f"bear-probe-v2-{trade_date.isoformat()}",
             "account_id": account_id,
             "local_sim_execution_policy_id": BEAR_PILOT_POLICY_ID,
             "execution_scope": BEAR_PILOT_EXECUTION_SCOPE,
             "research_only": True,
             "research_pilot": True,
-            "research_cohort": "BEAR_DEFENSIVE_PILOT",
+            "research_cohort": "BEAR_DEFENSIVE_PROBE_V2",
             "core_account_affected": False,
             "gm_submit_enabled": False,
-            "reason_code": "BEAR_PILOT_RISK_QUALIFIED",
+            "reason_code": "BEAR_PROBE_V2_QUALIFIED",
             "reason_codes": [
                 "BEAR_DEFENSIVE_SHAPE",
-                "RR_GTE_2",
+                "ATR_STRUCTURE_TARGET",
                 "VALID_ENTRY_GEOMETRY",
                 "LOCAL_SIM_RESEARCH_ONLY",
             ],
             "blocking_reason_codes": [],
-            "sizing_policy": "bear_pilot_2_5pct_with_t1_risk_cap_v1",
+            "sizing_policy": "bear_probe_v2_2_5pct_with_t1_risk_cap",
+            "exit_risk_reason": (
+                f"T+1 后跌破止损 {levels['stop']:.2f}、趋势失效或触发利润回撤保护；"
+                f"结构目标参考 {levels['target']:.2f}"
+            ),
         }
     )
     return payload
+
+
+def build_signal_starvation(
+    trade_date: date,
+    *,
+    current_candidate_count: int,
+    current_core_count: int,
+    current_pilot_count: int,
+    threshold_sessions: int = 5,
+) -> dict[str, Any]:
+    history_root = ROOT / "reports" / "local_sim_plan"
+    prior_rows: list[dict[str, Any]] = []
+    if history_root.exists():
+        for path in sorted(history_root.glob("*/core_plan.json"), reverse=True):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                row_date = date.fromisoformat(str(payload.get("trade_date") or ""))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if row_date >= trade_date:
+                continue
+            funnel = payload.get("execution_funnel") or {}
+            prior_rows.append(
+                {
+                    "trade_date": row_date.isoformat(),
+                    "candidate_count": len(payload.get("plans") or []),
+                    "core_count": safe_int(funnel.get("core_executable_count", payload.get("executable_buy_count"))),
+                    "pilot_count": safe_int(funnel.get("bear_pilot_count")),
+                }
+            )
+            if len(prior_rows) >= threshold_sessions:
+                break
+    prior_streak = 0
+    for row in prior_rows:
+        if row["candidate_count"] > 0 and row["core_count"] + row["pilot_count"] == 0:
+            prior_streak += 1
+        else:
+            break
+    current_zero = current_candidate_count > 0 and current_core_count + current_pilot_count == 0
+    streak = prior_streak + 1 if current_zero else 0
+    if current_zero and streak >= threshold_sessions:
+        state = "ALERT"
+        reason_code = "SIGNAL_STARVATION"
+    elif not current_zero and prior_streak >= threshold_sessions:
+        state = "RECOVERED"
+        reason_code = "SIGNAL_STARVATION_RECOVERED"
+    else:
+        state = "OK"
+        reason_code = ""
+    return {
+        "status": state,
+        "reason_code": reason_code,
+        "threshold_sessions": threshold_sessions,
+        "consecutive_zero_execution_sessions": streak,
+        "previous_zero_execution_sessions": prior_streak,
+        "current_candidate_count": current_candidate_count,
+        "current_core_count": current_core_count,
+        "current_pilot_count": current_pilot_count,
+        "evidence_dates": [row["trade_date"] for row in prior_rows[:threshold_sessions]],
+    }
 
 
 def account_equity(adapter: LocalSimBrokerAdapter | None) -> float:
@@ -1026,6 +1222,39 @@ def expire_old_buy_plans(ledger: Path, account_id: str, trade_date: str) -> int:
               and status in ({placeholders})
             """,
             (datetime.now(TZ).astimezone(ZoneInfo("UTC")).isoformat(timespec="seconds"), account_id, trade_date, *ACTIVE_BUY_STATUSES),
+        )
+        return int(cur.rowcount)
+
+
+def supersede_unselected_same_date_plans(
+    ledger: Path,
+    account_id: str,
+    trade_date: str,
+    selected_ids: set[str],
+) -> int:
+    if not ledger.exists():
+        return 0
+    status_placeholders = ",".join("?" for _ in ACTIVE_BUY_STATUSES)
+    selected = sorted(item for item in selected_ids if item)
+    selected_clause = f"and planned_order_id not in ({','.join('?' for _ in selected)})" if selected else ""
+    with sqlite3.connect(ledger) as conn:
+        cur = conn.execute(
+            f"""
+            update planned_orders
+            set status = 'SUPERSEDED_PLAN_REFRESH',
+                last_message = 'superseded by same-date plan regeneration',
+                updated_at = ?
+            where account_id = ? and upper(side) = 'BUY' and trade_date = ?
+              and status in ({status_placeholders})
+              {selected_clause}
+            """,
+            (
+                datetime.now(TZ).astimezone(ZoneInfo("UTC")).isoformat(timespec="seconds"),
+                account_id,
+                trade_date,
+                *ACTIVE_BUY_STATUSES,
+                *selected,
+            ),
         )
         return int(cur.rowcount)
 

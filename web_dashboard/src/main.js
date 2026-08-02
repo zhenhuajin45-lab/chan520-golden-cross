@@ -93,6 +93,7 @@ function render() {
         ${renderCorePlanAlert(payload)}
         ${renderResearchPilot(payload.research_pilot || {}, payload.core_plan || {})}
         ${renderCounterfactualReplay(payload.counterfactual_replay || {})}
+        ${renderWeeklyReview(payload.weekly_review || {})}
         ${renderKpis(account)}
         <section class="grid">
           <article class="panel">
@@ -190,13 +191,18 @@ function renderCorePlanAlert(payload) {
   const supplemental = core.supplemental_market_context || {};
   const style = core.candidate_style_diagnostic || {};
   const funnel = core.execution_funnel || {};
+  const starvation = core.signal_starvation || {};
   const coverage = Number(quality.coverage);
   const coverageText = Number.isFinite(coverage) ? `${(coverage * 100).toFixed(2)}%` : "未知";
   const executionCoverage = Number(quality.execution_coverage);
   const executionCoverageText = Number.isFinite(executionCoverage)
     ? `${(executionCoverage * 100).toFixed(2)}%`
     : "未知";
-  const kind = core.status === "PASS" && Number(core.executable_buy_count || 0) > 0 ? "ok" : core.status === "PASS" ? "warning" : "danger";
+  const kind = starvation.status === "ALERT"
+    ? "danger"
+    : core.status === "PASS" && Number(core.executable_buy_count || 0) > 0
+      ? "ok"
+      : core.status === "PASS" ? "warning" : "danger";
   const boundary = core.status !== "PASS"
     ? `自动新增买入已关闭，仅保留现有持仓风控。${core.failure_reason ? ` 原因：${core.failure_reason}` : ""}`
     : Number(core.executable_buy_count || 0) > 0
@@ -205,9 +211,12 @@ function renderCorePlanAlert(payload) {
   const supplementalText = supplemental.emotion_label ? `｜同花顺旁路 ${supplemental.emotion_label}` : "";
   const styleText = style.status ? `｜风格偏离 ${style.mismatch_alert ? "预警" : "正常"}` : "";
   const funnelText = funnel.scanned_count != null
-    ? `｜执行漏斗 ${intText(funnel.scanned_count)} 扫描 → ${intText(funnel.strict_count)} 严格 → ${intText(funnel.core_executable_count)} 核心 → ${intText(funnel.bear_pilot_count)} 熊市小仓`
+    ? `｜执行漏斗 ${intText(funnel.scanned_count)} 扫描 → ${intText(funnel.strict_count)} 基础严格 → ${intText(funnel.strict_full_gate_count)} 完整严格 → ${intText(funnel.core_executable_count)} 核心 → ${intText(funnel.bear_pilot_count)} 熊市 probe`
     : "";
-  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜研究覆盖率 ${escapeHtml(coverageText)}｜执行级覆盖率 ${escapeHtml(executionCoverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}${escapeHtml(funnelText)}｜${escapeHtml(boundary)}</div>`;
+  const starvationText = starvation.status && starvation.status !== "OK"
+    ? `｜连续无执行 ${intText(starvation.consecutive_zero_execution_sessions || starvation.previous_zero_execution_sessions)} 日：${escapeHtml(starvation.status)}`
+    : "";
+  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜研究覆盖率 ${escapeHtml(coverageText)}｜执行级覆盖率 ${escapeHtml(executionCoverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}${escapeHtml(funnelText)}${escapeHtml(starvationText)}｜${escapeHtml(boundary)}</div>`;
 }
 
 function renderSessionMarketAlert(payload) {
@@ -236,7 +245,7 @@ function renderResearchPilot(pilot, core) {
       <div class="pilot-head">
         <div>
           <h2>熊市研究小仓</h2>
-          <p class="meta">独立账户 ${escapeHtml(account.account_id || pilot.account_id || "-")}｜仅本地模拟研究｜不连接 GM｜不影响核心账户</p>
+          <p class="meta">独立账户 ${escapeHtml(account.account_id || pilot.account_id || "-")}｜${escapeHtml(cohort.policy_id || "bear probe")}｜仅本地模拟研究｜不连接 GM｜不影响核心账户</p>
         </div>
         <span class="pilot-status">${escapeHtml(cohort.status || pilot.status)}</span>
       </div>
@@ -252,6 +261,7 @@ function renderResearchPilot(pilot, core) {
         <div>
           <h3>计划与入场理由</h3>
           ${renderPilotPlans(activePlans)}
+          ${renderPilotAudit(cohort.eligibility_audit || [], new Set(activePlans.map((row) => String(row.symbol || ""))))}
         </div>
         <div>
           <h3>持仓与成交</h3>
@@ -259,6 +269,22 @@ function renderResearchPilot(pilot, core) {
         </div>
       </div>
     </section>
+  `;
+}
+
+function renderPilotAudit(rows, selectedSymbols) {
+  if (!rows.length) return `<p class="pilot-empty">本次未记录 probe 资格审计</p>`;
+  return `
+    <h3>资格审计</h3>
+    ${rows.slice(0, 6).map((row) => {
+      const symbol = String(row.symbol || "");
+      const result = selectedSymbols.has(symbol)
+        ? `最终入选（${row.control_v1_eligible ? "v1优先" : "v2补位"}）`
+        : row.probe_eligible
+          ? "probe 通过，未入选（名额/优先级）"
+          : (row.rejection_codes || []).join(", ") || "未通过";
+      return `<div class="pilot-row"><strong>${escapeHtml(`${row.stock_name || ""} ${row.symbol || ""}`.trim())}</strong><span>v1 R:R ${price(row.control_risk_reward)}｜probe R:R ${price(row.probe_risk_reward)}｜目标 ${price(row.probe_target_price)}</span><small>${escapeHtml(result)}</small></div>`;
+    }).join("")}
   `;
 }
 
@@ -289,6 +315,32 @@ function renderPilotActivity(positions, fills) {
     </div>
   `);
   return [...positionRows, ...fillRows].join("") || `<p class="pilot-empty">当前无持仓和成交</p>`;
+}
+
+function renderWeeklyReview(review) {
+  if (!review.status) return "";
+  if (review.status !== "PASS") {
+    return `<div class="valuation-alert warning">周度复盘 ${escapeHtml(review.status)}｜${escapeHtml(review.error || "证据不足")}</div>`;
+  }
+  const actual = review.actual_account || {};
+  const sameDay = review.exact_research_same_day_mark || {};
+  const t1 = review.t1_next_close_observation || {};
+  return `
+    <section class="pilot-workbench">
+      <div class="pilot-head">
+        <div><h2>五日运行复盘</h2><p class="meta">${escapeHtml(review.start_date || "-")} 至 ${escapeHtml(review.end_date || "-")}｜研究回放不写入实际账本</p></div>
+        <span class="pilot-status">${escapeHtml((review.alerts || []).join(", ") || "PASS")}</span>
+      </div>
+      <div class="pilot-metrics">
+        <span>实际订单/成交 <strong>${intText(actual.order_count)} / ${intText(actual.fill_count)}</strong></span>
+        <span>候选日样本 <strong>${intText(review.candidate_day_count)}</strong></span>
+        <span>核心/probe计划 <strong>${intText(review.core_executable_count)} / ${intText(review.pilot_plan_count)}</strong></span>
+        <span>当日盯市 <strong class="${pnlClass(sameDay.net_mark_pnl)}">${signedMoney(sameDay.net_mark_pnl)}</strong></span>
+        <span>T+1完成观察 <strong>${intText(t1.completed_count)}</strong></span>
+        <span>T+1净观察 <strong class="${pnlClass(t1.net_pnl)}">${signedMoney(t1.net_pnl)}</strong></span>
+      </div>
+    </section>
+  `;
 }
 
 function renderReadinessAlert(payload) {
@@ -548,7 +600,7 @@ function stockText(row) {
 }
 
 function compactText(parts) {
-  const text = parts.map((item) => String(item || "").trim()).filter(Boolean).join("｜");
+  const text = [...new Set(parts.map((item) => String(item || "").trim()).filter(Boolean))].join("｜");
   return text || "未记录";
 }
 

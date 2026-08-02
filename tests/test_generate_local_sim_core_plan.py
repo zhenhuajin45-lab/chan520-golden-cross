@@ -399,6 +399,171 @@ def test_bear_market_arms_isolated_small_pilot_without_changing_core_account(tmp
     assert core_adapter.account_snapshot()["cash"] == 1_000_000.0
 
 
+def test_bear_probe_v2_audits_v1_rr_rejection_but_can_arm_isolated_plan(tmp_path, monkeypatch):
+    ledger = tmp_path / "local_sim.sqlite"
+    core_adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id="plan-test", initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    pilot_adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id=core_plan.BEAR_PILOT_ACCOUNT_ID, initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    monkeypatch.setattr(
+        core_plan,
+        "candidate_levels",
+        lambda *_args, **_kwargs: {
+            "stop": 9.4,
+            "target": 10.4,
+            "rr": 0.6667,
+            "atr14": 0.5,
+            "t1_loss_buffer_pct": 0.075,
+            "reason_codes": [],
+            "level_evidence_status": "COMPLETE",
+            "target_price_available": True,
+            "level_evidence_source": "test_prior_high",
+        },
+    )
+    rows = [{
+        "code": "600177", "name": "雅戈尔", "verdict": "观察（等待确认）", "defect_count": "1",
+        "score": "20", "close": "10.00", "ma5": "9.90", "ma20": "9.50", "rsi14": "62",
+        "history_source": "tencent_qfq",
+    }]
+
+    payload = core_plan.generate_plan(
+        adapter=core_adapter,
+        ledger=Path(ledger),
+        account_id="plan-test",
+        trade_date=date(2026, 7, 22),
+        signal_date=date(2026, 7, 21),
+        scan_path=tmp_path / "scan.csv",
+        scan_rows=rows,
+        regime={"state": "BEAR", "regime_ok": False, "detail": "down"},
+        scan_quality={"coverage": 0.99, "coverage_pass": True, "execution_coverage": 0.99, "execution_coverage_pass": True},
+        pilot_adapter=pilot_adapter,
+        pilot_account_id=core_plan.BEAR_PILOT_ACCOUNT_ID,
+        max_candidates=20,
+        max_buy_plans=2,
+        max_new_exposure_pct=0.15,
+        risk_per_plan_pct=0.005,
+    )
+
+    cohort = payload["research_cohorts"]["bear_pilot"]
+    assert cohort["policy_id"] == core_plan.BEAR_PILOT_POLICY_ID
+    assert cohort["control_v1_eligible_count"] == 0
+    assert cohort["status"] == "ARMED"
+    assert cohort["eligibility_audit"][0]["control_v1_eligible"] is False
+    assert cohort["eligibility_audit"][0]["probe_eligible"] is True
+    assert payload["execution_funnel"]["bear_pilot_count"] == 1
+
+
+def test_bear_probe_prefers_control_v1_candidate_before_relaxed_candidate(tmp_path, monkeypatch):
+    ledger = tmp_path / "local_sim.sqlite"
+    core_adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id="plan-test", initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    pilot_adapter = LocalSimBrokerAdapter(
+        LocalSimBrokerConfig(account_id=core_plan.BEAR_PILOT_ACCOUNT_ID, initial_cash=1_000_000.0, ledger_path=str(ledger))
+    )
+    pilot_adapter.record_planned_order(
+        {
+            "planned_order_id": "BEAR-PROBE:2026-07-22:600999",
+            "trade_date": "2026-07-22",
+            "symbol": "600999",
+            "side": "BUY",
+            "volume": 100,
+            "status": "WATCH_TRIGGER",
+        }
+    )
+
+    def levels(row, *_args, **_kwargs):
+        qualified = row["code"] == "600002"
+        return {
+            "stop": 9.4,
+            "target": 12.0 if qualified else 10.4,
+            "rr": 3.3333 if qualified else 0.6667,
+            "atr14": 0.5,
+            "t1_loss_buffer_pct": 0.075,
+            "reason_codes": [],
+            "level_evidence_status": "COMPLETE",
+            "target_price_available": True,
+            "level_evidence_source": "test",
+        }
+
+    monkeypatch.setattr(core_plan, "candidate_levels", levels)
+    monkeypatch.setattr(core_plan, "BEAR_PILOT_MAX_FILLS", 1)
+    rows = [
+        {
+            "code": code,
+            "name": code,
+            "verdict": "观察（等待确认）",
+            "defect_count": "1",
+            "score": score,
+            "close": "10.00",
+            "ma5": "9.90",
+            "ma20": "9.50",
+            "rsi14": "62",
+            "history_source": "tencent_qfq",
+        }
+        for code, score in [("600001", "25"), ("600002", "18")]
+    ]
+
+    payload = core_plan.generate_plan(
+        adapter=core_adapter,
+        ledger=Path(ledger),
+        account_id="plan-test",
+        trade_date=date(2026, 7, 22),
+        signal_date=date(2026, 7, 21),
+        scan_path=tmp_path / "scan.csv",
+        scan_rows=rows,
+        regime={"state": "BEAR", "regime_ok": False},
+        scan_quality={
+            "coverage": 1.0,
+            "coverage_pass": True,
+            "execution_coverage": 1.0,
+            "execution_coverage_pass": True,
+        },
+        pilot_adapter=pilot_adapter,
+        pilot_account_id=core_plan.BEAR_PILOT_ACCOUNT_ID,
+        max_candidates=20,
+        max_buy_plans=2,
+        max_new_exposure_pct=0.15,
+        risk_per_plan_pct=0.005,
+    )
+
+    assert payload["research_cohorts"]["bear_pilot"]["symbols"] == ["600002"]
+    assert payload["pilot_superseded_plan_count"] == 1
+    statuses = {
+        row["planned_order_id"]: row["status"] for row in pilot_adapter.planned_orders_snapshot()
+    }
+    assert statuses["BEAR-PROBE:2026-07-22:600999"] == "SUPERSEDED_PLAN_REFRESH"
+
+
+def test_signal_starvation_alerts_and_recovers_after_five_sessions(tmp_path, monkeypatch):
+    root = tmp_path / "reports" / "local_sim_plan"
+    for day in range(27, 32):
+        folder = root / f"202607{day}"
+        folder.mkdir(parents=True)
+        (folder / "core_plan.json").write_text(
+            json.dumps({
+                "trade_date": f"2026-07-{day}",
+                "plans": [{"symbol": "600001"}],
+                "execution_funnel": {"core_executable_count": 0, "bear_pilot_count": 0},
+            }),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(core_plan, "ROOT", tmp_path)
+
+    alert = core_plan.build_signal_starvation(
+        date(2026, 8, 3), current_candidate_count=3, current_core_count=0, current_pilot_count=0
+    )
+    recovered = core_plan.build_signal_starvation(
+        date(2026, 8, 3), current_candidate_count=3, current_core_count=0, current_pilot_count=1
+    )
+
+    assert alert["status"] == "ALERT"
+    assert alert["consecutive_zero_execution_sessions"] == 6
+    assert recovered["status"] == "RECOVERED"
+
+
 def test_execution_priority_prefers_lower_t1_and_volatility_risk():
     low_risk = {"t1_loss_buffer_pct": 0.075, "average_amplitude_pct": 0.02, "rr": 2.1}
     high_risk = {"t1_loss_buffer_pct": 0.12, "average_amplitude_pct": 0.01, "rr": 4.0}

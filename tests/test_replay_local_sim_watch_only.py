@@ -170,3 +170,14 @@ def test_bear_reconstruction_can_activate_legacy_unknown_watch_sample():
     core = {"market_regime": {"state": "UNKNOWN"}, "research_regime": {"state": "BEAR"}, "plans": [row]}
 
     assert [item["symbol"] for item in research_candidates(core)] == ["600001"]
+
+
+def test_explicit_bear_cohort_excludes_legacy_shaped_strict_rows():
+    explicit = candidate("600001", 2, 10.0)
+    legacy = candidate("601156", 1, 20.0)
+    legacy.pop("research_only")
+    legacy.pop("research_cohort")
+    legacy.update({"geometry_valid": True, "score": 25, "rsi14": 60})
+    core = {"market_regime": {"state": "BEAR"}, "plans": [legacy, explicit]}
+
+    assert [item["symbol"] for item in research_candidates(core)] == ["600001"]
