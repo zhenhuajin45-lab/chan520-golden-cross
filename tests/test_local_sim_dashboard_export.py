@@ -278,3 +278,27 @@ def test_session_market_snapshot_uses_completed_trade_date_refresh(tmp_path, mon
     assert snapshot["scan_rows"] == 4977
     assert snapshot["scan_quality"]["research_coverage_pass"] is True
     assert snapshot["scan_quality"]["execution_coverage_pass"] is True
+
+
+def test_readiness_export_preserves_research_entry_state(tmp_path, monkeypatch):
+    report_dir = tmp_path / "reports" / "local_sim_readiness" / "2026-08-03"
+    report_dir.mkdir(parents=True)
+    (report_dir / "readiness.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS_LOCAL_SIM_RESEARCH_ENTRY_READY",
+                "local_sim_risk_loop_ready": True,
+                "local_sim_buy_entry_ready": False,
+                "local_sim_research_entry_ready": True,
+                "local_sim_any_entry_ready": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exporter, "ROOT", tmp_path)
+
+    payload = exporter.load_readiness("2026-08-03")
+
+    assert payload["local_sim_buy_entry_ready"] is False
+    assert payload["local_sim_research_entry_ready"] is True
+    assert payload["local_sim_any_entry_ready"] is True

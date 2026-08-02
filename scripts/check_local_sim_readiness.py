@@ -21,6 +21,10 @@ from chan520_skill.broker_adapter import (  # noqa: E402
     LocalSimBrokerAdapter,
     LocalSimBrokerConfig,
 )
+from chan520_skill.execution_policy import (  # noqa: E402
+    BEAR_PILOT_ACCOUNT_ID,
+    BEAR_PILOT_APPROVED_POLICY_IDS,
+)
 from scripts.export_local_sim_dashboard import build_payload  # noqa: E402
 from scripts.push_local_sim_feishu import read_json, webhook_source_info, write_json  # noqa: E402
 
@@ -102,6 +106,15 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
     manual_ready = not manual_blocking
     plan_ok, plan_details = core_plan_check(Path(args.ledger), args.account_id, args.trade_date)
     checks.append(check("daily_core_plan", plan_ok, plan_details))
+    research_plan_ok, research_plan_details = research_plan_check(Path(args.ledger), args.trade_date)
+    research_plan_required = research_plan_details.get("required") is True
+    checks.append(
+        check(
+            "daily_research_plan",
+            research_plan_ok if research_plan_required else True,
+            research_plan_details,
+        )
+    )
     executor_paths = [
         ROOT / "scripts" / "execute_local_sim_triggers.py",
         ROOT / "scripts" / "execute_local_sim_risk_exits.py",
@@ -112,6 +125,8 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
     local_bridge_ready = manual_ready and executors_ok
     risk_loop_ready = local_bridge_ready
     buy_entry_ready = risk_loop_ready and plan_ok
+    research_entry_ready = risk_loop_ready and research_plan_required and research_plan_ok
+    any_entry_ready = buy_entry_ready or research_entry_ready
     daily_loop_blocking = [item for item in checks if not item["passed"]]
     buy_entry_blocking_reasons = sorted(
         {
@@ -135,6 +150,8 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
         "local_sim_open_close_bridge_ready": local_bridge_ready,
         "local_sim_risk_loop_ready": risk_loop_ready,
         "local_sim_buy_entry_ready": buy_entry_ready,
+        "local_sim_research_entry_ready": research_entry_ready,
+        "local_sim_any_entry_ready": any_entry_ready,
         "local_sim_daily_loop_ready": risk_loop_ready,
         "auto_open_close_kernel_ready": False,
         "gm_adapter_shadow_ready": False,
@@ -142,6 +159,8 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
         "status": (
             "PASS_LOCAL_SIM_BUY_ENTRY_READY"
             if buy_entry_ready
+            else "PASS_LOCAL_SIM_RESEARCH_ENTRY_READY"
+            if research_entry_ready
             else "PASS_LOCAL_SIM_RISK_LOOP_ONLY"
             if risk_loop_ready
             else "PASS_MANUAL_ONLY"
@@ -157,6 +176,7 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
         "notes": [
             "本检查确认本地 SQLite 模拟盘与 paper open/close bridge 的运行前置条件；仅限本地模拟盘。",
             "local_sim_risk_loop_ready 与 local_sim_buy_entry_ready 分离；核心计划失败只关闭新增买入，不关闭持仓风控。",
+            "BEAR 研究账户单独使用 local_sim_research_entry_ready；该状态不代表核心账户买入已放开。",
             "auto_open_close_kernel_ready 保持 false；日常本地执行器不等同于正式 paper kernel 或 GM adapter 端到端就绪。",
             "GM adapter/shadow 自动提交仍保持 fail-closed；shadow_readiness 必须保持 false。",
         ],
@@ -306,6 +326,59 @@ def core_plan_check(ledger: Path, account_id: str, trade_date: str) -> tuple[boo
     }
 
 
+def research_plan_check(ledger: Path, trade_date: str) -> tuple[bool, dict[str, Any]]:
+    report_path = ROOT / "reports" / "local_sim_plan" / trade_date.replace("-", "") / "core_plan.json"
+    report = read_json(report_path, {})
+    regime = str((report.get("market_regime") or {}).get("state") or "").upper()
+    required = report.get("status") == "PASS" and regime == "BEAR"
+    if not ledger.exists():
+        return False, {"required": required, "reason": "ledger_missing", "report_path": str(report_path)}
+    try:
+        with sqlite3.connect(ledger) as conn:
+            rows = conn.execute(
+                "select status, payload_json from planned_orders where account_id = ? and trade_date = ? and upper(side) = 'BUY'",
+                (BEAR_PILOT_ACCOUNT_ID, trade_date),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return False, {
+            "required": required,
+            "reason": "ledger_error",
+            "message": str(exc),
+            "report_path": str(report_path),
+        }
+    approved_policy = 0
+    executable_approved = 0
+    policy_ids: set[str] = set()
+    for status, payload_json in rows:
+        try:
+            payload = json.loads(str(payload_json or "{}"))
+        except json.JSONDecodeError:
+            continue
+        policy_id = str(payload.get("local_sim_execution_policy_id") or "")
+        if policy_id not in BEAR_PILOT_APPROVED_POLICY_IDS:
+            continue
+        approved_policy += 1
+        policy_ids.add(policy_id)
+        if status in {"WATCH_TRIGGER", "CONFIRMED_TRIGGER", "FILLED"}:
+            executable_approved += 1
+    cohort = ((report.get("research_cohorts") or {}).get("bear_pilot") or {}) if report else {}
+    report_ok = required and cohort.get("status") == "ARMED" and int(cohort.get("queued_count") or 0) > 0
+    return executable_approved > 0 and report_ok, {
+        "required": required,
+        "account_id": BEAR_PILOT_ACCOUNT_ID,
+        "plan_count": len(rows),
+        "approved_policy_count": approved_policy,
+        "executable_approved_count": executable_approved,
+        "policy_ids": sorted(policy_ids),
+        "approved_policy_ids": sorted(BEAR_PILOT_APPROVED_POLICY_IDS),
+        "report_path": str(report_path),
+        "report_status": report.get("status"),
+        "market_regime": regime or None,
+        "cohort_status": cohort.get("status"),
+        "queued_count": int(cohort.get("queued_count") or 0),
+    }
+
+
 def check(name: str, passed: bool, details: dict[str, Any]) -> dict[str, Any]:
     return {"name": name, "passed": bool(passed), "details": details}
 
@@ -318,6 +391,8 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
         "local_sim_open_close_bridge_ready": payload.get("local_sim_open_close_bridge_ready"),
         "local_sim_risk_loop_ready": payload.get("local_sim_risk_loop_ready"),
         "local_sim_buy_entry_ready": payload.get("local_sim_buy_entry_ready"),
+        "local_sim_research_entry_ready": payload.get("local_sim_research_entry_ready"),
+        "local_sim_any_entry_ready": payload.get("local_sim_any_entry_ready"),
         "local_sim_daily_loop_ready": payload.get("local_sim_daily_loop_ready"),
         "auto_open_close_kernel_ready": payload.get("auto_open_close_kernel_ready"),
         "gm_adapter_shadow_ready": payload.get("gm_adapter_shadow_ready"),

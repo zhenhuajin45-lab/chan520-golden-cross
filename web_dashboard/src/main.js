@@ -370,11 +370,14 @@ function renderReadinessAlert(payload) {
   if (!readiness.status) return "";
   const riskReady = readiness.local_sim_risk_loop_ready === true;
   const buyReady = readiness.local_sim_buy_entry_ready === true;
-  const kind = !riskReady ? "danger" : buyReady ? "ok" : "warning";
+  const researchReady = readiness.local_sim_research_entry_ready === true;
+  const anyEntryReady = buyReady || researchReady;
+  const kind = !riskReady ? "danger" : anyEntryReady ? "ok" : "warning";
   const riskText = riskReady ? "风险闭环 READY" : "风险闭环 BLOCKED";
-  const buyText = buyReady ? "新增买入 READY" : "新增买入 BLOCKED";
+  const buyText = buyReady ? "核心买入 READY" : "核心买入 BLOCKED";
+  const researchText = researchReady ? "研究队列 READY" : "研究队列 BLOCKED";
   const blockers = (readiness.buy_entry_blocking_reasons || readiness.buy_entry_blocking_checks || []).join(", ") || "无";
-  return `<div class="valuation-alert ${kind}">${escapeHtml(readiness.status)}｜${escapeHtml(riskText)}｜${escapeHtml(buyText)}｜买入阻断 ${escapeHtml(blockers)}</div>`;
+  return `<div class="valuation-alert ${kind}">${escapeHtml(readiness.status)}｜${escapeHtml(riskText)}｜${escapeHtml(buyText)}｜${escapeHtml(researchText)}｜核心阻断 ${escapeHtml(blockers)}</div>`;
 }
 
 function renderCounterfactualReplay(replay) {

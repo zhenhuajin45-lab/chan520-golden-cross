@@ -39,3 +39,4 @@
 - 队列前两只是 `002668 TCL智家` 900 股、`002303 美盈森` 2,100 股；其余候选不会因为前两只未触发而失去盘中检查机会。
 - 10 只队列名义金额合计约 9.38%，这是互斥触发预算而非可同时成交仓位；每日成交上限 2 只、最多持仓 5 只、可执行总暴露仍严格为 5%。
 - 周末 dry-run 识别 10 张有效计划并因不在连续竞价时段全部返回 `NOT_IN_CONTINUOUS_AUCTION`，成交数 0，fail-closed 符合预期。
+- 盘前 readiness 明确返回 `local_sim_research_entry_ready=true`、`local_sim_any_entry_ready=true`；核心 `local_sim_buy_entry_ready=false` 和 `shadow_readiness=false` 继续保持。
