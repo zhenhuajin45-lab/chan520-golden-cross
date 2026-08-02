@@ -213,6 +213,13 @@ def build_steps(args: argparse.Namespace, trade_date: str) -> list[dict[str, Any
                 ),
             )
         )
+        if date.fromisoformat(trade_date).weekday() == 4:
+            steps.append(
+                step(
+                    "weekly_review",
+                    script("review_local_sim_week.py", "--end-date", trade_date, "--sessions", "5"),
+                )
+            )
         steps.append(export_pilot_dashboard_step(trade_date, args.initial_cash))
         steps.append(pilot_risk_scan_step(args, trade_date))
         steps.append(export_dashboard_step(trade_date, args.initial_cash))

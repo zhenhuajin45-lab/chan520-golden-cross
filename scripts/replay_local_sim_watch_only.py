@@ -109,20 +109,41 @@ def research_candidates(core_plan: dict[str, Any]) -> list[dict[str, Any]]:
     if regime != "BEAR":
         return []
     plans = core_plan.get("plans") if isinstance(core_plan.get("plans"), list) else []
+    explicitly_tagged = [
+        row
+        for row in plans
+        if isinstance(row, dict)
+        and (
+            (row.get("research_only") is True and row.get("research_cohort") == "BEAR_DEFENSIVE_WATCH")
+            or "BEAR_DEFENSIVE_WATCH" in list(row.get("research_conditional_cohorts") or [])
+        )
+    ]
+    source_rows = explicitly_tagged if explicitly_tagged else [row for row in plans if isinstance(row, dict) and legacy_research_shape(row)]
     return sorted(
         [
             row
-            for row in plans
-            if isinstance(row, dict)
-            and (
-                (row.get("research_only") is True and row.get("research_cohort") == "BEAR_DEFENSIVE_WATCH")
-                or "BEAR_DEFENSIVE_WATCH" in list(row.get("research_conditional_cohorts") or [])
-                or legacy_research_shape(row)
-            )
-            and str(row.get("status") or "").upper() == "WATCH_ONLY"
+            for row in source_rows
+            if str(row.get("status") or "").upper() == "WATCH_ONLY"
         ],
         key=plan_rank,
     )
+
+
+def research_candidate_source(core_plan: dict[str, Any]) -> str:
+    regime = str((core_plan.get("research_regime") or core_plan.get("market_regime") or {}).get("state") or "UNKNOWN").upper()
+    if regime != "BEAR":
+        return "not_applicable"
+    plans = core_plan.get("plans") if isinstance(core_plan.get("plans"), list) else []
+    if any(
+        isinstance(row, dict)
+        and (
+            (row.get("research_only") is True and row.get("research_cohort") == "BEAR_DEFENSIVE_WATCH")
+            or "BEAR_DEFENSIVE_WATCH" in list(row.get("research_conditional_cohorts") or [])
+        )
+        for row in plans
+    ):
+        return "explicit_bear_defensive_cohort"
+    return "legacy_shape_fallback"
 
 
 def all_plan_candidates(core_plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -635,6 +656,7 @@ def base_payload(
         "actual_executable_buy_count": int(core_plan.get("executable_buy_count") or 0),
         "candidate_count": len(candidates),
         "candidate_symbols": [str(row.get("symbol") or "") for row in candidates],
+        "research_candidate_source": research_candidate_source(core_plan),
         "counterfactual_overrides": ["PLAN_MARKET_REGIME_BLOCKED", "STRICT_ENTRY_REQUIRED"],
         "guards_retained": [
             "two_stage_confirmation",

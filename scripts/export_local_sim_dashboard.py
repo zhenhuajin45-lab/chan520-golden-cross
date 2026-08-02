@@ -5,7 +5,7 @@ import json
 import sqlite3
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -195,6 +195,7 @@ def build_payload(
         "session_market_snapshot": load_session_market_snapshot(selected_trade_date),
         "readiness": load_readiness(selected_trade_date),
         "counterfactual_replay": load_counterfactual_replay(selected_trade_date),
+        "weekly_review": load_weekly_review(selected_trade_date),
         "account": {
             "account_id": account_id,
             "initial_cash": initial_cash,
@@ -560,6 +561,7 @@ def load_core_plan(trade_date: str) -> dict[str, Any]:
         "signal_date": payload.get("signal_date"),
         "execution_readiness": payload.get("execution_readiness"),
         "buy_entry_ready": payload.get("buy_entry_ready"),
+        "signal_starvation": payload.get("signal_starvation") or {},
         "executable_buy_count": payload.get("executable_buy_count", 0),
         "strict_scan_count": payload.get("strict_scan_count", 0),
         "watch_scan_count": payload.get("watch_scan_count", 0),
@@ -620,6 +622,7 @@ def load_counterfactual_replay(trade_date: str) -> dict[str, Any]:
         "live_execution_enabled": False,
         "candidate_count": payload.get("candidate_count", 0),
         "candidate_symbols": payload.get("candidate_symbols") or [],
+        "research_candidate_source": payload.get("research_candidate_source"),
         "filled_count": payload.get("filled_count", 0),
         "fills": payload.get("fills") or [],
         "position_cap_pct": payload.get("position_cap_pct"),
@@ -659,6 +662,23 @@ def load_session_market_snapshot(trade_date: str) -> dict[str, Any]:
         "scan_rows": payload.get("scan_rows", 0),
         "scan_evidence_path": payload.get("scan_evidence_path"),
     }
+
+
+def load_weekly_review(trade_date: str) -> dict[str, Any]:
+    if not trade_date:
+        return {}
+    requested = date.fromisoformat(trade_date)
+    root = ROOT / "reports" / "local_sim_weekly"
+    candidates = sorted(root.glob("*/weekly_review.json"), reverse=True) if root.exists() else []
+    for path in candidates:
+        payload = read_json(path, {})
+        try:
+            end_date = date.fromisoformat(str(payload.get("end_date") or ""))
+        except ValueError:
+            continue
+        if end_date <= requested:
+            return payload if isinstance(payload, dict) else {}
+    return {}
 
 
 def load_readiness(trade_date: str) -> dict[str, Any]:

@@ -108,6 +108,35 @@ def sample_payload():
     }
 
 
+def test_reason_text_deduplicates_identical_fields_and_marks_selected_audit():
+    assert feishu.compact_text("同一理由", "同一理由", "") == "同一理由"
+    assert feishu.pilot_audit_result(
+        {"symbol": "600001", "control_v1_eligible": True}, {"600001"}
+    ) == "最终入选（v1优先）"
+
+
+def test_review_fingerprint_changes_when_weekly_t1_evidence_changes():
+    first = sample_payload()
+    first["weekly_review"] = {
+        "status": "PASS",
+        "start_date": "2026-07-27",
+        "end_date": "2026-07-31",
+        "alerts": [],
+        "exact_research_same_day_mark": {"net_mark_pnl": 145.79},
+        "t1_next_close_observation": {"completed_count": 3, "missing_count": 1, "net_pnl": 395.01},
+    }
+    second = json.loads(json.dumps(first))
+    second["weekly_review"]["t1_next_close_observation"] = {
+        "completed_count": 4,
+        "missing_count": 0,
+        "net_pnl": -406.72,
+    }
+
+    assert feishu.review_evidence_fingerprint(first, "2026-07-31") != feishu.review_evidence_fingerprint(
+        second, "2026-07-31"
+    )
+
+
 def test_build_trade_card_uses_interactive_card():
     payload = sample_payload()
     card = build_trade_card(payload, payload["fills"][0], payload["orders"][0])
@@ -302,6 +331,17 @@ def test_feishu_cards_include_isolated_bear_pilot_plan_trade_and_review():
         "fills": [pilot_fill],
         "planned_orders": [pilot_plan],
     }
+    payload["weekly_review"] = {
+        "status": "PASS",
+        "start_date": "2026-07-27",
+        "end_date": "2026-07-31",
+        "actual_account": {"order_count": 0, "fill_count": 0},
+        "core_executable_count": 0,
+        "pilot_plan_count": 2,
+        "exact_research_same_day_mark": {"net_mark_pnl": 145.79},
+        "t1_next_close_observation": {"completed_count": 4, "net_pnl": -120.0},
+        "alerts": ["SIGNAL_STARVATION"],
+    }
 
     trade_card = build_trade_card(payload, {**pilot_fill, "_research_pilot": True}, pilot_order)
     plan_card = build_plan_card(payload, "2026-07-15")
@@ -321,6 +361,8 @@ def test_feishu_cards_include_isolated_bear_pilot_plan_trade_and_review():
     assert "4976" in str(plan_card)
     assert "独立于核心" in str(review_card)
     assert "熊市防御形态" in str(review_card)
+    assert "最近五个交易日审计" in str(review_card)
+    assert "SIGNAL_STARVATION" in str(review_card)
     assert audit["candidate_count"] == 2
     assert {row["key"] for row in audit["cards"]} == {"fill:core:FILL-1", "fill:bear_pilot:PILOT-FILL-1"}
 

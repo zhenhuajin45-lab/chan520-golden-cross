@@ -65,6 +65,16 @@ def test_eod_records_review_not_trade_push():
     assert replay["cmd"][exposure_index + 1] == "0.05"
 
 
+def test_friday_eod_builds_weekly_review_before_final_dashboard_and_feishu():
+    steps = build_steps(args(phase="eod", feishu="send"), "2026-07-31")
+    names = [item["name"] for item in steps]
+
+    assert "weekly_review" in names
+    assert names.index("replay_watch_only") < names.index("weekly_review")
+    assert names.index("weekly_review") < max(i for i, name in enumerate(names) if name == "export_dashboard")
+    assert names.index("weekly_review") < names.index("feishu_review")
+
+
 def test_plan_phase_generates_core_plan_before_dashboard_and_feishu():
     steps = build_steps(args(phase="plan", feishu="send"), "2026-07-15")
 
