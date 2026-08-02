@@ -23,6 +23,8 @@ from chan520_skill.execution_policy import (  # noqa: E402
     BEAR_PILOT_EXECUTION_SCOPE,
     BEAR_PILOT_MAX_EXPOSURE_PCT,
     BEAR_PILOT_MAX_FILLS,
+    BEAR_PILOT_MAX_POSITIONS,
+    BEAR_PILOT_MAX_QUEUE,
     BEAR_PILOT_MIN_RR,
     BEAR_PILOT_POLICY_ID,
     BEAR_PILOT_POSITION_PCT,
@@ -530,9 +532,12 @@ def generate_plan(
     pilot_eligible_candidates.sort(
         key=lambda item: (not item[3], execution_risk_priority_key(item[0], item[1]))
     )
-    for row, probe_levels, pilot_zone, _control_v1_eligible in pilot_eligible_candidates:
-        if len(pilot_plans) >= BEAR_PILOT_MAX_FILLS:
-            break
+    pilot_eligible_candidates = pilot_eligible_candidates[:BEAR_PILOT_MAX_QUEUE]
+    audit_by_symbol = {str(row.get("symbol") or ""): row for row in pilot_audits}
+    for queue_priority, (row, probe_levels, pilot_zone, control_v1_eligible) in enumerate(
+        pilot_eligible_candidates,
+        start=1,
+    ):
         close = safe_float(row.get("close"))
         shares = planned_shares(
             equity=pilot_equity,
@@ -543,15 +548,13 @@ def generate_plan(
             t1_loss_buffer_pct=safe_float(probe_levels.get("t1_loss_buffer_pct")),
             value_pct=BEAR_PILOT_POSITION_PCT,
         )
-        remaining = max(pilot_equity * BEAR_PILOT_MAX_EXPOSURE_PCT - pilot_planned_gross, 0.0)
-        shares = min(shares, int((remaining / close) // 100) * 100 if close > 0 else 0)
         if shares <= 0:
             continue
         pilot = bear_pilot_plan(
             row,
             trade_date,
             signal_date,
-            len(pilot_plans) + 1,
+            queue_priority,
             shares,
             probe_levels,
             pilot_zone,
@@ -561,6 +564,15 @@ def generate_plan(
         pilot_adapter.record_planned_order(pilot)
         pilot_plans.append(pilot)
         pilot_planned_gross += close * shares
+        audit = audit_by_symbol.get(str(row.get("code") or ""))
+        if audit is not None:
+            audit.update(
+                {
+                    "queued": True,
+                    "queue_priority": queue_priority,
+                    "queue_tier": "CONTROL_V1_PRIORITY" if control_v1_eligible else "PROBE_V2_BACKUP",
+                }
+            )
 
     superseded = supersede_unselected_same_date_plans(
         ledger,
@@ -669,18 +681,33 @@ def generate_plan(
                 "account_id": pilot_account_id,
                 "eligible_count": len(pilot_plans),
                 "eligible_candidate_count": len(pilot_eligible_candidates),
+                "queued_count": len(pilot_plans),
                 "symbols": [str(row.get("symbol") or "") for row in pilot_plans],
-                "max_positions": BEAR_PILOT_MAX_FILLS,
+                "max_positions": BEAR_PILOT_MAX_POSITIONS,
+                "daily_fill_cap": BEAR_PILOT_MAX_FILLS,
+                "queue_cap": BEAR_PILOT_MAX_QUEUE,
                 "position_cap_pct": BEAR_PILOT_POSITION_PCT,
                 "account_exposure_cap_pct": BEAR_PILOT_MAX_EXPOSURE_PCT,
                 "minimum_risk_reward": BEAR_PROBE_MIN_TARGET_RISK_MULTIPLE,
                 "control_v1_minimum_risk_reward": BEAR_PILOT_MIN_RR,
-                "selection_priority": "control_v1_eligible_then_t1_risk_v1",
+                "selection_priority": "control_v1_eligible_then_t1_risk_queue_v2",
                 "control_v1_eligible_count": sum(row["control_v1_eligible"] for row in pilot_audits),
                 "probe_target_policy": "atr_1_5_or_1_25_risk_v1",
                 "eligibility_audit": pilot_audits,
-                "planned_gross": round(pilot_planned_gross, 2),
-                "planned_exposure_pct": pilot_planned_gross / pilot_equity if pilot_equity else 0.0,
+                "queued_notional_gross": round(pilot_planned_gross, 2),
+                "queued_notional_pct": pilot_planned_gross / pilot_equity if pilot_equity else 0.0,
+                "planned_gross": round(min(pilot_planned_gross, pilot_equity * BEAR_PILOT_MAX_EXPOSURE_PCT), 2),
+                "planned_exposure_pct": min(
+                    pilot_planned_gross / pilot_equity if pilot_equity else 0.0,
+                    BEAR_PILOT_MAX_EXPOSURE_PCT,
+                ),
+                "queue_semantics": "all_eligible_candidates_armed_execution_still_capped",
+                "trade_activity_policy": {
+                    "window_sessions": 5,
+                    "target_trade_days": 3,
+                    "forced_trade_enabled": False,
+                    "diagnostic_only": True,
+                },
                 "execution_scope": BEAR_PILOT_EXECUTION_SCOPE,
                 "core_account_affected": False,
                 "gm_submit_enabled": False,
@@ -1125,10 +1152,14 @@ def bear_pilot_plan(
                 "BEAR_DEFENSIVE_SHAPE",
                 "ATR_STRUCTURE_TARGET",
                 "VALID_ENTRY_GEOMETRY",
+                "ELIGIBLE_CANDIDATE_QUEUE",
                 "LOCAL_SIM_RESEARCH_ONLY",
             ],
+            "queue_priority": rank,
+            "daily_fill_cap": BEAR_PILOT_MAX_FILLS,
+            "account_exposure_cap_pct": BEAR_PILOT_MAX_EXPOSURE_PCT,
             "blocking_reason_codes": [],
-            "sizing_policy": "bear_probe_v2_2_5pct_with_t1_risk_cap",
+            "sizing_policy": "bear_probe_v3_1pct_with_t1_risk_cap",
             "exit_risk_reason": (
                 f"T+1 后跌破止损 {levels['stop']:.2f}、趋势失效或触发利润回撤保护；"
                 f"结构目标参考 {levels['target']:.2f}"

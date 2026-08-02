@@ -147,7 +147,7 @@ python scripts/execute_local_sim_risk_exits.py --trade-date 2026-07-16 --submit
 
 推荐使用每日编排器。`plan` 只使用上一交易日完整日线；扫描覆盖率低于 85%、市场状态未知、计划几何无效或无严格候选时，新增买入保持关闭。`intraday` 先处理 T+1 风控卖出，再处理买入二阶段确认。
 
-当市场状态为 `BEAR` 时，核心账户仍严格禁止新增买入。符合主板防御形态、完整止损证据和有效价格几何的观察候选，可进入独立账户 `local-sim-bear-pilot`：单票最多 2.5%，最多 2 只，总仓最多 5%。`local_sim_bear_probe_v2` 优先选择旧 v1 `R:R >= 2` 候选，只在名额不足时才用 `max(1.5 ATR, 1.25R)` 结构目标补位；新旧目标和资格均写入审计。该账户沿用报价新鲜度、停牌/涨跌停、二阶段确认、T+1 和盘中风险退出规则，仅用于本地模拟研究，不连接 GM，也不改变核心账户或 `shadow_readiness=false`。同日重生成会将未再入选计划标记为 `SUPERSEDED_PLAN_REFRESH`，避免重复触发。
+当市场状态为 `BEAR` 时，核心账户仍严格禁止新增买入。符合主板防御形态、完整止损证据和有效价格几何的观察候选，可进入独立账户 `local-sim-bear-pilot`。研究账户最多武装 10 只候选，按 v1 资格和 T+1 风险排序逐只检查；前排未触发不会阻塞后排。单票最多 1%，每日最多成交 2 只，最多同时持仓 5 只，总仓最多 5%。`local_sim_bear_probe_v3` 优先选择旧 v1 `R:R >= 2` 候选，只在队列不足时才用 `max(1.5 ATR, 1.25R)` 结构目标补位；旧 v2 计划仅保留兼容读取，新生成计划均写入 v3 版本和新旧目标资格审计。五日研究触发目标为至少 3 天，只用于发现信号饥饿，不允许为达标而强制交易。该账户沿用报价新鲜度、停牌/涨跌停、二阶段确认、T+1 和盘中风险退出规则，仅用于本地模拟研究，不连接 GM，也不改变核心账户或 `shadow_readiness=false`。同日重生成会将未再入选计划标记为 `SUPERSEDED_PLAN_REFRESH`，避免重复触发。
 
 ```bash
 python scripts/run_local_sim_daily.py --phase plan --trade-date 2026-07-16 --feishu dry-run

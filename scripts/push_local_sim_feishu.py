@@ -251,6 +251,7 @@ def review_evidence_fingerprint(payload: dict[str, Any], trade_date: str) -> str
     pilot = (core.get("research_cohorts") or {}).get("bear_pilot") or {}
     weekly = payload.get("weekly_review") or {}
     weekly_t1 = weekly.get("t1_next_close_observation") or {}
+    weekly_activity = weekly.get("trade_activity") or {}
     evidence = {
         "trade_date": trade_date,
         "account": {
@@ -289,6 +290,8 @@ def review_evidence_fingerprint(payload: dict[str, Any], trade_date: str) -> str
             "t1_completed_count": weekly_t1.get("completed_count"),
             "t1_missing_count": weekly_t1.get("missing_count"),
             "t1_net_pnl": weekly_t1.get("net_pnl"),
+            "research_trade_day_count": weekly_activity.get("research_trade_day_count"),
+            "activity_status": weekly_activity.get("status"),
         },
     }
     encoded = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -456,14 +459,17 @@ def execution_funnel_lines(funnel: dict[str, Any]) -> str:
         f"扫描 {safe_int(funnel.get('scanned_count'))} → 基础严格 {safe_int(funnel.get('strict_count'))} → "
         f"完整严格 {safe_int(funnel.get('strict_full_gate_count'))} → "
         f"观察 {safe_int(funnel.get('watch_count'))} → 核心可执行 {safe_int(funnel.get('core_executable_count'))} → "
-        f"熊市 probe {safe_int(funnel.get('bear_pilot_count'))}。"
+        f"probe 候选队列 {safe_int(funnel.get('bear_pilot_count'))}。"
     )
 
 
 def bear_pilot_plan_lines(rows: list[dict[str, Any]], cohort: dict[str, Any]) -> str:
     boundary = (
         f"状态 {cohort.get('status') or '-'}；策略 {cohort.get('policy_id') or '-'}；单票上限 {pct(cohort.get('position_cap_pct'))}，"
-        f"账户总仓上限 {pct(cohort.get('account_exposure_cap_pct'))}，最多 {safe_int(cohort.get('max_positions'))} 只，"
+        f"账户总仓上限 {pct(cohort.get('account_exposure_cap_pct'))}，"
+        f"候选队列 {safe_int(cohort.get('queued_count', len(rows)))} 只，"
+        f"当日最多成交 {safe_int(cohort.get('daily_fill_cap', cohort.get('max_positions')))} 只，"
+        f"最多同时持仓 {safe_int(cohort.get('max_positions'))} 只，"
         "仅本地模拟研究，不连接 GM。"
     )
     audits = cohort.get("eligibility_audit") if isinstance(cohort.get("eligibility_audit"), list) else []
@@ -483,9 +489,9 @@ def bear_pilot_plan_lines(rows: list[dict[str, Any]], cohort: dict[str, Any]) ->
 
 def pilot_audit_result(row: dict[str, Any], selected_symbols: set[str]) -> str:
     if str(row.get("symbol") or "") in selected_symbols:
-        return f"最终入选（{'v1优先' if row.get('control_v1_eligible') else 'v2补位'}）"
+        return f"已入队 #{safe_int(row.get('queue_priority'))}（{'v1优先' if row.get('control_v1_eligible') else 'v2候补'}）"
     if row.get("probe_eligible"):
-        return "probe 通过，未入选（名额/优先级）"
+        return "probe 通过，未入队（队列上限）"
     return "淘汰 " + ",".join(row.get("rejection_codes") or [])
 
 
@@ -588,12 +594,16 @@ def weekly_review_lines(weekly: dict[str, Any]) -> str:
     actual = weekly.get("actual_account") or {}
     same_day = weekly.get("exact_research_same_day_mark") or {}
     t1 = weekly.get("t1_next_close_observation") or {}
+    activity = weekly.get("trade_activity") or {}
     alerts = "、".join(str(item) for item in weekly.get("alerts") or []) or "无"
     return (
         f"{weekly.get('start_date') or '-'} 至 {weekly.get('end_date') or '-'}；"
         f"实际订单/成交 {safe_int(actual.get('order_count'))}/{safe_int(actual.get('fill_count'))}；"
+        f"候选交易日 {safe_int(weekly.get('candidate_day_count'))}/{safe_int(weekly.get('session_count'))}，"
+        f"全池样本 {safe_int(weekly.get('candidate_sample_count'))}；"
         f"核心/probe {safe_int(weekly.get('core_executable_count'))}/{safe_int(weekly.get('pilot_plan_count'))}。\n"
         f"精确研究子集当日盯市 {pnl_text(same_day.get('net_mark_pnl'))}；"
+        f"五日研究触发 {safe_int(activity.get('research_trade_day_count'))}/{safe_int(activity.get('session_count'))} 天；"
         f"T+1 下一交易日收盘 {safe_int(t1.get('completed_count'))} 笔，{pnl_text(t1.get('net_pnl'))}；"
         f"告警 {alerts}。"
     )

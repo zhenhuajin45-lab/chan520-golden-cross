@@ -211,7 +211,7 @@ function renderCorePlanAlert(payload) {
   const supplementalText = supplemental.emotion_label ? `｜同花顺旁路 ${supplemental.emotion_label}` : "";
   const styleText = style.status ? `｜风格偏离 ${style.mismatch_alert ? "预警" : "正常"}` : "";
   const funnelText = funnel.scanned_count != null
-    ? `｜执行漏斗 ${intText(funnel.scanned_count)} 扫描 → ${intText(funnel.strict_count)} 基础严格 → ${intText(funnel.strict_full_gate_count)} 完整严格 → ${intText(funnel.core_executable_count)} 核心 → ${intText(funnel.bear_pilot_count)} 熊市 probe`
+    ? `｜执行漏斗 ${intText(funnel.scanned_count)} 扫描 → ${intText(funnel.strict_count)} 基础严格 → ${intText(funnel.strict_full_gate_count)} 完整严格 → ${intText(funnel.core_executable_count)} 核心 → ${intText(funnel.bear_pilot_count)} probe 候选队列`
     : "";
   const starvationText = starvation.status && starvation.status !== "OK"
     ? `｜连续无执行 ${intText(starvation.consecutive_zero_execution_sessions || starvation.previous_zero_execution_sessions)} 日：${escapeHtml(starvation.status)}`
@@ -254,7 +254,9 @@ function renderResearchPilot(pilot, core) {
         <span>盈亏 <strong class="${pnlClass(account.total_pnl)}">${signedMoney(account.total_pnl)} / ${signedPct(account.total_pnl_pct)}</strong></span>
         <span>仓位 <strong>${pct(account.gross_exposure_pct)}</strong></span>
         <span>持仓 <strong>${intText(account.open_position_count)}</strong></span>
-        <span>待触发 <strong>${intText(activePlans.length)}</strong></span>
+        <span>候选队列 <strong>${intText(activePlans.length)}</strong></span>
+        <span>当日成交上限 <strong>${intText(cohort.daily_fill_cap ?? cohort.max_positions)}</strong></span>
+        <span>最多持仓 <strong>${intText(cohort.max_positions)}</strong></span>
         <span>单票/总仓上限 <strong>${pct(cohort.position_cap_pct ?? pilot.position_cap_pct)} / ${pct(cohort.account_exposure_cap_pct ?? pilot.account_exposure_cap_pct)}</strong></span>
       </div>
       <div class="pilot-grid">
@@ -274,14 +276,19 @@ function renderResearchPilot(pilot, core) {
 
 function renderPilotAudit(rows, selectedSymbols) {
   if (!rows.length) return `<p class="pilot-empty">本次未记录 probe 资格审计</p>`;
+  const ordered = [...rows].sort((left, right) => {
+    const leftPriority = Number(left.queue_priority || Number.MAX_SAFE_INTEGER);
+    const rightPriority = Number(right.queue_priority || Number.MAX_SAFE_INTEGER);
+    return leftPriority - rightPriority || String(left.symbol || "").localeCompare(String(right.symbol || ""));
+  });
   return `
     <h3>资格审计</h3>
-    ${rows.slice(0, 6).map((row) => {
+    ${ordered.slice(0, 6).map((row) => {
       const symbol = String(row.symbol || "");
       const result = selectedSymbols.has(symbol)
-        ? `最终入选（${row.control_v1_eligible ? "v1优先" : "v2补位"}）`
+        ? `已入队 #${intText(row.queue_priority)}（${row.control_v1_eligible ? "v1优先" : "v2候补"}）`
         : row.probe_eligible
-          ? "probe 通过，未入选（名额/优先级）"
+          ? "probe 通过，未入队（队列上限）"
           : (row.rejection_codes || []).join(", ") || "未通过";
       return `<div class="pilot-row"><strong>${escapeHtml(`${row.stock_name || ""} ${row.symbol || ""}`.trim())}</strong><span>v1 R:R ${price(row.control_risk_reward)}｜probe R:R ${price(row.probe_risk_reward)}｜目标 ${price(row.probe_target_price)}</span><small>${escapeHtml(result)}</small></div>`;
     }).join("")}
@@ -290,13 +297,19 @@ function renderPilotAudit(rows, selectedSymbols) {
 
 function renderPilotPlans(rows) {
   if (!rows.length) return `<p class="pilot-empty">当前无待触发研究计划</p>`;
-  return rows.slice(0, 4).map((row) => `
+  const ordered = [...rows].sort((left, right) => {
+    const leftPriority = Number((left.payload || {}).queue_priority || Number.MAX_SAFE_INTEGER);
+    const rightPriority = Number((right.payload || {}).queue_priority || Number.MAX_SAFE_INTEGER);
+    return leftPriority - rightPriority || String(left.symbol || "").localeCompare(String(right.symbol || ""));
+  });
+  const visible = ordered.slice(0, 6).map((row) => `
     <div class="pilot-row">
-      <strong>${stockText(row)}</strong>
+      <strong>#${intText((row.payload || {}).queue_priority)} ${stockText(row)}</strong>
       <span>${intText(row.volume)} 股｜${price(row.lower_price)}-${price(row.upper_price || row.trigger_price)}｜止损 ${price(row.stop_price)}｜目标 ${price(row.target_price)}</span>
       <small>${escapeHtml(planReason(row))}</small>
     </div>
   `).join("");
+  return visible + (ordered.length > 6 ? `<p class="pilot-empty">共 ${intText(ordered.length)} 只入队，盘中最多成交 2 只</p>` : "");
 }
 
 function renderPilotActivity(positions, fills) {
@@ -325,6 +338,7 @@ function renderWeeklyReview(review) {
   const actual = review.actual_account || {};
   const sameDay = review.exact_research_same_day_mark || {};
   const t1 = review.t1_next_close_observation || {};
+  const activity = review.trade_activity || {};
   return `
     <section class="pilot-workbench">
       <div class="pilot-head">
@@ -333,14 +347,22 @@ function renderWeeklyReview(review) {
       </div>
       <div class="pilot-metrics">
         <span>实际订单/成交 <strong>${intText(actual.order_count)} / ${intText(actual.fill_count)}</strong></span>
-        <span>候选日样本 <strong>${intText(review.candidate_day_count)}</strong></span>
+        <span>候选交易日 <strong>${intText(review.candidate_day_count)} / ${intText(review.session_count)}</strong></span>
+        <span>全池候选样本 <strong>${intText(review.candidate_sample_count)}</strong></span>
         <span>核心/probe计划 <strong>${intText(review.core_executable_count)} / ${intText(review.pilot_plan_count)}</strong></span>
+        <span>研究触发日 <strong>${intText(activity.research_trade_day_count)} / ${intText(activity.session_count)}</strong></span>
         <span>当日盯市 <strong class="${pnlClass(sameDay.net_mark_pnl)}">${signedMoney(sameDay.net_mark_pnl)}</strong></span>
         <span>T+1完成观察 <strong>${intText(t1.completed_count)}</strong></span>
         <span>T+1净观察 <strong class="${pnlClass(t1.net_pnl)}">${signedMoney(t1.net_pnl)}</strong></span>
       </div>
+      ${renderNoTradeDiagnostics(activity.no_trade_days || [])}
     </section>
   `;
+}
+
+function renderNoTradeDiagnostics(rows) {
+  if (!rows.length) return "";
+  return `<div class="research-fills"><strong>无成交日原因</strong><br>${rows.map((row) => `${escapeHtml(row.trade_date || "-")}：${escapeHtml(row.dominant_reason || "NO_TRIGGER_EVIDENCE")}（候选 ${intText(row.candidate_count)}）`).join("<br>")}</div>`;
 }
 
 function renderReadinessAlert(payload) {

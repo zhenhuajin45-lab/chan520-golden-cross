@@ -112,6 +112,68 @@ def test_bear_pilot_uses_two_stage_confirmation_in_isolated_account(tmp_path, mo
     assert adapter.account_snapshot()["positions"][0]["shares"] == 2500
 
 
+def test_bear_probe_queue_allows_later_candidate_when_higher_priority_does_not_trigger(tmp_path, monkeypatch):
+    adapter, ledger = make_bear_pilot_adapter(tmp_path)
+    adapter.record_planned_order(
+        {
+            "planned_order_id": "BEAR-PROBE:2026-07-15:600672",
+            "order_intent_id": "BEAR-PROBE-2026-07-15-02",
+            "trade_date": "2026-07-15",
+            "symbol": "600672",
+            "side": "BUY",
+            "volume": 1000,
+            "status": "WATCH_TRIGGER",
+            "lower_price": 19.8,
+            "upper_price": 20.2,
+            "invalid_price": 20.5,
+            "stop_price": 19.4,
+            "target_price": 21.5,
+            "trigger_price": 19.9,
+            "ma5": 19.9,
+            "ma20": 19.5,
+            "market_regime": "BEAR",
+            "local_sim_execution_policy_id": BEAR_PILOT_POLICY_ID,
+            "execution_scope": BEAR_PILOT_EXECUTION_SCOPE,
+            "research_pilot": True,
+            "research_only": True,
+            "core_account_affected": False,
+            "gm_submit_enabled": False,
+        }
+    )
+
+    def quote(code):
+        price = "10.4" if code == "600671" else "20.0"
+        return {
+            "code": code,
+            "name": code,
+            "price": price,
+            "prev_close": price,
+            "open": price,
+            "datetime": "20260715100100",
+        }
+
+    monkeypatch.setattr(triggers, "tencent_quote", quote)
+    common = dict(
+        adapter=adapter,
+        ledger=ledger,
+        account_id=BEAR_PILOT_ACCOUNT_ID,
+        trade_date="2026-07-15",
+        max_age_minutes=5,
+        max_fills=1,
+        max_exposure_pct=0.05,
+        max_trigger_drawdown_pct=1.2,
+        submit=True,
+        market_context=healthy_market_context(),
+    )
+
+    first = triggers.run_trigger_cycle(now=datetime(2026, 7, 15, 10, 2, tzinfo=TZ), **common)
+    second = triggers.run_trigger_cycle(now=datetime(2026, 7, 15, 10, 5, tzinfo=TZ), **common)
+
+    assert [row["reason"] for row in first["results"]] == ["ABOVE_TRIGGER_ZONE", "TRIGGER_CONFIRMED"]
+    assert second["results"][1]["reason"] == "TRIGGER_MATCHED"
+    assert adapter.account_snapshot()["positions"][0]["symbol"] == "600672"
+
+
 def test_bear_pilot_plan_is_rejected_outside_isolated_account(tmp_path, monkeypatch):
     adapter, ledger = make_bear_pilot_adapter(tmp_path, account_id="local-test")
     monkeypatch.setattr(triggers, "tencent_quote", lambda _code: {})
@@ -131,6 +193,35 @@ def test_bear_pilot_plan_is_rejected_outside_isolated_account(tmp_path, monkeypa
     )
 
     assert payload["results"][0]["reason"] == "RESEARCH_PILOT_ACCOUNT_MISMATCH"
+
+
+def test_bear_probe_rejects_sixth_concurrent_research_position(tmp_path):
+    _adapter, ledger = make_bear_pilot_adapter(tmp_path)
+    plan = triggers.load_watch_plans(ledger, BEAR_PILOT_ACCOUNT_ID, "2026-07-15")[0]
+
+    decision = triggers.evaluate_plan(
+        plan,
+        trade_date="2026-07-15",
+        now=datetime(2026, 7, 15, 10, 2, tzinfo=TZ),
+        max_age_minutes=5,
+        time_gate_ok=True,
+        filled_count=0,
+        max_fills=2,
+        used_exposure=0,
+        equity=1_000_000,
+        max_exposure_pct=0.05,
+        max_trigger_drawdown_pct=1.2,
+        max_open_drawdown_pct=1.0,
+        confirmation_max_minutes=20,
+        market_context=healthy_market_context(),
+        account_marks_ok=True,
+        active_risk_exit_count=0,
+        account_id=BEAR_PILOT_ACCOUNT_ID,
+        open_position_count=5,
+        position_already_open=False,
+    )
+
+    assert decision["reason"] == "MAX_RESEARCH_POSITIONS_REACHED"
 
 
 def test_trigger_cycle_blocks_before_continuous_auction(tmp_path, monkeypatch):

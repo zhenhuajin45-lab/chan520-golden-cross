@@ -20,6 +20,7 @@ from chan520_skill.execution_policy import (
     BEAR_PILOT_ACCOUNT_ID,
     BEAR_PILOT_APPROVED_POLICY_IDS,
     BEAR_PILOT_EXECUTION_SCOPE,
+    BEAR_PILOT_MAX_POSITIONS,
     BEAR_PILOT_POLICY_ID,
     CORE_PLAN_POLICY_ID,
 )
@@ -122,6 +123,7 @@ def run_trigger_cycle(
     marked = mark_account_positions(account, now=now, max_age_minutes=max_age_minutes)
     equity = float(account["cash"]) + marked["market_value"]
     used_exposure = marked["market_value"]
+    open_symbols = {str(row.get("symbol") or "") for row in account.get("positions", []) if int(row.get("shares") or 0) > 0}
     active_risk_exit_count = count_active_risk_exits(ledger, account_id, trade_date)
     filled_count = today_buy_count(ledger, account_id, trade_date)
     results: list[dict[str, Any]] = []
@@ -151,6 +153,8 @@ def run_trigger_cycle(
             account_marks_ok=not marked["errors"],
             active_risk_exit_count=active_risk_exit_count,
             account_id=account_id,
+            open_position_count=len(open_symbols),
+            position_already_open=str(plan.get("symbol") or "") in open_symbols,
         )
         result_row = {"planned_order_id": plan["planned_order_id"], "symbol": plan["symbol"], **decision}
         if decision["action"] == "CONFIRM" and submit:
@@ -174,6 +178,7 @@ def run_trigger_cycle(
             if broker_result.accepted:
                 filled_count += 1
                 used_exposure += float(decision["price"]) * int(plan["volume"])
+                open_symbols.add(str(plan.get("symbol") or ""))
         elif decision["action"] == "SUBMIT":
             result_row["message"] = "dry-run would submit; add --submit to write local simulated fill"
         elif (
@@ -279,6 +284,8 @@ def evaluate_plan(
     active_risk_exit_count: int,
     account_id: str | None = None,
     raw_quote: dict[str, Any] | None = None,
+    open_position_count: int = 0,
+    position_already_open: bool = False,
 ) -> dict[str, Any]:
     symbol = str(plan.get("symbol") or "")
     code = normalize_code(symbol)
@@ -310,6 +317,11 @@ def evaluate_plan(
         and str(payload.get("market_regime") or "").upper() == "BEAR"
     ):
         return reject("INVALID_RESEARCH_PILOT_SCOPE", "bear pilot must be isolated, local-only, and precomputed in BEAR regime")
+    if is_bear_pilot and open_position_count >= BEAR_PILOT_MAX_POSITIONS and not position_already_open:
+        return reject(
+            "MAX_RESEARCH_POSITIONS_REACHED",
+            f"open position count {open_position_count} >= {BEAR_PILOT_MAX_POSITIONS}",
+        )
     if not is_bear_pilot and str(payload.get("market_regime") or "").upper() in {"BEAR", "UNKNOWN", "DOWN"}:
         return reject("PLAN_MARKET_REGIME_BLOCKED", f"plan regime={payload.get('market_regime')}")
     if market_context.get("status") != "OK":

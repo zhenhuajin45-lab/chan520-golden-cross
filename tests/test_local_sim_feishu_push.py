@@ -112,7 +112,7 @@ def test_reason_text_deduplicates_identical_fields_and_marks_selected_audit():
     assert feishu.compact_text("同一理由", "同一理由", "") == "同一理由"
     assert feishu.pilot_audit_result(
         {"symbol": "600001", "control_v1_eligible": True}, {"600001"}
-    ) == "最终入选（v1优先）"
+    ) == "已入队 #0（v1优先）"
 
 
 def test_review_fingerprint_changes_when_weekly_t1_evidence_changes():

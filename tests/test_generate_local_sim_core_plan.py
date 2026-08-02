@@ -356,7 +356,7 @@ def test_bear_market_arms_isolated_small_pilot_without_changing_core_account(tmp
             "ma20": "9.50",
             "rsi14": "62",
         }
-        for code, name in [("600177", "雅戈尔"), ("600671", "天目药业"), ("300142", "沃森生物")]
+        for code, name in [("600177", "雅戈尔"), ("600671", "天目药业"), ("600142", "第三主板样本")]
     ]
 
     payload = core_plan.generate_plan(
@@ -378,7 +378,7 @@ def test_bear_market_arms_isolated_small_pilot_without_changing_core_account(tmp
     )
 
     assert payload["executable_buy_count"] == 0
-    assert payload["execution_funnel"]["bear_pilot_count"] == 2
+    assert payload["execution_funnel"]["bear_pilot_count"] == 3
     cohort = payload["research_cohorts"]["bear_pilot"]
     assert cohort["status"] == "ARMED"
     assert cohort["core_account_affected"] is False
@@ -393,9 +393,9 @@ def test_bear_market_arms_isolated_small_pilot_without_changing_core_account(tmp
                 (core_plan.BEAR_PILOT_ACCOUNT_ID,),
             ).fetchall()
         ]
-    assert len(pilot_plans) == 2
+    assert len(pilot_plans) == 3
     assert all(row["status"] == "WATCH_TRIGGER" for row in pilot_plans)
-    assert all(row["volume"] == 2500 for row in pilot_plans)
+    assert all(row["volume"] == 1000 for row in pilot_plans)
     assert core_adapter.account_snapshot()["cash"] == 1_000_000.0
 
 
@@ -529,7 +529,10 @@ def test_bear_probe_prefers_control_v1_candidate_before_relaxed_candidate(tmp_pa
         risk_per_plan_pct=0.005,
     )
 
-    assert payload["research_cohorts"]["bear_pilot"]["symbols"] == ["600002"]
+    cohort = payload["research_cohorts"]["bear_pilot"]
+    assert cohort["symbols"] == ["600002", "600001"]
+    assert cohort["daily_fill_cap"] == 1
+    assert cohort["queued_count"] == 2
     assert payload["pilot_superseded_plan_count"] == 1
     statuses = {
         row["planned_order_id"]: row["status"] for row in pilot_adapter.planned_orders_snapshot()
