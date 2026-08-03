@@ -23,6 +23,9 @@ from chan520_skill.execution_policy import (
     BEAR_PILOT_MAX_POSITIONS,
     BEAR_PILOT_POLICY_ID,
     CORE_PLAN_POLICY_ID,
+    CONFIRMATION_MIN_WAIT_MINUTES,
+    CONFIRMATION_MAX_UPSLIP_PCT,
+    TRIGGER_EXECUTION_GUARD_ID,
 )
 from chan520_skill.microstructure import price_limit
 
@@ -42,6 +45,7 @@ def main() -> int:
     parser.add_argument("--max-trigger-drawdown-pct", type=float, default=1.2)
     parser.add_argument("--max-open-drawdown-pct", type=float, default=1.0)
     parser.add_argument("--confirmation-max-minutes", type=int, default=20)
+    parser.add_argument("--confirmation-max-upslip-pct", type=float, default=CONFIRMATION_MAX_UPSLIP_PCT)
     parser.add_argument("--submit", action="store_true", help="Write accepted trigger fills into the local simulated broker")
     parser.add_argument("--ignore-time-gate", action="store_true", help="For tests/replay only; do not use for live paper execution")
     parser.add_argument("--output", default="")
@@ -70,6 +74,7 @@ def main() -> int:
         ignore_time_gate=args.ignore_time_gate,
         max_open_drawdown_pct=args.max_open_drawdown_pct,
         confirmation_max_minutes=args.confirmation_max_minutes,
+        confirmation_max_upslip_pct=args.confirmation_max_upslip_pct,
     )
     output = Path(args.output) if args.output else default_audit_path(args.trade_date, now)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -93,6 +98,7 @@ def run_trigger_cycle(
     ignore_time_gate: bool = False,
     max_open_drawdown_pct: float = 1.0,
     confirmation_max_minutes: int = 20,
+    confirmation_max_upslip_pct: float = CONFIRMATION_MAX_UPSLIP_PCT,
     market_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     plans = load_watch_plans(ledger, account_id, trade_date)
@@ -112,6 +118,8 @@ def run_trigger_cycle(
             "max_trigger_drawdown_pct": max_trigger_drawdown_pct,
             "max_open_drawdown_pct": max_open_drawdown_pct,
             "confirmation_max_minutes": confirmation_max_minutes,
+            "confirmation_max_upslip_pct": confirmation_max_upslip_pct,
+            "execution_guard_id": TRIGGER_EXECUTION_GUARD_ID,
             "market_context": {"status": "NOT_REQUIRED", "indices": {}},
             "equity": float(account["cash"]),
             "used_exposure": None,
@@ -149,6 +157,7 @@ def run_trigger_cycle(
             max_trigger_drawdown_pct=max_trigger_drawdown_pct,
             max_open_drawdown_pct=max_open_drawdown_pct,
             confirmation_max_minutes=confirmation_max_minutes,
+            confirmation_max_upslip_pct=confirmation_max_upslip_pct,
             market_context=market_context,
             account_marks_ok=not marked["errors"],
             active_risk_exit_count=active_risk_exit_count,
@@ -185,7 +194,8 @@ def run_trigger_cycle(
             submit
             and str(plan.get("status") or "").upper() == "CONFIRMED_TRIGGER"
             and decision["action"] == "WAIT"
-            and decision["reason"] not in {"MAX_FILLS_REACHED", "NOT_IN_CONTINUOUS_AUCTION"}
+            and decision["reason"]
+            not in {"MAX_FILLS_REACHED", "NOT_IN_CONTINUOUS_AUCTION", "CONFIRMATION_MIN_WAIT"}
         ):
             adapter.mark_planned_order(
                 str(plan["planned_order_id"]),
@@ -209,6 +219,8 @@ def run_trigger_cycle(
         "max_trigger_drawdown_pct": max_trigger_drawdown_pct,
         "max_open_drawdown_pct": max_open_drawdown_pct,
         "confirmation_max_minutes": confirmation_max_minutes,
+        "confirmation_max_upslip_pct": confirmation_max_upslip_pct,
+        "execution_guard_id": TRIGGER_EXECUTION_GUARD_ID,
         "market_context": market_context,
         "equity": equity,
         "used_exposure": used_exposure,
@@ -286,6 +298,7 @@ def evaluate_plan(
     raw_quote: dict[str, Any] | None = None,
     open_position_count: int = 0,
     position_already_open: bool = False,
+    confirmation_max_upslip_pct: float = CONFIRMATION_MAX_UPSLIP_PCT,
 ) -> dict[str, Any]:
     symbol = str(plan.get("symbol") or "")
     code = normalize_code(symbol)
@@ -408,8 +421,12 @@ def evaluate_plan(
     if confirmation_time is None or confirmation_price <= 0:
         return reject("CONFIRMATION_EVIDENCE_MISSING", "confirmed plan has no valid first-stage quote", quote=quote)
     confirmation_age = (now - confirmation_time).total_seconds() / 60
-    if confirmation_age < 2:
-        return reject("CONFIRMATION_MIN_WAIT", f"confirmation age {confirmation_age:.1f} min < 2 min", quote=quote)
+    if confirmation_age < CONFIRMATION_MIN_WAIT_MINUTES:
+        return reject(
+            "CONFIRMATION_MIN_WAIT",
+            f"confirmation age {confirmation_age:.1f} min < {CONFIRMATION_MIN_WAIT_MINUTES:.1f} min",
+            quote=quote,
+        )
     if confirmation_age > confirmation_max_minutes:
         return reject(
             "CONFIRMATION_EXPIRED",
@@ -422,10 +439,23 @@ def evaluate_plan(
             f"price {price:.2f} fell more than 0.5% below first confirmation {confirmation_price:.2f}",
             quote=quote,
         )
+    max_confirmed_price = confirmation_price * (1 + abs(confirmation_max_upslip_pct) / 100)
+    if price > max_confirmed_price:
+        return reject(
+            "CONFIRMATION_SLIPPAGE_BLOCKED",
+            (
+                f"price {price:.2f} exceeds first confirmation {confirmation_price:.2f} "
+                f"by more than {abs(confirmation_max_upslip_pct):.2f}%"
+            ),
+            quote=quote,
+        )
     return {
         "action": "SUBMIT",
         "reason": "TRIGGER_MATCHED",
-        "message": f"price {price:.2f} within {lower:.2f}-{upper:.2f}",
+        "message": (
+            f"price {price:.2f} within {lower:.2f}-{upper:.2f}; "
+            f"confirmation slippage <= {abs(confirmation_max_upslip_pct):.2f}%"
+        ),
         "price": price,
         "quote": quote,
         "metrics": metrics,
@@ -461,6 +491,8 @@ def submit_plan(adapter: LocalSimBrokerAdapter, plan: dict[str, Any], trade_date
                         "target_price": plan.get("target_price"),
                         "execution_policy_id": payload.get("local_sim_execution_policy_id"),
                         "research_pilot": payload.get("research_pilot") is True,
+                        "execution_guard_id": TRIGGER_EXECUTION_GUARD_ID,
+                        "confirmation_max_upslip_pct": CONFIRMATION_MAX_UPSLIP_PCT,
                     },
                     ensure_ascii=False,
                     sort_keys=True,

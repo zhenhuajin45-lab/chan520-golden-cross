@@ -20,7 +20,12 @@ if str(ROOT) not in sys.path:
 
 from scripts.execute_local_sim_triggers import CORE_PLAN_POLICY_ID, evaluate_plan, plan_rank
 from scripts.generate_local_sim_core_plan import resolve_market_regime
-from chan520_skill.execution_policy import BEAR_PILOT_POSITION_PCT
+from chan520_skill.execution_policy import (
+    BEAR_PILOT_POSITION_PCT,
+    CONFIRMATION_MIN_WAIT_MINUTES,
+    CONFIRMATION_MAX_UPSLIP_PCT,
+    TRIGGER_EXECUTION_GUARD_ID,
+)
 from chan520_skill.market_store import (
     DEFAULT_PATH as MARKET_STORE,
     load_minute_day,
@@ -30,7 +35,7 @@ from chan520_skill.market_store import (
 
 TZ = ZoneInfo("Asia/Shanghai")
 INDEX_SYMBOLS = ("000001", "399001", "399006", "000688")
-POLICY_ID = "watch_only_counterfactual_v1"
+POLICY_ID = "watch_only_counterfactual_v2"
 REPLAY_MINUTES = tuple(
     f"{hour:02d}{minute:02d}"
     for start, end in ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
@@ -46,6 +51,7 @@ def main() -> int:
     parser.add_argument("--initial-equity", type=float, default=1_000_000.0)
     parser.add_argument("--max-fills", type=int, default=2)
     parser.add_argument("--max-exposure-pct", type=float, default=0.15)
+    parser.add_argument("--confirmation-max-upslip-pct", type=float, default=CONFIRMATION_MAX_UPSLIP_PCT)
     args = parser.parse_args()
 
     trade_date = date.fromisoformat(args.trade_date)
@@ -61,6 +67,7 @@ def main() -> int:
             initial_equity=args.initial_equity,
             max_fills=args.max_fills,
             max_exposure_pct=args.max_exposure_pct,
+            confirmation_max_upslip_pct=args.confirmation_max_upslip_pct,
         )
         payload["plan_path"] = str(plan_path)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -86,6 +93,7 @@ def main() -> int:
             initial_equity=args.initial_equity,
             max_fills=args.max_fills,
             max_exposure_pct=args.max_exposure_pct,
+            confirmation_max_upslip_pct=args.confirmation_max_upslip_pct,
         )
         payload["minute_data_errors"] = market_data_errors
     except (KeyError, ValueError, TimeoutError, OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
@@ -211,6 +219,7 @@ def run_replay(
     initial_equity: float,
     max_fills: int,
     max_exposure_pct: float,
+    confirmation_max_upslip_pct: float = CONFIRMATION_MAX_UPSLIP_PCT,
 ) -> dict[str, Any]:
     candidates = research_candidates(core_plan)
     all_candidates = all_plan_candidates(core_plan)
@@ -238,8 +247,15 @@ def run_replay(
         effective_equity,
         max_fills=max_fills,
         max_exposure_pct=max_exposure_pct,
+        confirmation_max_upslip_pct=confirmation_max_upslip_pct,
     )
-    all_results, all_summary = all_candidate_performance(core_plan, market_data, trade_date, effective_equity)
+    all_results, all_summary = all_candidate_performance(
+        core_plan,
+        market_data,
+        trade_date,
+        effective_equity,
+        confirmation_max_upslip_pct=confirmation_max_upslip_pct,
+    )
     common = {
         "minute_data_source": sorted({str(item.get("source") or "tencent") for item in market_data.values()}),
         "historical_date_integrity": "PASS",
@@ -249,6 +265,9 @@ def run_replay(
         "max_exposure_pct": max_exposure_pct,
         "position_cap_pct": BEAR_PILOT_POSITION_PCT,
         "sampling_interval_minutes": 2,
+        "execution_guard_id": TRIGGER_EXECUTION_GUARD_ID,
+        "confirmation_max_upslip_pct": confirmation_max_upslip_pct,
+        "confirmation_min_wait_minutes": CONFIRMATION_MIN_WAIT_MINUTES,
         "replay_equity": round(effective_equity, 2),
         "all_candidate_independent_results": all_results,
         "all_candidate_close_summary": all_summary,
@@ -294,6 +313,7 @@ def run_replay(
             effective_equity,
             max_fills=max_fills,
             max_exposure_pct=max_exposure_pct,
+            confirmation_max_upslip_pct=confirmation_max_upslip_pct,
         )
         for name, ordered in orders.items()
     }
@@ -303,7 +323,13 @@ def run_replay(
             "symbol": str(candidate.get("symbol") or ""),
             "stock_name": str(candidate.get("stock_name") or ""),
             **simulate_portfolio(
-                [candidate], market_data, trade_date, effective_equity, max_fills=1, max_exposure_pct=max_exposure_pct
+                [candidate],
+                market_data,
+                trade_date,
+                effective_equity,
+                max_fills=1,
+                max_exposure_pct=max_exposure_pct,
+                confirmation_max_upslip_pct=confirmation_max_upslip_pct,
             ),
         }
         for candidate in sorted(candidates, key=plan_rank)
@@ -320,6 +346,21 @@ def run_replay(
         for name, result in variants.items()
     ]
     pnl_values = [float(row["net_mark_pnl"]) for row in sensitivity_rows]
+    guard_sensitivity = [
+        {
+            "confirmation_max_upslip_pct": threshold,
+            **simulate_portfolio(
+                orders["risk_priority"],
+                market_data,
+                trade_date,
+                effective_equity,
+                max_fills=max_fills,
+                max_exposure_pct=max_exposure_pct,
+                confirmation_max_upslip_pct=threshold,
+            ),
+        }
+        for threshold in (0.30, 0.50, 1.00)
+    ]
     payload = base_payload(core_plan, trade_date, candidates, status="PASS")
     payload.update(ranked)
     payload.update(
@@ -332,6 +373,7 @@ def run_replay(
                 "worst_net_mark_pnl": min(pnl_values) if pnl_values else 0.0,
                 "spread_net_mark_pnl": round(max(pnl_values) - min(pnl_values), 2) if pnl_values else 0.0,
             },
+            "execution_guard_sensitivity": guard_sensitivity,
             **common,
         }
     )
@@ -346,6 +388,7 @@ def simulate_portfolio(
     *,
     max_fills: int,
     max_exposure_pct: float,
+    confirmation_max_upslip_pct: float = CONFIRMATION_MAX_UPSLIP_PCT,
 ) -> dict[str, Any]:
     plans = [replay_plan(row, effective_equity) for row in candidates]
     minute_keys = list(REPLAY_MINUTES)
@@ -380,6 +423,7 @@ def simulate_portfolio(
                 max_trigger_drawdown_pct=1.2,
                 max_open_drawdown_pct=1.0,
                 confirmation_max_minutes=20,
+                confirmation_max_upslip_pct=confirmation_max_upslip_pct,
                 market_context=context,
                 account_marks_ok=True,
                 active_risk_exit_count=0,
@@ -450,6 +494,8 @@ def all_candidate_performance(
     market_data: dict[str, dict[str, Any]],
     trade_date: date,
     equity: float,
+    *,
+    confirmation_max_upslip_pct: float = CONFIRMATION_MAX_UPSLIP_PCT,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     candidates = all_plan_candidates(core_plan)
     rows: list[dict[str, Any]] = []
@@ -464,7 +510,15 @@ def all_candidate_performance(
         prev_close = float(day.get("prev_close") or 0)
         prices = [float(value) for value in minutes.values()]
         replay = (
-            simulate_portfolio([candidate], market_data, trade_date, equity, max_fills=1, max_exposure_pct=0.05)
+            simulate_portfolio(
+                [candidate],
+                market_data,
+                trade_date,
+                equity,
+                max_fills=1,
+                max_exposure_pct=0.05,
+                confirmation_max_upslip_pct=confirmation_max_upslip_pct,
+            )
             if indices_ready
             else {}
         )
@@ -660,6 +714,7 @@ def base_payload(
         "counterfactual_overrides": ["PLAN_MARKET_REGIME_BLOCKED", "STRICT_ENTRY_REQUIRED"],
         "guards_retained": [
             "two_stage_confirmation",
+            "confirmation_upslip_guard",
             "market_shock",
             "board_risk",
             "relative_weakness",

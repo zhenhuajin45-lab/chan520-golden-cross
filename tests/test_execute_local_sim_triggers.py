@@ -112,6 +112,73 @@ def test_bear_pilot_uses_two_stage_confirmation_in_isolated_account(tmp_path, mo
     assert adapter.account_snapshot()["positions"][0]["shares"] == 2500
 
 
+def test_two_stage_confirmation_blocks_upward_slippage_and_resets(tmp_path, monkeypatch):
+    adapter, ledger = make_bear_pilot_adapter(tmp_path)
+    quote = {
+        "code": "600671",
+        "name": "天目药业",
+        "price": "10.00",
+        "prev_close": "10.00",
+        "open": "9.95",
+        "datetime": "20260715100100",
+    }
+    monkeypatch.setattr(triggers, "tencent_quote", lambda _code: quote)
+    common = dict(
+        adapter=adapter,
+        ledger=ledger,
+        account_id=BEAR_PILOT_ACCOUNT_ID,
+        trade_date="2026-07-15",
+        max_age_minutes=5,
+        max_fills=2,
+        max_exposure_pct=0.05,
+        max_trigger_drawdown_pct=1.2,
+        submit=True,
+        market_context=healthy_market_context(),
+    )
+
+    first = triggers.run_trigger_cycle(now=datetime(2026, 7, 15, 10, 2, tzinfo=TZ), **common)
+    quote["price"] = "10.06"
+    second = triggers.run_trigger_cycle(now=datetime(2026, 7, 15, 10, 5, tzinfo=TZ), **common)
+
+    assert first["results"][0]["reason"] == "TRIGGER_CONFIRMED"
+    assert second["results"][0]["reason"] == "CONFIRMATION_SLIPPAGE_BLOCKED"
+    assert second["results"][0]["action"] == "RESET"
+    assert adapter.account_snapshot()["positions"] == []
+
+
+def test_confirmation_min_wait_preserves_first_quote_instead_of_resetting(tmp_path, monkeypatch):
+    adapter, ledger = make_bear_pilot_adapter(tmp_path)
+    monkeypatch.setattr(triggers, "tencent_quote", lambda _code: {
+        "code": "600671",
+        "name": "天目药业",
+        "price": "10.00",
+        "prev_close": "10.00",
+        "open": "9.95",
+        "datetime": "20260715100005",
+    })
+    common = dict(
+        adapter=adapter,
+        ledger=ledger,
+        account_id=BEAR_PILOT_ACCOUNT_ID,
+        trade_date="2026-07-15",
+        max_age_minutes=5,
+        max_fills=2,
+        max_exposure_pct=0.05,
+        max_trigger_drawdown_pct=1.2,
+        submit=True,
+        market_context=healthy_market_context(),
+    )
+
+    triggers.run_trigger_cycle(now=datetime(2026, 7, 15, 10, 0, 10, tzinfo=TZ), **common)
+    waiting = triggers.run_trigger_cycle(now=datetime(2026, 7, 15, 10, 2, 0, tzinfo=TZ), **common)
+    plan = triggers.load_watch_plans(ledger, BEAR_PILOT_ACCOUNT_ID, "2026-07-15")[0]
+
+    assert waiting["results"][0]["action"] == "WAIT"
+    assert waiting["results"][0]["reason"] == "CONFIRMATION_MIN_WAIT"
+    assert plan["status"] == "CONFIRMED_TRIGGER"
+    assert plan["confirmation_quote"]["quote_time"] == "2026-07-15T10:00:05+08:00"
+
+
 def test_bear_probe_queue_allows_later_candidate_when_higher_priority_does_not_trigger(tmp_path, monkeypatch):
     adapter, ledger = make_bear_pilot_adapter(tmp_path)
     adapter.record_planned_order(
