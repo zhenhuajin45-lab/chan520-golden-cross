@@ -15,6 +15,9 @@ if str(ROOT) not in sys.path:
 from chan520_skill.market_store import DEFAULT_PATH, initialize, load_scan, stats, upsert_scan  # noqa: E402
 from chan520_skill.scanner import scan_market  # noqa: E402
 from scripts.generate_local_sim_core_plan import (  # noqa: E402
+    build_market_breadth,
+    build_sector_strength,
+    classify_market_breadth,
     read_scan,
     prefer_qualified_scan_evidence,
     resolve_market_regime,
@@ -77,6 +80,8 @@ def main() -> int:
     )
     upsert_scan(target, rows, quality, source="eod_qualified_scan", path=DEFAULT_PATH)
     sectors = resolve_sector_map(rows)
+    breadth = build_market_breadth(rows)
+    sector_strength = build_sector_strength(rows, sectors)
     regime = resolve_market_regime(target)
     payload = {
         "schema_version": "chan520_local_market_refresh_v1",
@@ -93,6 +98,8 @@ def main() -> int:
         "scan_evidence_path": str(evidence_path),
         "scan_quality": quality,
         "sector_count": len(set(sectors.values())),
+        "market_breadth": {**breadth, "state": classify_market_breadth(breadth)},
+        "sector_strength": sector_strength,
         "market_regime": regime,
         "store": stats(path=DEFAULT_PATH),
     }

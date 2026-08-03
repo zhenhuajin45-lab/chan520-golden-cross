@@ -702,3 +702,29 @@ def test_low_adjusted_execution_coverage_blocks_strict_candidate(tmp_path, monke
     assert payload["status"] == "FAIL_CLOSED"
     assert plan["status"] == "WATCH_ONLY"
     assert "SCAN_EXECUTION_COVERAGE_BLOCKED" in plan["blocking_reason_codes"]
+
+
+def test_market_breadth_classifies_index_divergent_recovery_session():
+    rows = [
+        {"code": f"600{i:03d}", "close": "10", "ma20": "9", "pct_chg": change}
+        for i, change in enumerate(["2.0", "1.5", "1.0", "0.5", "0.2", "0.1", "-0.3", "-1.0"])
+    ]
+
+    breadth = core_plan.build_market_breadth(rows)
+
+    assert breadth["up_ratio"] == 0.75
+    assert breadth["median_pct_chg"] > 0
+    assert core_plan.classify_market_breadth(breadth) == "BREADTH_RECOVERY"
+
+
+def test_research_style_priority_prefers_strong_prior_session_sector():
+    rows = [
+        {"code": "600001", "industry": "强行业", "close": "10", "ma20": "9", "pct_chg": "2.0"},
+        {"code": "600002", "industry": "弱行业", "close": "10", "ma20": "11", "pct_chg": "-2.0"},
+    ]
+    strengths = core_plan.build_sector_strength(rows, {}, min_members=1)
+    lookup = {row["sector"]: row for row in strengths}
+
+    assert lookup["强行业"]["strength_state"] == "STRONG"
+    assert lookup["弱行业"]["strength_state"] == "WEAK"
+    assert core_plan.style_priority_key(rows[0], lookup) < core_plan.style_priority_key(rows[1], lookup)

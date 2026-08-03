@@ -76,14 +76,10 @@ def run_risk_exit_cycle(
     for plan in plans:
         symbol = str(plan.get("symbol") or "")
         position = positions.get(symbol)
-        if not time_gate_ok:
-            decision = wait("NOT_IN_CONTINUOUS_AUCTION", "risk exits only run in continuous auction")
-        elif position is None or int(position.get("shares", 0) or 0) <= 0:
+        if position is None or int(position.get("shares", 0) or 0) <= 0:
             decision = {"action": "RESOLVE", "reason": "NO_POSITION", "message": "position already closed", "quote": {}}
-        elif sellable_shares(ledger, account_id, symbol, trade_date) <= 0:
-            decision = wait("T_PLUS_ONE_WAIT", "position is not sellable in this session")
         else:
-            decision = evaluate_risk_plan(
+            evaluated = evaluate_risk_plan(
                 plan,
                 position,
                 trade_date=trade_date,
@@ -91,6 +87,18 @@ def run_risk_exit_cycle(
                 max_age_minutes=max_age_minutes,
                 confirmation_max_minutes=confirmation_max_minutes,
             )
+            if evaluated["action"] == "RESOLVE":
+                decision = evaluated
+            elif not time_gate_ok:
+                decision = wait(
+                    "NOT_IN_CONTINUOUS_AUCTION",
+                    f"risk still active ({evaluated['reason']}); recovery was checked but orders are disabled outside auction",
+                    evaluated.get("quote"),
+                )
+            elif sellable_shares(ledger, account_id, symbol, trade_date) <= 0:
+                decision = wait("T_PLUS_ONE_WAIT", "position is not sellable in this session", evaluated.get("quote"))
+            else:
+                decision = evaluated
         result = {"planned_order_id": plan.get("planned_order_id"), "symbol": symbol, **decision}
         if submit and decision["action"] == "CONFIRM":
             adapter.mark_planned_order(symbol_plan_id(plan), "RISK_CONFIRMED", decision["message"], decision.get("quote", {}))
@@ -112,6 +120,7 @@ def run_risk_exit_cycle(
         "trade_date": trade_date,
         "submit": submit,
         "time_gate_ok": time_gate_ok,
+        "outside_auction_recovery_check_enabled": True,
         "plan_count": len(plans),
         "results": results,
         "blocking_errors": [],

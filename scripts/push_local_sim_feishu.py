@@ -478,6 +478,7 @@ def bear_pilot_plan_lines(rows: list[dict[str, Any]], cohort: dict[str, Any]) ->
     audit_lines = [
         f"- {stock_label(row)}：v1 R:R {safe_float(row.get('control_risk_reward')):.2f}，"
         f"probe R:R {safe_float(row.get('probe_risk_reward')):.2f}，"
+        f"行业 {row.get('industry') or '未映射'} / {row.get('sector_strength_state') or 'UNAVAILABLE'}，"
         f"{pilot_audit_result(row, selected_symbols)}"
         for row in audits[:6]
     ]
@@ -527,7 +528,8 @@ def style_diagnostic_lines(style: dict[str, Any]) -> str:
     candidate = style.get("candidate_breadth") or {}
     top = "、".join(str(row.get("sector")) for row in (style.get("top_industries") or [])[:3]) or "-"
     return (
-        f"全市场上涨占比 {pct(market.get('up_ratio'))}，候选上涨占比 {pct(candidate.get('up_ratio'))}；"
+        f"宽度状态 {style.get('breadth_state') or '-'}；全市场上涨占比 {pct(market.get('up_ratio'))}，"
+        f"候选上涨占比 {pct(candidate.get('up_ratio'))}；"
         f"强势行业 {top}；Top3 行业重合 {pct(style.get('top3_industry_overlap_ratio'))}；"
         f"偏离预警 {'是' if style.get('mismatch_alert') else '否'}。"
     )
@@ -615,10 +617,17 @@ def session_market_lines(snapshot: dict[str, Any]) -> str:
         return "收盘行情快照尚未生成；复盘证据不完整。"
     regime = snapshot.get("market_regime") or {}
     quality = snapshot.get("scan_quality") or {}
+    breadth = snapshot.get("market_breadth") or {}
+    breadth_line = (
+        f"宽度 {breadth.get('state')}，上涨占比 {pct(breadth.get('up_ratio'))}，"
+        f"涨跌中位 {safe_float(breadth.get('median_pct_chg')):+.2f}%；"
+        if breadth.get("state")
+        else ""
+    )
     return (
         f"状态 {regime.get('state') or 'UNKNOWN'}，门控 {'通过' if regime.get('regime_ok') else '阻断'}；"
         f"{regime.get('detail') or '-'}\n"
-        f"研究覆盖 {pct(quality.get('research_coverage', quality.get('coverage')))}，"
+        f"{breadth_line}研究覆盖 {pct(quality.get('research_coverage', quality.get('coverage')))}，"
         f"执行级覆盖 {pct(quality.get('execution_coverage'))}，"
         f"收盘扫描 {safe_int(snapshot.get('scan_rows'))} 只，证据状态 {snapshot.get('status') or '-'}。"
     )

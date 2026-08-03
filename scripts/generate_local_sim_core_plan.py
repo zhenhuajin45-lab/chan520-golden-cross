@@ -9,6 +9,7 @@ import sys
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -306,33 +307,13 @@ def build_style_diagnostic(
     plan_codes = {str(row.get("symbol") or "") for row in plans}
     candidates = [row for row in usable if str(row.get("code") or "") in plan_codes]
 
-    def breadth(rows: list[dict[str, Any]]) -> dict[str, Any]:
-        count = len(rows)
-        up = sum(safe_float(row.get("pct_chg")) > 0 for row in rows)
-        above20 = sum(safe_float(row.get("close")) > safe_float(row.get("ma20")) > 0 for row in rows)
-        return {
-            "count": count,
-            "up_ratio": round(up / count, 4) if count else 0.0,
-            "average_pct_chg": round(sum(safe_float(row.get("pct_chg")) for row in rows) / count, 4) if count else 0.0,
-            "above_ma20_ratio": round(above20 / count, 4) if count else 0.0,
-        }
-
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in usable:
-        sector = sector_map.get(str(row.get("code") or ""), str(row.get("industry") or "UNMAPPED"))
-        grouped.setdefault(sector or "UNMAPPED", []).append(row)
-    sectors = [
-        {"sector": sector, **breadth(rows)}
-        for sector, rows in grouped.items()
-        if sector != "UNMAPPED" and len(rows) >= 10
-    ]
-    sectors.sort(key=lambda item: (item["average_pct_chg"], item["up_ratio"], item["count"]), reverse=True)
+    market = build_market_breadth(usable)
+    sectors = build_sector_strength(usable, sector_map)
     top_sectors = sectors[:8]
     top_names = {str(item["sector"]) for item in top_sectors[:3]}
     candidate_sectors = [sector_map.get(str(row.get("code") or ""), "UNMAPPED") for row in candidates]
     overlap = sum(sector in top_names for sector in candidate_sectors)
-    market = breadth(usable)
-    candidate = breadth(candidates)
+    candidate = build_market_breadth(candidates)
     overlap_ratio = overlap / len(candidates) if candidates else 0.0
     mismatch = bool(candidates and market["up_ratio"] >= 0.60 and (overlap_ratio < 0.20 or candidate["up_ratio"] + 0.15 < market["up_ratio"]))
     boards = {
@@ -346,6 +327,7 @@ def build_style_diagnostic(
         "role": "completed_session_diagnostic_only",
         "used_for_execution_gate": False,
         "market_breadth": market,
+        "breadth_state": classify_market_breadth(market),
         "candidate_breadth": candidate,
         "top_industries": top_sectors,
         "candidate_industries": dict(sorted(Counter(candidate_sectors).items())),
@@ -354,6 +336,91 @@ def build_style_diagnostic(
         "mismatch_alert": mismatch,
         "diagnosis": "候选与强势行业/市场宽度存在偏离，仅作观察池诊断，不放宽入场门槛" if mismatch else "候选风格未见显著宽度偏离",
     }
+
+
+def build_market_breadth(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [row for row in rows if safe_float(row.get("close")) > 0]
+    changes = [safe_float(row.get("pct_chg")) for row in usable]
+    count = len(usable)
+    up = sum(value > 0 for value in changes)
+    down = sum(value < 0 for value in changes)
+    above20 = sum(safe_float(row.get("close")) > safe_float(row.get("ma20")) > 0 for row in usable)
+    return {
+        "count": count,
+        "up_count": up,
+        "down_count": down,
+        "up_ratio": round(up / count, 4) if count else 0.0,
+        "down_ratio": round(down / count, 4) if count else 0.0,
+        "average_pct_chg": round(sum(changes) / count, 4) if count else 0.0,
+        "median_pct_chg": round(float(median(changes)), 4) if count else 0.0,
+        "strong_up_ratio": round(sum(value >= 3 for value in changes) / count, 4) if count else 0.0,
+        "strong_down_ratio": round(sum(value <= -3 for value in changes) / count, 4) if count else 0.0,
+        "above_ma20_ratio": round(above20 / count, 4) if count else 0.0,
+    }
+
+
+def classify_market_breadth(breadth: dict[str, Any]) -> str:
+    if safe_int(breadth.get("count")) <= 0:
+        return "UNAVAILABLE"
+    up_ratio = safe_float(breadth.get("up_ratio"))
+    median_change = safe_float(breadth.get("median_pct_chg"))
+    if up_ratio >= 0.60 and median_change > 0:
+        return "BREADTH_RECOVERY"
+    if up_ratio <= 0.40 and median_change < 0:
+        return "BROAD_WEAKNESS"
+    return "NEUTRAL"
+
+
+def build_sector_strength(
+    rows: list[dict[str, Any]], sector_map: dict[str, str], *, min_members: int = 10
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        sector = sector_map.get(str(row.get("code") or ""), str(row.get("industry") or "UNMAPPED"))
+        grouped.setdefault(sector or "UNMAPPED", []).append(row)
+    sectors = []
+    for sector, members in grouped.items():
+        if sector == "UNMAPPED" or len(members) < min_members:
+            continue
+        breadth = build_market_breadth(members)
+        strength_score = (
+            safe_float(breadth.get("average_pct_chg"))
+            + safe_float(breadth.get("median_pct_chg"))
+            + (safe_float(breadth.get("up_ratio")) - 0.5) * 2
+        )
+        state = (
+            "STRONG"
+            if safe_float(breadth.get("up_ratio")) >= 0.60 and safe_float(breadth.get("median_pct_chg")) > 0
+            else "WEAK"
+            if safe_float(breadth.get("up_ratio")) <= 0.40 and safe_float(breadth.get("median_pct_chg")) < 0
+            else "NEUTRAL"
+        )
+        sectors.append({"sector": sector, **breadth, "strength_score": round(strength_score, 4), "strength_state": state})
+    sectors.sort(key=lambda item: (item["strength_score"], item["up_ratio"], item["count"]), reverse=True)
+    return sectors
+
+
+def style_priority_key(row: dict[str, Any], sector_strength: dict[str, dict[str, Any]]) -> tuple[int, float]:
+    evidence = sector_strength.get(str(row.get("industry") or "UNMAPPED"), {})
+    state = str(evidence.get("strength_state") or "UNAVAILABLE")
+    tier = {"STRONG": 0, "NEUTRAL": 1, "UNAVAILABLE": 2, "WEAK": 3}.get(state, 2)
+    return tier, -safe_float(evidence.get("strength_score"))
+
+
+def attach_style_evidence(
+    plan: dict[str, Any], row: dict[str, Any], market_breadth: dict[str, Any], sector_strength: dict[str, dict[str, Any]]
+) -> None:
+    evidence = sector_strength.get(str(row.get("industry") or "UNMAPPED"), {})
+    plan.update(
+        {
+            "signal_market_breadth_state": classify_market_breadth(market_breadth),
+            "signal_market_up_ratio": safe_float(market_breadth.get("up_ratio")),
+            "sector_strength_state": str(evidence.get("strength_state") or "UNAVAILABLE"),
+            "sector_strength_score": safe_float(evidence.get("strength_score")),
+            "sector_advance_ratio": safe_float(evidence.get("up_ratio")),
+            "style_evidence_role": "prior_session_research_priority_only",
+        }
+    )
 
 
 def generate_plan(
@@ -386,6 +453,9 @@ def generate_plan(
         [{**row, "industry": sector_map.get(str(row.get("code") or ""), str(row.get("industry") or "UNMAPPED"))} for row in scan_rows],
         key=lambda row: str(row.get("code") or ""),
     )
+    market_breadth = build_market_breadth(ordered)
+    sector_strength_rows = build_sector_strength(ordered, sector_map)
+    sector_strength = {str(item["sector"]): item for item in sector_strength_rows}
     strict_candidates = [
         (row, candidate_levels(row, signal_date, offline=str(regime.get("state") or "").upper() == "UNKNOWN"))
         for row in ordered
@@ -451,6 +521,7 @@ def generate_plan(
                 reasons.append("POSITION_OR_DAILY_CAP")
         status = "WATCH_TRIGGER" if hard_pass else "WATCH_ONLY"
         plan = plan_payload(row, trade_date, signal_date, rank, status, shares, levels, zone, regime, reasons)
+        attach_style_evidence(plan, row, market_breadth, sector_strength)
         adapter.record_planned_order(plan)
         audits.append(plan)
         if hard_pass:
@@ -462,7 +533,7 @@ def generate_plan(
         levels = fallback_levels(row)
         zone = entry_zone(row, levels)
         watch_candidates.append((row, levels, zone))
-    watch_candidates.sort(key=lambda item: research_priority_key(item[0], item[1], item[2]))
+    watch_candidates.sort(key=lambda item: research_priority_key(item[0], item[1], item[2], sector_strength))
     watch_candidates = watch_candidates[:max_candidates]
     bear_defensive_symbols: list[str] = []
     for rank, (row, levels, zone) in enumerate(watch_candidates, start=1):
@@ -478,6 +549,7 @@ def generate_plan(
             regime,
             ["SCAN_WATCH_ONLY", "STRICT_ENTRY_REQUIRED", *zone["reason_codes"]],
         )
+        attach_style_evidence(plan, row, market_breadth, sector_strength)
         if bear_defensive_shape_eligible(row, zone):
             plan["research_conditional_cohorts"] = ["BEAR_DEFENSIVE_WATCH"]
             plan["research_policy_id"] = "bear_defensive_watch_v2"
@@ -522,6 +594,9 @@ def generate_plan(
                         "level_evidence_status": probe_levels.get("level_evidence_status"),
                         "level_evidence_source": probe_levels.get("level_evidence_source"),
                         "rejection_codes": rejection_codes,
+                        "industry": str(row.get("industry") or "UNMAPPED"),
+                        "sector_strength_state": plan.get("sector_strength_state"),
+                        "sector_strength_score": plan.get("sector_strength_score"),
                     }
                 )
                 if probe_eligible:
@@ -530,7 +605,11 @@ def generate_plan(
         audits.append(plan)
 
     pilot_eligible_candidates.sort(
-        key=lambda item: (not item[3], execution_risk_priority_key(item[0], item[1]))
+        key=lambda item: (
+            not item[3],
+            style_priority_key(item[0], sector_strength),
+            execution_risk_priority_key(item[0], item[1]),
+        )
     )
     pilot_eligible_candidates = pilot_eligible_candidates[:BEAR_PILOT_MAX_QUEUE]
     audit_by_symbol = {str(row.get("symbol") or ""): row for row in pilot_audits}
@@ -561,6 +640,7 @@ def generate_plan(
             regime,
             pilot_account_id,
         )
+        attach_style_evidence(pilot, row, market_breadth, sector_strength)
         pilot_adapter.record_planned_order(pilot)
         pilot_plans.append(pilot)
         pilot_planned_gross += close * shares
@@ -620,6 +700,12 @@ def generate_plan(
         "signal_date": signal_date.isoformat(),
         "scan_path": str(scan_path),
         "market_regime": regime,
+        "market_breadth_context": {
+            **market_breadth,
+            "state": classify_market_breadth(market_breadth),
+            "role": "prior_session_research_priority_only",
+            "core_regime_gate_relaxed": False,
+        },
         "supplemental_market_context": load_supplemental_market_context(signal_date),
         "candidate_style_diagnostic": style_diagnostic,
         "scan_quality": scan_quality,
@@ -690,7 +776,8 @@ def generate_plan(
                 "account_exposure_cap_pct": BEAR_PILOT_MAX_EXPOSURE_PCT,
                 "minimum_risk_reward": BEAR_PROBE_MIN_TARGET_RISK_MULTIPLE,
                 "control_v1_minimum_risk_reward": BEAR_PILOT_MIN_RR,
-                "selection_priority": "control_v1_eligible_then_t1_risk_queue_v2",
+                "selection_priority": "control_v1_then_sector_strength_then_t1_risk_v3",
+                "sector_strength_execution_role": "prior_session_research_priority_only",
                 "control_v1_eligible_count": sum(row["control_v1_eligible"] for row in pilot_audits),
                 "probe_target_policy": "atr_1_5_or_1_25_risk_v1",
                 "eligibility_audit": pilot_audits,
@@ -816,10 +903,16 @@ def execution_risk_priority_key(row: dict[str, str], levels: dict[str, Any]) -> 
 
 
 def research_priority_key(
-    row: dict[str, str], levels: dict[str, Any], zone: dict[str, Any]
-) -> tuple[int, float, float, str]:
+    row: dict[str, str],
+    levels: dict[str, Any],
+    zone: dict[str, Any],
+    sector_strength: dict[str, dict[str, Any]] | None = None,
+) -> tuple[int, int, float, float, float, str]:
+    style_tier, style_score = style_priority_key(row, sector_strength or {})
     return (
         0 if zone.get("geometry_valid") else 1,
+        style_tier,
+        style_score,
         safe_float(levels.get("t1_loss_buffer_pct"), 999.0),
         -safe_float(row.get("score")),
         str(row.get("code") or ""),

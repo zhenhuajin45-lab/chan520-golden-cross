@@ -141,6 +141,46 @@ def test_risk_exit_blocks_same_day_position_under_t_plus_one(tmp_path, monkeypat
     assert adapter.account_snapshot()["positions"][0]["shares"] == 100
 
 
+def test_after_close_can_resolve_recovered_risk_but_cannot_sell(tmp_path, monkeypatch):
+    recovered_adapter, recovered_ledger = make_adapter(tmp_path / "recovered")
+    monkeypatch.setattr(
+        risk_exit,
+        "tencent_quote",
+        lambda _code: {**quote_at("20260716150000"), "price": "10.00"},
+    )
+    recovered = risk_exit.run_risk_exit_cycle(
+        adapter=recovered_adapter,
+        ledger=Path(recovered_ledger),
+        account_id="risk-exit-test",
+        trade_date="2026-07-16",
+        now=datetime(2026, 7, 16, 15, 1, tzinfo=TZ),
+        max_age_minutes=5,
+        confirmation_max_minutes=20,
+        submit=True,
+    )
+
+    assert recovered["time_gate_ok"] is False
+    assert recovered["results"][0]["reason"] == "RISK_RECOVERED"
+    with sqlite3.connect(recovered_ledger) as conn:
+        assert conn.execute("select status from planned_orders").fetchone()[0] == "RESOLVED_RISK"
+
+    active_adapter, active_ledger = make_adapter(tmp_path / "active")
+    monkeypatch.setattr(risk_exit, "tencent_quote", lambda _code: quote_at("20260716150000"))
+    active = risk_exit.run_risk_exit_cycle(
+        adapter=active_adapter,
+        ledger=Path(active_ledger),
+        account_id="risk-exit-test",
+        trade_date="2026-07-16",
+        now=datetime(2026, 7, 16, 15, 1, tzinfo=TZ),
+        max_age_minutes=5,
+        confirmation_max_minutes=20,
+        submit=True,
+    )
+
+    assert active["results"][0]["reason"] == "NOT_IN_CONTINUOUS_AUCTION"
+    assert active_adapter.account_snapshot()["positions"][0]["shares"] == 100
+
+
 def make_zte_replay_adapter(path: Path):
     adapter = LocalSimBrokerAdapter(
         LocalSimBrokerConfig(account_id="zte-replay", initial_cash=1_000_000.0, ledger_path=str(path))

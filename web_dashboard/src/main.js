@@ -190,6 +190,7 @@ function renderCorePlanAlert(payload) {
   const quality = core.scan_quality || {};
   const supplemental = core.supplemental_market_context || {};
   const style = core.candidate_style_diagnostic || {};
+  const breadth = core.market_breadth_context || {};
   const funnel = core.execution_funnel || {};
   const starvation = core.signal_starvation || {};
   const coverage = Number(quality.coverage);
@@ -210,13 +211,14 @@ function renderCorePlanAlert(payload) {
       : "没有通过全部执行门槛的可执行买入，观察池不会自动成交。";
   const supplementalText = supplemental.emotion_label ? `｜同花顺旁路 ${supplemental.emotion_label}` : "";
   const styleText = style.status ? `｜风格偏离 ${style.mismatch_alert ? "预警" : "正常"}` : "";
+  const breadthText = breadth.state ? `｜宽度 ${escapeHtml(breadth.state)}（上涨 ${pct(breadth.up_ratio)}）` : "";
   const funnelText = funnel.scanned_count != null
     ? `｜执行漏斗 ${intText(funnel.scanned_count)} 扫描 → ${intText(funnel.strict_count)} 基础严格 → ${intText(funnel.strict_full_gate_count)} 完整严格 → ${intText(funnel.core_executable_count)} 核心 → ${intText(funnel.bear_pilot_count)} probe 候选队列`
     : "";
   const starvationText = starvation.status && starvation.status !== "OK"
     ? `｜连续无执行 ${intText(starvation.consecutive_zero_execution_sessions || starvation.previous_zero_execution_sessions)} 日：${escapeHtml(starvation.status)}`
     : "";
-  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜研究覆盖率 ${escapeHtml(coverageText)}｜执行级覆盖率 ${escapeHtml(executionCoverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}${escapeHtml(funnelText)}${escapeHtml(starvationText)}｜${escapeHtml(boundary)}</div>`;
+  return `<div class="valuation-alert ${kind}">核心计划 ${escapeHtml(core.status)}｜信号日 ${escapeHtml(core.signal_date || "-")}｜研究覆盖率 ${escapeHtml(coverageText)}｜执行级覆盖率 ${escapeHtml(executionCoverageText)}｜几何拦截 ${intText(core.geometry_blocked_count || 0)}${escapeHtml(supplementalText)}${escapeHtml(styleText)}${breadthText}${escapeHtml(funnelText)}${escapeHtml(starvationText)}｜${escapeHtml(boundary)}</div>`;
 }
 
 function renderSessionMarketAlert(payload) {
@@ -224,9 +226,13 @@ function renderSessionMarketAlert(payload) {
   if (!snapshot.status) return "";
   const regime = snapshot.market_regime || {};
   const quality = snapshot.scan_quality || {};
+  const breadth = snapshot.market_breadth || {};
   const stateText = String(regime.state || "UNKNOWN").toUpperCase();
   const kind = regime.regime_ok === true ? "ok" : stateText === "BEAR" ? "danger" : "warning";
-  return `<div class="valuation-alert ${kind}">交易日收盘市场 ${escapeHtml(stateText)}｜门控 ${regime.regime_ok === true ? "通过" : "阻断"}｜研究覆盖 ${pct(quality.research_coverage ?? quality.coverage)}｜执行级覆盖 ${pct(quality.execution_coverage)}｜扫描 ${intText(snapshot.scan_rows)} 只｜${escapeHtml(regime.detail || "收盘状态明细不可用")}</div>`;
+  const breadthText = breadth.state
+    ? `｜宽度 ${escapeHtml(breadth.state)}（上涨 ${pct(breadth.up_ratio)} / 中位 ${signedPct(Number(breadth.median_pct_chg || 0) / 100)}）`
+    : "";
+  return `<div class="valuation-alert ${kind}">交易日收盘市场 ${escapeHtml(stateText)}｜门控 ${regime.regime_ok === true ? "通过" : "阻断"}${breadthText}｜研究覆盖 ${pct(quality.research_coverage ?? quality.coverage)}｜执行级覆盖 ${pct(quality.execution_coverage)}｜扫描 ${intText(snapshot.scan_rows)} 只｜${escapeHtml(regime.detail || "收盘状态明细不可用")}</div>`;
 }
 
 function renderResearchPilot(pilot, core) {
@@ -306,7 +312,7 @@ function renderPilotPlans(rows) {
     <div class="pilot-row">
       <strong>#${intText((row.payload || {}).queue_priority)} ${stockText(row)}</strong>
       <span>${intText(row.volume)} 股｜${price(row.lower_price)}-${price(row.upper_price || row.trigger_price)}｜止损 ${price(row.stop_price)}｜目标 ${price(row.target_price)}</span>
-      <small>${escapeHtml(planReason(row))}</small>
+      <small>${escapeHtml(`${(row.payload || {}).industry || "行业未映射"}｜行业 ${(row.payload || {}).sector_strength_state || "UNAVAILABLE"}｜${planReason(row)}`)}</small>
     </div>
   `).join("");
   return visible + (ordered.length > 6 ? `<p class="pilot-empty">共 ${intText(ordered.length)} 只入队，盘中最多成交 2 只</p>` : "");

@@ -176,6 +176,31 @@ def test_missing_core_plan_is_reported_as_generation_failure(tmp_path, monkeypat
     assert "502" in core["failure_reason"]
 
 
+def test_core_plan_export_preserves_market_breadth_context(tmp_path, monkeypatch):
+    plan_dir = tmp_path / "reports" / "local_sim_plan" / "20260804"
+    plan_dir.mkdir(parents=True)
+    (plan_dir / "core_plan.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "signal_date": "2026-08-03",
+                "market_breadth_context": {
+                    "state": "BREADTH_RECOVERY",
+                    "up_ratio": 0.7422,
+                    "core_regime_gate_relaxed": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(exporter, "ROOT", tmp_path)
+
+    core = exporter.load_core_plan("2026-08-04")
+
+    assert core["market_breadth_context"]["state"] == "BREADTH_RECOVERY"
+    assert core["market_breadth_context"]["core_regime_gate_relaxed"] is False
+
+
 def test_core_dashboard_embeds_isolated_bear_pilot_account(tmp_path):
     ledger = tmp_path / "local_sim.sqlite"
     core = LocalSimBrokerAdapter(

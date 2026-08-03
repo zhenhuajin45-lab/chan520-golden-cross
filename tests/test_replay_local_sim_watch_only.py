@@ -40,7 +40,7 @@ def series(name: str, prev_close: float, first: float, second: float) -> dict:
         "name": name,
         "prev_close": prev_close,
         "open": first,
-        "minutes": {"0930": first, "0932": second},
+        "minutes": {"0930": first, "0932": second, "0934": second},
     }
 
 
@@ -53,8 +53,8 @@ def test_replay_uses_explicit_risk_priority_and_never_changes_actual_execution_c
         "plans": [candidate("600001", 2, 10.0), candidate("000001", 1, 20.0)],
     }
     market_data = {
-        "600001": series("A", 10.0, 10.0, 10.1),
-        "000001": series("B", 20.0, 20.0, 20.2),
+        "600001": series("A", 10.0, 10.0, 10.02),
+        "000001": series("B", 20.0, 20.0, 20.04),
     }
     market_data.update({index_data_key(symbol): series(symbol, 100.0, 100.0, 100.0) for symbol in INDEX_SYMBOLS})
 
@@ -119,8 +119,8 @@ def test_replay_keeps_full_pool_evidence_without_bear_research_candidates():
         "plans": rows,
     }
     market_data = {
-        "600001": series("A", 10.0, 10.0, 10.1),
-        "000001": series("B", 20.0, 20.0, 20.2),
+        "600001": series("A", 10.0, 10.0, 10.02),
+        "000001": series("B", 20.0, 20.0, 20.04),
     }
     market_data.update({index_data_key(symbol): series(symbol, 100.0, 100.0, 100.0) for symbol in INDEX_SYMBOLS})
 
@@ -181,3 +181,27 @@ def test_explicit_bear_cohort_excludes_legacy_shaped_strict_rows():
     core = {"market_regime": {"state": "BEAR"}, "plans": [legacy, explicit]}
 
     assert [item["symbol"] for item in research_candidates(core)] == ["600001"]
+
+
+def test_replay_reports_same_confirmation_slippage_guard_as_live_executor():
+    core = {
+        "policy_id": "local_sim_core_plan_v2",
+        "market_regime": {"state": "BEAR"},
+        "executable_buy_count": 0,
+        "plans": [candidate("600001", 1, 10.0)],
+    }
+    market_data = {"600001": series("A", 10.0, 10.0, 10.04)}
+    market_data.update({index_data_key(symbol): series(symbol, 100.0, 100.0, 100.0) for symbol in INDEX_SYMBOLS})
+
+    payload = run_replay(
+        core,
+        date(2026, 7, 20),
+        market_data,
+        initial_equity=1_000_000.0,
+        max_fills=1,
+        max_exposure_pct=0.15,
+    )
+
+    assert payload["execution_guard_id"] == "two_stage_confirmation_slippage_v2"
+    assert payload["confirmation_max_upslip_pct"] == 0.50
+    assert "confirmation_upslip_guard" in payload["guards_retained"]
